@@ -1,0 +1,73 @@
+[package]
+name = "pslXserver"
+version = "0.1.0"
+edition = "2021"
+description = "Native macOS X11 Server in Rust — XQuartz alternative with proper IME support"
+license = "MIT"
+
+[dependencies]
+# X11 protocol types with server-side request parsing
+x11rb-protocol = { version = "0.13", features = [
+    "request-parsing",
+    "render",
+    "xfixes",
+    "randr",
+    "shape",
+    "composite",
+    "sync",
+] }
+
+# Async runtime
+tokio = { version = "1", features = [
+    "net",
+    "io-util",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "signal",
+] }
+
+# Utilities
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+bitflags = "2"
+thiserror = "2"
+dashmap = "6"
+bytes = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+# macOS dependencies (only on macOS)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSArray",
+    "NSDictionary",
+    "NSData",
+    "NSNotification",
+    "NSRunLoop",
+    "NSThread",
+    "NSAttributedString",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSEvent",
+    "NSCursor",
+    "NSPasteboard",
+    "NSScreen",
+    "NSColor",
+    "NSImage",
+    "NSGraphicsContext",
+    "NSResponder",
+] }
+block2 = "0.6"
+core-foundation = "0.10"
+core-graphics = "0.24"
+core-text = "20"
