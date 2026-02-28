@@ -1,11 +1,16 @@
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod hidpi;
 pub mod renderer;
 
 use crate::util::coord::{X11Point, X11Rect};
 
 pub type Xid = u32;
 pub type Atom = u32;
+
+/// Shared render mailbox: native_window_id -> pending render commands.
+/// Protocol handlers append commands; display thread drains each frame.
+pub type RenderMailbox = std::sync::Arc<dashmap::DashMap<u64, Vec<RenderCommand>>>;
 
 /// Opaque handle to a native macOS window.
 #[derive(Debug, Clone)]
@@ -201,6 +206,12 @@ pub enum DisplayEvent {
         height: u16,
         scale_factor: f64,
     },
+    /// Global pointer position update (sent every frame from macOS).
+    /// Used to keep QueryPointer accurate even when cursor is outside X11 windows.
+    GlobalPointerUpdate {
+        root_x: i16,
+        root_y: i16,
+    },
 }
 
 /// Individual rendering commands mapped from X11 drawing operations.
@@ -238,6 +249,16 @@ pub enum RenderCommand {
         angle2: i16,
         color: u32,
     },
+    DrawArc {
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        angle1: i16,
+        angle2: i16,
+        color: u32,
+        line_width: u16,
+    },
     PutImage {
         x: i16,
         y: i16,
@@ -269,5 +290,9 @@ pub enum RenderCommand {
         width: u16,
         height: u16,
         bg_color: u32,
+    },
+    FillPolygon {
+        points: Vec<(i16, i16)>,
+        color: u32,
     },
 }

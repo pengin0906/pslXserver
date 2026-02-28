@@ -23,6 +23,10 @@ struct Cli {
     #[arg(long)]
     tcp: bool,
 
+    /// Screen resolution (e.g., "1920x1080"). Defaults to actual macOS screen size.
+    #[arg(long)]
+    screen: Option<String>,
+
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -37,11 +41,30 @@ fn main() {
 
     info!("pslXserver starting on display :{}", cli.display);
 
+    // Detect screen resolution: CLI override or actual macOS screen size
+    let (screen_width, screen_height) = if let Some(ref s) = cli.screen {
+        let parts: Vec<&str> = s.split('x').collect();
+        if parts.len() == 2 {
+            let w: u16 = parts[0].parse().expect("Invalid screen width");
+            let h: u16 = parts[1].parse().expect("Invalid screen height");
+            (w, h)
+        } else {
+            panic!("Invalid --screen format. Use WIDTHxHEIGHT (e.g., 1920x1080)");
+        }
+    } else {
+        display::hidpi::get_screen_dimensions_pixels()
+    };
+    info!("Screen resolution: {}x{}", screen_width, screen_height);
+
     // Create channels for communication between Cocoa main thread and tokio thread
     #[allow(unused_variables)]
-    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<display::DisplayCommand>(256);
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<display::DisplayCommand>();
     #[allow(unused_variables)]
-    let (evt_tx, evt_rx) = crossbeam_channel::bounded::<display::DisplayEvent>(256);
+    let (evt_tx, evt_rx) = crossbeam_channel::unbounded::<display::DisplayEvent>();
+
+    // Shared render mailbox — protocol threads write, display thread reads
+    let render_mailbox: display::RenderMailbox = std::sync::Arc::new(dashmap::DashMap::new());
+    let render_mailbox_display = render_mailbox.clone();
 
     let display_num = cli.display;
     let listen_tcp = cli.tcp;
@@ -55,7 +78,7 @@ fn main() {
             .expect("Failed to create tokio runtime");
 
         rt.block_on(async {
-            if let Err(e) = server::run_server(display_num, listen_tcp, evt_rx, cmd_tx).await {
+            if let Err(e) = server::run_server(display_num, listen_tcp, evt_rx, cmd_tx, screen_width, screen_height, render_mailbox).await {
                 log::error!("X11 server error: {}", e);
             }
         });
@@ -63,7 +86,7 @@ fn main() {
 
     // Run Cocoa application on the main thread (macOS requirement)
     #[cfg(target_os = "macos")]
-    display::macos::run_cocoa_app(cmd_rx, evt_tx);
+    display::macos::run_cocoa_app(cmd_rx, evt_tx, render_mailbox_display);
 
     #[cfg(not(target_os = "macos"))]
     {

@@ -11,6 +11,14 @@ impl<'a> EventBuilder<'a> {
     pub fn new(conn: &'a ClientConnection, event_type: u8) -> Self {
         let mut buf = vec![0u8; 32];
         buf[0] = event_type;
+        // Set sequence number at offset 2-3
+        let seq = conn.current_request_sequence();
+        let seq_bytes = match conn.byte_order {
+            ByteOrder::BigEndian => (seq as u16).to_be_bytes(),
+            ByteOrder::LittleEndian => (seq as u16).to_le_bytes(),
+        };
+        buf[2] = seq_bytes[0];
+        buf[3] = seq_bytes[1];
         Self { conn, buf }
     }
 
@@ -74,7 +82,7 @@ pub fn build_key_event(
 ) -> Vec<u8> {
     let mut eb = EventBuilder::new(conn, event_type);
     eb.set_u8(1, keycode)
-      .set_u16(2, 0) // sequence (filled by sender)
+      // sequence at offset 2-3 already set by EventBuilder::new
       .set_u32(4, time)
       .set_u32(8, root)
       .set_u32(12, event_window)
