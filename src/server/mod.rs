@@ -38,6 +38,19 @@ pub enum ServerError {
     NotImplemented,
 }
 
+impl ServerError {
+    /// Map this error to the appropriate X11 error code.
+    pub fn x11_error_code(&self) -> u8 {
+        match self {
+            ServerError::Protocol => 1,            // BadRequest
+            ServerError::ResourceNotFound(_) => 9,  // BadDrawable (generic for missing resources)
+            ServerError::AtomNotFound => 5,         // BadAtom
+            ServerError::NotImplemented => 17,      // BadImplementation
+            ServerError::Io(_) => 17,               // BadImplementation
+        }
+    }
+}
+
 /// Visual type information for the X11 connection setup.
 pub struct Visual {
     pub id: u32,
@@ -104,6 +117,8 @@ pub struct XServer {
     pub virtual_keysyms: parking_lot::RwLock<Vec<u32>>,
     /// Flag: server is waiting for X11 selection data to copy to macOS clipboard.
     pub pending_clipboard_copy: AtomicBool,
+    /// Available font names (XLFD) loaded from fonts.dir/fonts.alias files.
+    pub font_names: Vec<String>,
 }
 
 impl XServer {
@@ -212,7 +227,59 @@ impl XServer {
             focus_revert_to: AtomicU32::new(1), // PointerRoot
             virtual_keysyms: parking_lot::RwLock::new(Vec::new()),
             pending_clipboard_copy: AtomicBool::new(false),
+            font_names: Self::load_font_names(),
         }
+    }
+
+    /// Load XLFD font names from system fonts.dir and fonts.alias files.
+    fn load_font_names() -> Vec<String> {
+        let font_dirs = [
+            "/opt/X11/share/fonts/misc",
+            "/opt/X11/share/fonts/75dpi",
+            "/opt/X11/share/fonts/100dpi",
+            "/opt/X11/share/fonts/TTF",
+            "/opt/X11/share/fonts/Type1",
+            "/opt/X11/lib/X11/fonts/misc",
+            "/opt/X11/lib/X11/fonts/75dpi",
+            "/opt/X11/lib/X11/fonts/100dpi",
+            "/opt/X11/lib/X11/fonts/TTF",
+            "/opt/X11/lib/X11/fonts/Type1",
+        ];
+        let mut names = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for dir in &font_dirs {
+            // Read fonts.dir — first line is count, rest are "filename XLFD-name"
+            if let Ok(content) = std::fs::read_to_string(format!("{}/fonts.dir", dir)) {
+                for line in content.lines().skip(1) {
+                    if let Some(pos) = line.find(' ') {
+                        let xlfd = line[pos + 1..].trim();
+                        if !xlfd.is_empty() && seen.insert(xlfd.to_lowercase()) {
+                            names.push(xlfd.to_string());
+                        }
+                    }
+                }
+            }
+            // Read fonts.alias — "alias XLFD-name"
+            if let Ok(content) = std::fs::read_to_string(format!("{}/fonts.alias", dir)) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('!') {
+                        continue;
+                    }
+                    if let Some(pos) = line.find(char::is_whitespace) {
+                        let alias = line[..pos].trim();
+                        if !alias.is_empty() && seen.insert(alias.to_lowercase()) {
+                            names.push(alias.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        names.sort();
+        log::info!("Loaded {} font names from system font directories", names.len());
+        names
     }
 
     /// Allocate a resource ID base for a new connection.
@@ -443,10 +510,8 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 // Send Expose for full window so client redraws
                 send_expose_event(&server, window, 0, 0, width, height, 0);
 
-                // Don't force-resize child windows here. The client (e.g. xterm)
-                // is responsible for resizing its own children via ConfigureWindow
-                // after receiving the parent's ConfigureNotify.
-                let _ = children;
+                // Recursively resize all descendant windows to match parent size
+                resize_descendants(&server, &children, width, height);
             }
             DisplayEvent::GlobalPointerUpdate { root_x, root_y } => {
                 server.pointer_x.store(root_x as i32, Ordering::Relaxed);
@@ -1111,6 +1176,32 @@ fn send_configure_notify_event(
             if !sent {
                 info!("  No client selected StructureNotify on this window");
             }
+        }
+    }
+}
+
+/// Recursively resize all descendant windows and send ConfigureNotify+Expose.
+fn resize_descendants(server: &XServer, child_ids: &[Xid], width: u16, height: u16) {
+    for child_id in child_ids {
+        let grandchildren = if let Some(res) = server.resources.get(child_id) {
+            if let Resource::Window(win) = res.value() {
+                let mut w = win.write();
+                w.width = width;
+                w.height = height;
+                w.children.clone()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        send_configure_notify_event(server, *child_id, 0, 0, width, height);
+        send_expose_event(server, *child_id, 0, 0, width, height, 0);
+
+        // Recurse into grandchildren
+        if !grandchildren.is_empty() {
+            resize_descendants(server, &grandchildren, width, height);
         }
     }
 }

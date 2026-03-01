@@ -8,6 +8,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use super::{ServerError, XServer};
+use crate::display::Xid;
 
 /// Byte order of the client connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,10 +209,11 @@ where
                             let _ = stream.write_all(&err_buf).await;
                         }
                         Err(e) => {
-                            warn!("Request error (opcode {}): {}", opcode, e);
+                            let error_code = e.x11_error_code();
+                            warn!("Request error (opcode {}): {} -> X11 error {}", opcode, e, error_code);
                             err_buf = [0u8; 32];
                             err_buf[0] = 0;
-                            err_buf[1] = 17;
+                            err_buf[1] = error_code;
                             err_buf[2] = (seq & 0xFF) as u8;
                             err_buf[3] = ((seq >> 8) & 0xFF) as u8;
                             err_buf[8] = opcode;
@@ -267,7 +269,26 @@ where
         (*owner & !mask) != (base & !mask)
     });
 
-    // Clean up: remove resources owned by this connection
+    // Clean up: find and destroy top-level windows owned by this connection
+    let owned_windows: Vec<Xid> = server.resources.iter()
+        .filter(|entry| (*entry.key() & !mask) == (base & !mask))
+        .filter_map(|entry| {
+            if let super::resources::Resource::Window(win) = entry.value() {
+                let w = win.read();
+                // Only destroy top-level (parent=root) to trigger recursive destruction
+                if w.parent == server.screens[0].root_window {
+                    return Some(*entry.key());
+                }
+            }
+            None
+        })
+        .collect();
+
+    for wid in owned_windows {
+        destroy_window_recursive(&server, wid);
+    }
+
+    // Remove remaining non-window resources (pixmaps, GCs, fonts, etc.)
     server.resources.retain(|xid, _| {
         (*xid & !mask) != (base & !mask)
     });
@@ -316,11 +337,11 @@ fn build_setup_reply(server: &XServer, conn: &ClientConnection) -> Vec<u8> {
     write_u16(&mut reply, vendor.len() as u16); // vendor length
     write_u16(&mut reply, 65535); // maximum-request-length
     reply.push(1); // number of screens
-    reply.push(1); // number of pixmap formats
+    reply.push(2); // number of pixmap formats
 
     reply.push(0); // image-byte-order (LSBFirst)
     reply.push(0); // bitmap-bit-order (LSBFirst)
-    reply.push(32); // bitmap-scanline-unit
+    reply.push(8);  // bitmap-scanline-unit
     reply.push(32); // bitmap-scanline-pad
     reply.push(8);  // min-keycode
     reply.push(255); // max-keycode
@@ -331,7 +352,13 @@ fn build_setup_reply(server: &XServer, conn: &ClientConnection) -> Vec<u8> {
     reply.extend_from_slice(vendor);
     reply.extend(std::iter::repeat(0).take(vendor_pad));
 
-    // Pixmap formats (1 format: depth 24, bpp 32, scanline-pad 32)
+    // Pixmap format 1: depth 1 (bitmaps), bpp 1, scanline-pad 32
+    reply.push(1);  // depth
+    reply.push(1);  // bits-per-pixel
+    reply.push(32); // scanline-pad
+    reply.extend(std::iter::repeat(0).take(5)); // unused padding
+
+    // Pixmap format 2: depth 24, bpp 32, scanline-pad 32
     reply.push(24); // depth
     reply.push(32); // bits-per-pixel
     reply.push(32); // scanline-pad
@@ -409,6 +436,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         18 => handle_change_property(server, conn, data, stream).await,
         19 => handle_delete_property(server, conn, data, stream).await,
         20 => handle_get_property(server, conn, data, stream).await,
+        21 => handle_list_properties(server, conn, data, stream).await,
         22 => handle_set_selection_owner(server, conn, data, stream).await,
         23 => handle_get_selection_owner(server, conn, data, stream).await,
         24 => handle_convert_selection(server, conn, data, stream).await,
@@ -450,6 +478,8 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         77 => handle_image_text16(server, conn, data, stream).await,
         78 => handle_create_colormap(server, conn, data, stream).await,
         79 => handle_free_colormap(server, conn, data, stream).await,
+        80 => handle_get_font_path(server, conn, data, stream).await,
+        81 => { Ok(()) }, // SetFontPath — no-op, we use system fonts
         84 => handle_alloc_color(server, conn, data, stream).await,
         85 => handle_alloc_named_color(server, conn, data, stream).await,
         91 => handle_query_colors(server, conn, data, stream).await,
@@ -682,11 +712,32 @@ async fn handle_get_atom_name<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
 ) -> Result<(), ServerError> {
     let atom = read_u32(conn, &data[4..8]);
-    let name = server.atoms.get_name(atom).unwrap_or_default();
+    let seq = conn.current_request_sequence();
+
+    let name = match server.atoms.get_name(atom) {
+        Some(n) => n,
+        None => {
+            // BadAtom error (error code 5)
+            let mut err = [0u8; 32];
+            err[0] = 0; // error
+            err[1] = 5; // BadAtom
+            err[2] = (seq & 0xFF) as u8;
+            err[3] = ((seq >> 8) & 0xFF) as u8;
+            // bytes 4-7: bad resource id (the invalid atom)
+            err[4] = (atom & 0xFF) as u8;
+            err[5] = ((atom >> 8) & 0xFF) as u8;
+            err[6] = ((atom >> 16) & 0xFF) as u8;
+            err[7] = ((atom >> 24) & 0xFF) as u8;
+            err[8] = 0; // minor opcode
+            err[9] = 0;
+            err[10] = 17; // major opcode (GetAtomName)
+            stream.write_all(&err).await?;
+            return Ok(());
+        }
+    };
+
     let name_bytes = name.as_bytes();
     let pad = (4 - (name_bytes.len() % 4)) % 4;
-
-    let seq = conn.current_request_sequence();
     let additional_len = (name_bytes.len() + pad) / 4;
 
     let mut reply = Vec::with_capacity(32 + name_bytes.len() + pad);
@@ -732,6 +783,15 @@ async fn handle_create_window<S: AsyncRead + AsyncWrite + Unpin>(
 
     let effective_depth = if depth == 0 { 24 } else { depth };
 
+    // CopyFromParent: inherit visual from parent
+    let effective_visual = if visual == 0 {
+        if let Some(res) = server.resources.get(&parent) {
+            if let super::resources::Resource::Window(win) = res.value() {
+                win.read().visual
+            } else { 0x21 }
+        } else { 0x21 }
+    } else { visual };
+
     let mut window = super::resources::WindowState::new(
         wid,
         parent,
@@ -740,7 +800,7 @@ async fn handle_create_window<S: AsyncRead + AsyncWrite + Unpin>(
         border_width,
         effective_depth,
         super::resources::WindowClass::from(class),
-        visual,
+        effective_visual,
     );
 
     // Parse value list based on value_mask
@@ -968,8 +1028,47 @@ async fn handle_destroy_window<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), ServerError> {
     let wid = read_u32(conn, &data[4..8]);
     debug!("DestroyWindow: 0x{:08X}", wid);
-    server.resources.remove(&wid);
+    destroy_window_recursive(server, wid);
     Ok(())
+}
+
+fn destroy_window_recursive(server: &Arc<XServer>, wid: Xid) {
+    // Get parent and children before removing
+    let (parent, children, native_window) = if let Some(res) = server.resources.get(&wid) {
+        if let super::resources::Resource::Window(win) = res.value() {
+            let w = win.read();
+            (w.parent, w.children.clone(), w.native_window.clone())
+        } else {
+            return;
+        }
+    } else {
+        return;
+    };
+
+    // Recursively destroy children first
+    for child in &children {
+        destroy_window_recursive(server, *child);
+    }
+
+    // Remove from parent's children list
+    if parent != 0 {
+        if let Some(res) = server.resources.get(&parent) {
+            if let super::resources::Resource::Window(win) = res.value() {
+                win.write().children.retain(|&c| c != wid);
+            }
+        }
+    }
+
+    // Close native window if exists
+    if let Some(handle) = native_window {
+        let _ = server.display_cmd_tx.send(
+            crate::display::DisplayCommand::DestroyWindow { handle },
+        );
+    }
+
+    // Remove from resource table
+    server.resources.remove(&wid);
+    debug!("Destroyed window 0x{:08X}", wid);
 }
 
 async fn handle_reparent_window<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1463,9 +1562,7 @@ async fn handle_query_tree<S: AsyncRead + AsyncWrite + Unpin>(
     let wid = read_u32(conn, &data[4..8]);
     let seq = conn.current_request_sequence();
 
-    let (parent, children) = if wid == server.screens[0].root_window {
-        (0u32, Vec::new()) // Root has no parent
-    } else if let Some(res) = server.resources.get(&wid) {
+    let (parent, children) = if let Some(res) = server.resources.get(&wid) {
         if let super::resources::Resource::Window(win) = res.value() {
             let w = win.read();
             (w.parent, w.children.clone())
@@ -3009,6 +3106,56 @@ async fn handle_delete_property<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn handle_list_properties<S: AsyncRead + AsyncWrite + Unpin>(
+    server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
+    data: &[u8],
+    stream: &mut S,
+) -> Result<(), ServerError> {
+    let wid = read_u32(conn, &data[4..8]);
+    let seq = conn.current_request_sequence();
+
+    let atoms: Vec<u32> = if let Some(res) = server.resources.get(&wid) {
+        if let super::resources::Resource::Window(win) = res.value() {
+            win.read().properties.iter().map(|p| p.name).collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        // Window not found — send BadWindow error
+        let mut err = vec![0u8; 32];
+        err[0] = 0; // error
+        err[1] = 3; // BadWindow
+        write_u16_to(conn, &mut err[2..4].to_vec(), seq);
+        // Need to write seq into the buffer properly
+        let mut reply = Vec::with_capacity(32);
+        reply.push(0); // error
+        reply.push(3); // BadWindow
+        write_u16_to(conn, &mut reply, seq);
+        write_u32_to(conn, &mut reply, wid); // bad resource id
+        write_u16_to(conn, &mut reply, 0); // minor opcode
+        reply.push(21); // major opcode
+        reply.extend(std::iter::repeat(0).take(32 - reply.len()));
+        stream.write_all(&reply).await?;
+        return Ok(());
+    };
+
+    let num_atoms = atoms.len() as u16;
+    let data_len = atoms.len() as u32; // each atom is 4 bytes = 1 word
+    let mut reply = Vec::with_capacity(32 + atoms.len() * 4);
+    reply.push(1); // reply
+    reply.push(0); // unused
+    write_u16_to(conn, &mut reply, seq);
+    write_u32_to(conn, &mut reply, data_len);
+    write_u16_to(conn, &mut reply, num_atoms);
+    reply.extend(std::iter::repeat(0).take(22)); // padding
+    for atom in &atoms {
+        write_u32_to(conn, &mut reply, *atom);
+    }
+    stream.write_all(&reply).await?;
+    Ok(())
+}
+
 async fn handle_set_input_focus<S: AsyncRead + AsyncWrite + Unpin>(
     server: &Arc<XServer>,
     conn: &Arc<ClientConnection>,
@@ -3263,7 +3410,7 @@ async fn handle_get_keyboard_control<S: AsyncRead + AsyncWrite + Unpin>(
     let seq = conn.current_request_sequence();
     let mut reply = Vec::with_capacity(52);
     reply.push(1); // reply
-    reply.push(0); // global auto-repeat (Off)
+    reply.push(1); // global auto-repeat (On)
     write_u16_to(conn, &mut reply, seq);
     write_u32_to(conn, &mut reply, 5); // additional data (5 words)
     write_u32_to(conn, &mut reply, 0); // LED mask
@@ -3275,6 +3422,24 @@ async fn handle_get_keyboard_control<S: AsyncRead + AsyncWrite + Unpin>(
     // Auto-repeats: 32 bytes bitmap (all keys repeat)
     reply.extend(std::iter::repeat(0xFF).take(32));
 
+    stream.write_all(&reply).await?;
+    Ok(())
+}
+
+async fn handle_get_font_path<S: AsyncRead + AsyncWrite + Unpin>(
+    _server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
+    _data: &[u8],
+    stream: &mut S,
+) -> Result<(), ServerError> {
+    let seq = conn.current_request_sequence();
+    let mut reply = Vec::with_capacity(32);
+    reply.push(1); // reply
+    reply.push(0); // unused
+    write_u16_to(conn, &mut reply, seq);
+    write_u32_to(conn, &mut reply, 0); // additional data
+    write_u16_to(conn, &mut reply, 0); // number of STRs (empty path)
+    reply.extend(std::iter::repeat(0).take(22)); // padding
     stream.write_all(&reply).await?;
     Ok(())
 }
@@ -3399,22 +3564,89 @@ async fn handle_ungrab_server<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 async fn handle_list_fonts<S: AsyncRead + AsyncWrite + Unpin>(
-    _server: &Arc<XServer>,
+    server: &Arc<XServer>,
     conn: &Arc<ClientConnection>,
-    _data: &[u8],
+    data: &[u8],
     stream: &mut S,
 ) -> Result<(), ServerError> {
     let seq = conn.current_request_sequence();
-    // Return empty font list for now
-    let mut reply = Vec::with_capacity(32);
+    if data.len() < 8 {
+        return Err(ServerError::Protocol);
+    }
+    let max_names = read_u16(conn, &data[4..6]) as usize;
+    let pattern_len = read_u16(conn, &data[6..8]) as usize;
+    let pattern = if data.len() >= 8 + pattern_len {
+        std::str::from_utf8(&data[8..8 + pattern_len]).unwrap_or("*")
+    } else {
+        "*"
+    };
+    let pattern_lower = pattern.to_lowercase();
+
+    // Collect matching font names
+    let mut matched: Vec<&str> = Vec::new();
+    for name in &server.font_names {
+        if matched.len() >= max_names {
+            break;
+        }
+        if x11_font_pattern_match(&pattern_lower, &name.to_lowercase()) {
+            matched.push(name);
+        }
+    }
+
+    // Build the names data: each name is 1-byte length + name bytes
+    let mut names_data = Vec::new();
+    for name in &matched {
+        let name_bytes = name.as_bytes();
+        names_data.push(name_bytes.len() as u8);
+        names_data.extend_from_slice(name_bytes);
+    }
+    // Pad to 4-byte boundary
+    while names_data.len() % 4 != 0 {
+        names_data.push(0);
+    }
+
+    let mut reply = Vec::with_capacity(32 + names_data.len());
     reply.push(1); // reply
     reply.push(0); // unused
     write_u16_to(conn, &mut reply, seq);
-    write_u32_to(conn, &mut reply, 0); // additional data
-    write_u16_to(conn, &mut reply, 0); // number of names
+    write_u32_to(conn, &mut reply, (names_data.len() / 4) as u32);
+    write_u16_to(conn, &mut reply, matched.len() as u16);
     reply.extend(std::iter::repeat(0).take(22)); // padding
+    reply.extend_from_slice(&names_data);
     stream.write_all(&reply).await?;
     Ok(())
+}
+
+/// X11 font pattern matching: '*' matches any sequence, '?' matches any single character.
+/// Case-insensitive (caller should lowercase both strings).
+fn x11_font_pattern_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    fn matches(p: &[char], t: &[char]) -> bool {
+        let (mut pi, mut ti) = (0, 0);
+        let (mut star_pi, mut star_ti) = (usize::MAX, 0);
+        while ti < t.len() {
+            if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+                pi += 1;
+                ti += 1;
+            } else if pi < p.len() && p[pi] == '*' {
+                star_pi = pi;
+                star_ti = ti;
+                pi += 1;
+            } else if star_pi != usize::MAX {
+                pi = star_pi + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+        }
+        while pi < p.len() && p[pi] == '*' {
+            pi += 1;
+        }
+        pi == p.len()
+    }
+    matches(&p, &t)
 }
 
 // --- Pointer, Selection, and Input handlers ---

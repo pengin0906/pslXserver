@@ -767,6 +767,7 @@ fn process_commands() {
             let ws = w.borrow();
             for (win_id, commands) in render_batches {
                 if let Some(info) = ws.get(&win_id) {
+                    debug!("Render: win={} cmds={} surface={}x{}", win_id, commands.len(), info.width, info.height);
                     // Process all commands — no frame coalescing.
                     // Each command is a simple buffer operation (memcpy/fill),
                     // fast enough even for thousands of commands per frame.
