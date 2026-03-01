@@ -1382,13 +1382,14 @@ fn get_event_location(event: &AnyObject, x11_id: crate::display::Xid, win_width:
             let vh = bounds.size.height;
             // With topLeft gravity: IOSurface pixels map 1:1 to points, pinned at top-left
             // macOS Y is bottom-up, X11 Y is top-down
-            let x = point.x.clamp(0.0, win_width as f64 - 1.0) as i16;
-            let y = (vh - point.y).clamp(0.0, win_height as f64 - 1.0) as i16;
+            // Don't clamp: allow negative/out-of-bounds coords for drag scroll-back
+            let x = point.x as i16;
+            let y = (vh - point.y) as i16;
             return (x, y);
         }
-        // Fallback
-        let x = point.x.clamp(0.0, win_width as f64 - 1.0) as i16;
-        let y = (win_height as f64 - point.y).clamp(0.0, win_height as f64 - 1.0) as i16;
+        // Fallback — don't clamp for drag scroll-back
+        let x = point.x as i16;
+        let y = (win_height as f64 - point.y) as i16;
         (x, y)
     } else {
         // No window — use screen coords and find the matching window frame
