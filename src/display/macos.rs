@@ -355,16 +355,51 @@ unsafe extern "C" fn selected_range(_this: *mut AnyObject, _sel: Sel) -> NSRange
     NSRange { location: 0, length: 0 }
 }
 
-unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, _text: *mut AnyObject, _sel_range: NSRange, _repl_range: NSRange) {
+unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, _sel_range: NSRange, _repl_range: NSRange) {
     if this.is_null() { return; }
     let flag_ivar = (*this).class().instance_variable(c"textInserted").unwrap();
     *flag_ivar.load_mut::<u8>(&mut *this) = 1;
     crate::display::IME_COMPOSING.store(true, std::sync::atomic::Ordering::Relaxed);
-    debug!("IME setMarkedText: preedit active, suppressing raw KeyPress+KeyRelease");
+
+    // Send preedit text to xterm for inline display
+    if !text.is_null() {
+        let is_attr_str: bool = msg_send![&*text, isKindOfClass: objc2::class!(NSAttributedString)];
+        let ns_string: *mut AnyObject = if is_attr_str {
+            msg_send![&*text, string]
+        } else {
+            text
+        };
+        if !ns_string.is_null() {
+            let utf8: *const std::os::raw::c_char = msg_send![&*ns_string, UTF8String];
+            if !utf8.is_null() {
+                if let Ok(s) = std::ffi::CStr::from_ptr(utf8).to_str() {
+                    let preedit = s.to_string();
+                    let ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
+                    let x11_id = *ivar.load::<u32>(&*this) as crate::display::Xid;
+                    debug!("IME setMarkedText: preedit='{}' window=0x{:08x}", preedit, x11_id);
+                    send_display_event(DisplayEvent::ImePreeditDraw {
+                        window: x11_id,
+                        text: preedit,
+                        cursor_pos: 0,
+                    });
+                }
+            }
+        }
+    }
 }
 
-unsafe extern "C" fn unmark_text(_this: *mut AnyObject, _sel: Sel) {
+unsafe extern "C" fn unmark_text(this: *mut AnyObject, _sel: Sel) {
     crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Clear preedit display by sending empty preedit
+    if !this.is_null() {
+        let ivar = unsafe { (*this).class().instance_variable(c"x11WindowId").unwrap() };
+        let x11_id = unsafe { *ivar.load::<u32>(&*this) } as crate::display::Xid;
+        send_display_event(DisplayEvent::ImePreeditDraw {
+            window: x11_id,
+            text: String::new(),
+            cursor_pos: 0,
+        });
+    }
 }
 
 unsafe extern "C" fn valid_attributes(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
