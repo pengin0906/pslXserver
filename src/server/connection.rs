@@ -189,7 +189,7 @@ where
 
                     let _seq = conn.next_sequence();
                     let opcode = pending[0];
-                    debug!("Request seq={} opcode={} len={} bytes", conn.current_request_sequence(), opcode, request_len);
+                    info!("Request seq={} opcode={} len={} bytes", conn.current_request_sequence(), opcode, request_len);
                     let seq = conn.current_request_sequence();
 
                     let request_data = pending.split_to(request_len);
@@ -197,7 +197,7 @@ where
                     match handle_request(&server, &conn, opcode, &request_data, &mut stream).await {
                         Ok(()) => {}
                         Err(ServerError::NotImplemented) => {
-                            debug!("Unimplemented opcode: {} — sending Implementation error", opcode);
+                            info!("Unimplemented opcode: {} — sending Implementation error", opcode);
                             err_buf = [0u8; 32];
                             err_buf[0] = 0;
                             err_buf[1] = 17;
@@ -230,7 +230,10 @@ where
                 // would violate xcb's monotonic sequence requirement.
                 let cur_seq = conn.current_request_sequence();
                 set_event_sequence(&conn, &mut event_data, cur_seq);
-                debug!("Writing event to conn {}: type={} seq={} len={}", conn_id, event_data[0], cur_seq, event_data.len());
+                if event_data[0] == 2 || event_data[0] == 3 || event_data[0] == 34 {
+                    let detail = event_data[1];
+                    info!("Writing event to conn {}: type={} detail={} seq={}", conn_id, event_data[0], detail, cur_seq);
+                }
                 match stream.write_all(&event_data).await {
                     Ok(()) => {
                         // Drain any additional queued events before going back to select
@@ -239,6 +242,9 @@ where
                         while let Ok(mut more) = event_rx.try_recv() {
                             let cur_seq = conn.current_request_sequence();
                             set_event_sequence(&conn, &mut more, cur_seq);
+                            if more[0] == 2 || more[0] == 3 || more[0] == 34 {
+                                info!("Writing event (drain) to conn {}: type={} detail={} seq={}", conn_id, more[0], more[1], cur_seq);
+                            }
                             if stream.write_all(&more).await.is_err() { break; }
                             extra += 1;
                             if extra >= 16 { break; } // cap to avoid starving reads
@@ -391,6 +397,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         2 => handle_change_window_attributes(server, conn, data, stream).await,
         3 => handle_get_window_attributes(server, conn, data, stream).await,
         4 => handle_destroy_window(server, conn, data, stream).await,
+        7 => handle_reparent_window(server, conn, data, stream).await,
         8 => handle_map_window(server, conn, data, stream).await,
         9 => handle_map_subwindows(server, conn, data, stream).await,
         10 => handle_unmap_window(server, conn, data, stream).await,
@@ -438,10 +445,13 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         71 => handle_poly_fill_arc(server, conn, data, stream).await,
         72 => handle_put_image(server, conn, data, stream).await,
         74 => handle_poly_text8(server, conn, data, stream).await,
+        75 => handle_poly_text16(server, conn, data, stream).await,
         76 => handle_image_text8(server, conn, data, stream).await,
+        77 => handle_image_text16(server, conn, data, stream).await,
         78 => handle_create_colormap(server, conn, data, stream).await,
         79 => handle_free_colormap(server, conn, data, stream).await,
         84 => handle_alloc_color(server, conn, data, stream).await,
+        85 => handle_alloc_named_color(server, conn, data, stream).await,
         91 => handle_query_colors(server, conn, data, stream).await,
         92 => handle_lookup_color(server, conn, data, stream).await,
         97 => handle_query_best_size(server, conn, data, stream).await,
@@ -454,6 +464,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         115 => handle_set_close_down_mode(server, conn, data, stream).await,
         116 => handle_set_pointer_mapping(server, conn, data, stream).await,
         117 => handle_get_pointer_mapping(server, conn, data, stream).await,
+        118 => handle_set_modifier_mapping(server, conn, data, stream).await,
         119 => handle_get_modifier_mapping(server, conn, data, stream).await,
         93 => handle_create_cursor(server, conn, data, stream).await,
         94 => handle_create_glyph_cursor(server, conn, data, stream).await,
@@ -615,7 +626,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         }
         // No-op for common requests that don't need replies
         5 | 11 | 28 | 29 | 30 | 33 | 34 | 41 | 51 | 57 | 58 | 59 |
-        63 | 75 | 77 | 100 | 104 | 105 | 107 | 109 | 111 | 112 | 113 | 114 => {
+        63 | 100 | 104 | 105 | 107 | 109 | 111 | 112 | 113 | 114 => {
             debug!("Stubbed opcode: {} (no-op)", opcode);
             Ok(())
         }
@@ -961,6 +972,48 @@ async fn handle_destroy_window<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn handle_reparent_window<S: AsyncRead + AsyncWrite + Unpin>(
+    server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
+    data: &[u8],
+    _stream: &mut S,
+) -> Result<(), ServerError> {
+    if data.len() < 16 {
+        return Err(ServerError::Protocol);
+    }
+    let wid = read_u32(conn, &data[4..8]);
+    let new_parent = read_u32(conn, &data[8..12]);
+    let x = read_i16(conn, &data[12..14]);
+    let y = read_i16(conn, &data[14..16]);
+    debug!("ReparentWindow: 0x{:08X} -> parent 0x{:08X} at ({},{})", wid, new_parent, x, y);
+
+    // Update window's parent and position
+    if let Some(res) = server.resources.get(&wid) {
+        if let super::resources::Resource::Window(win) = res.value() {
+            let mut w = win.write();
+            let old_parent = w.parent;
+            w.parent = new_parent;
+            w.x = x;
+            w.y = y;
+            drop(w);
+
+            // Remove from old parent's children list
+            if let Some(old_res) = server.resources.get(&old_parent) {
+                if let super::resources::Resource::Window(old_win) = old_res.value() {
+                    old_win.write().children.retain(|&c| c != wid);
+                }
+            }
+            // Add to new parent's children list
+            if let Some(new_res) = server.resources.get(&new_parent) {
+                if let super::resources::Resource::Window(new_win) = new_res.value() {
+                    new_win.write().children.push(wid);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
     server: &Arc<XServer>,
     conn: &Arc<ClientConnection>,
@@ -1007,11 +1060,23 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
         });
 
         if let Ok(handle) = rx.await {
-            // Re-acquire lock to store handle
-            if let Some(res) = server.resources.get(&wid) {
+            // Re-acquire lock to store handle and check for deferred WM_NAME
+            let deferred_title = if let Some(res) = server.resources.get(&wid) {
                 if let super::resources::Resource::Window(win) = res.value() {
-                    win.write().native_window = Some(handle.clone());
-                }
+                    let mut w = win.write();
+                    w.native_window = Some(handle.clone());
+                    // If WM_NAME was already set before MapWindow, apply it now
+                    w.get_property(crate::server::atoms::predefined::WM_NAME)
+                        .and_then(|p| std::str::from_utf8(&p.data).ok().map(|s| s.to_string()))
+                } else { None }
+            } else { None };
+            if let Some(title) = deferred_title {
+                let _ = server.display_cmd_tx.send(
+                    crate::display::DisplayCommand::SetWindowTitle {
+                        handle: handle.clone(),
+                        title,
+                    },
+                );
             }
             let _ = server.display_cmd_tx.send(
                 crate::display::DisplayCommand::ShowWindow { handle },
@@ -1147,8 +1212,8 @@ async fn handle_configure_window<S: AsyncRead + AsyncWrite + Unpin>(
             // 0x20 = Sibling, 0x40 = StackMode
             let _ = offset;
 
-            debug!("ConfigureWindow: 0x{:08X} mask=0x{:04X} => {}x{} at ({},{}) border={}",
-                wid, value_mask, w.width, w.height, w.x, w.y, w.border_width);
+            debug!("ConfigureWindow: 0x{:08X} mask=0x{:04X} => {}x{} at ({},{}) border={} old={}x{}",
+                wid, value_mask, w.width, w.height, w.x, w.y, w.border_width, old_width, old_height);
 
             // Update native window if exists
             if let Some(ref handle) = w.native_window {
@@ -1172,7 +1237,8 @@ async fn handle_configure_window<S: AsyncRead + AsyncWrite + Unpin>(
     } else { None };
 
     // Send ConfigureNotify event inline (must maintain sequence order)
-    if let Some((x, y, width, height, border_width, override_redirect, _parent, _size_changed, wants_structure_notify)) = configure_info {
+    if let Some((x, y, width, height, border_width, override_redirect, _parent, size_changed, wants_structure_notify)) = configure_info {
+        debug!("ConfigureWindow 0x{:08X}: size_changed={} wants_struct_notify={}", wid, size_changed, wants_structure_notify);
         if wants_structure_notify {
             let seq = conn.current_request_sequence();
             let mut config_notify = super::events::build_configure_notify(
@@ -1180,6 +1246,21 @@ async fn handle_configure_window<S: AsyncRead + AsyncWrite + Unpin>(
             );
             set_event_sequence(conn, &mut config_notify, seq);
             stream.write_all(&config_notify).await?;
+        }
+        // When a child window is resized by the client, send Expose so it redraws
+        if size_changed {
+            let seq = conn.current_request_sequence();
+            let mut expose = [0u8; 32];
+            expose[0] = 12; // Expose event type
+            expose[2..4].copy_from_slice(&(seq as u16).to_le_bytes());
+            expose[4..8].copy_from_slice(&wid.to_le_bytes());
+            expose[8..10].copy_from_slice(&0u16.to_le_bytes()); // x
+            expose[10..12].copy_from_slice(&0u16.to_le_bytes()); // y
+            expose[12..14].copy_from_slice(&width.to_le_bytes()); // width
+            expose[14..16].copy_from_slice(&height.to_le_bytes()); // height
+            expose[16..18].copy_from_slice(&0u16.to_le_bytes()); // count
+            set_event_sequence(conn, &mut expose, seq);
+            stream.write_all(&expose).await?;
         }
     }
 
@@ -1219,6 +1300,10 @@ async fn handle_change_property<S: AsyncRead + AsyncWrite + Unpin>(
 
     let prop_data = data[data_start..data_start + data_len].to_vec();
 
+    // Resolve property and type atom names for logging
+    let prop_name = server.atoms.get_name(property).unwrap_or_default();
+    let _type_name = server.atoms.get_name(type_atom).unwrap_or_default();
+
     if let Some(res) = server.resources.get(&wid) {
         if let super::resources::Resource::Window(win) = res.value() {
             let mut w = win.write();
@@ -1229,8 +1314,8 @@ async fn handle_change_property<S: AsyncRead + AsyncWrite + Unpin>(
                 data: prop_data,
             });
 
-            // Check for WM_NAME changes to update native window title
-            if property == crate::server::atoms::predefined::WM_NAME {
+            // Check for WM_NAME or _NET_WM_NAME changes to update native window title
+            if property == crate::server::atoms::predefined::WM_NAME || prop_name == "_NET_WM_NAME" {
                 if let Some(prop) = w.get_property(property) {
                     if let Ok(title) = std::str::from_utf8(&prop.data) {
                         if let Some(ref handle) = w.native_window {
@@ -1418,23 +1503,40 @@ async fn handle_get_geometry<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     let reply = if let Some(res) = server.resources.get(&drawable) {
-        if let super::resources::Resource::Window(win) = res.value() {
-            let w = win.read();
-            let mut reply = Vec::with_capacity(32);
-            reply.push(1); // reply
-            reply.push(w.depth);
-            write_u16_to(conn, &mut reply, seq);
-            write_u32_to(conn, &mut reply, 0);
-            write_u32_to(conn, &mut reply, server.screens[0].root_window); // root
-            write_i16_to(conn, &mut reply, w.x);
-            write_i16_to(conn, &mut reply, w.y);
-            write_u16_to(conn, &mut reply, w.width);
-            write_u16_to(conn, &mut reply, w.height);
-            write_u16_to(conn, &mut reply, w.border_width);
-            reply.extend(std::iter::repeat(0).take(10));
-            Some(reply)
-        } else {
-            None
+        match res.value() {
+            super::resources::Resource::Window(win) => {
+                let w = win.read();
+                let mut reply = Vec::with_capacity(32);
+                reply.push(1); // reply
+                reply.push(w.depth);
+                write_u16_to(conn, &mut reply, seq);
+                write_u32_to(conn, &mut reply, 0);
+                write_u32_to(conn, &mut reply, server.screens[0].root_window); // root
+                write_i16_to(conn, &mut reply, w.x);
+                write_i16_to(conn, &mut reply, w.y);
+                write_u16_to(conn, &mut reply, w.width);
+                write_u16_to(conn, &mut reply, w.height);
+                write_u16_to(conn, &mut reply, w.border_width);
+                reply.extend(std::iter::repeat(0).take(10));
+                Some(reply)
+            }
+            super::resources::Resource::Pixmap(pix) => {
+                let p = pix.read();
+                let mut reply = Vec::with_capacity(32);
+                reply.push(1); // reply
+                reply.push(p.depth);
+                write_u16_to(conn, &mut reply, seq);
+                write_u32_to(conn, &mut reply, 0);
+                write_u32_to(conn, &mut reply, server.screens[0].root_window); // root
+                write_i16_to(conn, &mut reply, 0); // x
+                write_i16_to(conn, &mut reply, 0); // y
+                write_u16_to(conn, &mut reply, p.width);
+                write_u16_to(conn, &mut reply, p.height);
+                write_u16_to(conn, &mut reply, 0); // border_width
+                reply.extend(std::iter::repeat(0).take(10));
+                Some(reply)
+            }
+            _ => None,
         }
     } else {
         None
@@ -1483,41 +1585,9 @@ async fn handle_create_gc<S: AsyncRead + AsyncWrite + Unpin>(
 
     let mut gc = super::resources::GContextState::new(gcid, drawable);
 
-    // Parse GC value list
-    let mut offset = 16;
-    if value_mask & (1 << 0) != 0 { // Function
-        gc.function = super::resources::GcFunction::from(read_u32(conn, &data[offset..offset+4]) as u8);
-        offset += 4;
-    }
-    if value_mask & (1 << 1) != 0 { // PlaneMask
-        gc.plane_mask = read_u32(conn, &data[offset..offset+4]);
-        offset += 4;
-    }
-    if value_mask & (1 << 2) != 0 { // Foreground
-        gc.foreground = read_u32(conn, &data[offset..offset+4]);
-        offset += 4;
-    }
-    if value_mask & (1 << 3) != 0 { // Background
-        gc.background = read_u32(conn, &data[offset..offset+4]);
-        offset += 4;
-    }
-    if value_mask & (1 << 4) != 0 { // LineWidth
-        gc.line_width = read_u32(conn, &data[offset..offset+4]) as u16;
-        offset += 4;
-    }
-    if value_mask & (1 << 5) != 0 { // LineStyle
-        gc.line_style = read_u32(conn, &data[offset..offset+4]) as u8;
-        offset += 4;
-    }
-    if value_mask & (1 << 14) != 0 { // Font
-        gc.font = read_u32(conn, &data[offset..offset+4]);
-        offset += 4;
-    }
-    if value_mask & (1 << 16) != 0 { // GraphicsExposures
-        gc.graphics_exposures = read_u32(conn, &data[offset..offset+4]) != 0;
-        offset += 4;
-    }
-    let _ = offset; // suppress warning
+    // Parse GC value list — all 23 bits (0-22) must be processed in order.
+    // Each set bit corresponds to a 4-byte value in the data.
+    parse_gc_values(conn, data, 16, value_mask, &mut gc);
 
     debug!("CreateGC: 0x{:08X} fg=0x{:06X} bg=0x{:06X}", gcid, gc.foreground, gc.background);
 
@@ -1544,21 +1614,7 @@ async fn handle_change_gc<S: AsyncRead + AsyncWrite + Unpin>(
     if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
             let mut g = gc.write();
-            let mut offset = 12;
-
-            if value_mask & (1 << 2) != 0 { // Foreground
-                g.foreground = read_u32(conn, &data[offset..offset+4]);
-                offset += 4;
-            }
-            if value_mask & (1 << 3) != 0 { // Background
-                g.background = read_u32(conn, &data[offset..offset+4]);
-                offset += 4;
-            }
-            if value_mask & (1 << 14) != 0 { // Font
-                g.font = read_u32(conn, &data[offset..offset+4]);
-                offset += 4;
-            }
-            let _ = offset;
+            parse_gc_values(conn, data, 12, value_mask, &mut g);
         }
     }
     Ok(())
@@ -1610,6 +1666,38 @@ fn clear_window_tree(server: &Arc<XServer>, wid: u32) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Parse GC value list attributes (bits 0-22) in correct order.
+/// X11 GC value list packs values for set bits in ascending bit order.
+/// All 23 possible bits must be processed to maintain correct offsets.
+fn parse_gc_values(
+    conn: &Arc<ClientConnection>,
+    data: &[u8],
+    start_offset: usize,
+    value_mask: u32,
+    gc: &mut super::resources::GContextState,
+) {
+    let mut offset = start_offset;
+    // Process all 23 GC attribute bits in order (0-22).
+    // For each set bit, read the 4-byte value and advance offset.
+    for bit in 0..23u32 {
+        if value_mask & (1 << bit) == 0 { continue; }
+        if offset + 4 > data.len() { break; }
+        let val = read_u32(conn, &data[offset..offset+4]);
+        offset += 4;
+        match bit {
+            0  => gc.function = super::resources::GcFunction::from(val as u8),
+            1  => gc.plane_mask = val,
+            2  => gc.foreground = val,
+            3  => gc.background = val,
+            4  => gc.line_width = val as u16,
+            5  => gc.line_style = val as u8,
+            14 => gc.font = val,
+            16 => gc.graphics_exposures = val != 0,
+            _  => { /* skip unhandled attributes (cap-style, join-style, fill-style, etc.) */ }
         }
     }
 }
@@ -1680,6 +1768,48 @@ fn clip_clear_by_children(
 fn post_render_to_mailbox(server: &Arc<XServer>, win_id: u64, commands: Vec<crate::display::RenderCommand>) {
     let mut entry = server.render_mailbox.entry(win_id).or_default();
     entry.extend(commands);
+}
+
+/// Update the global IME cursor spot position.
+/// Walks up from the drawable to find the top-level native window,
+/// accumulating coordinate offsets, and stores the result in global atomics.
+fn update_ime_spot(server: &Arc<XServer>, drawable: u32, x: i16, y: i16) {
+    use std::sync::atomic::Ordering;
+    let (_, abs_x, abs_y) = find_native_position(server, drawable, x, y);
+    crate::display::IME_SPOT_X.store(abs_x as i32, Ordering::Relaxed);
+    crate::display::IME_SPOT_Y.store(abs_y as i32, Ordering::Relaxed);
+}
+
+/// Find the native window for a drawable and compute position in native window coordinates.
+/// Returns (native_window_handle_id, adjusted_x, adjusted_y).
+fn find_native_position(server: &Arc<XServer>, drawable: u32, x: i16, y: i16) -> (u64, i16, i16) {
+    if let Some(res) = server.resources.get(&drawable) {
+        if let super::resources::Resource::Window(win) = res.value() {
+            let w = win.read();
+            if let Some(ref handle) = w.native_window {
+                return (handle.id, x, y);
+            }
+            // Child window — walk up ancestor chain
+            let mut ax = x + w.x;
+            let mut ay = y + w.y;
+            let mut current = w.parent;
+            drop(w);
+            for _ in 0..32 {
+                if let Some(pres) = server.resources.get(&current) {
+                    if let super::resources::Resource::Window(pwin) = pres.value() {
+                        let pw = pwin.read();
+                        if let Some(ref handle) = pw.native_window {
+                            return (handle.id, ax, ay);
+                        }
+                        ax += pw.x;
+                        ay += pw.y;
+                        current = pw.parent;
+                    } else { break; }
+                } else { break; }
+            }
+        }
+    }
+    (0, 0, 0)
 }
 
 fn dispatch_render_commands(
@@ -1773,6 +1903,8 @@ fn dispatch_render_commands(
                         let pw = pwin.read();
                         if let Some(ref handle) = pw.native_window {
                             // Found the native ancestor — offset all commands
+                            debug!("ChildWindow dispatch: drawable=0x{:08X} offset=({},{}) -> native win {} ({} cmds)",
+                                  drawable, offset_x, offset_y, handle.id, commands.len());
                             let adjusted = offset_render_commands(commands, offset_x, offset_y);
                             post_render_to_mailbox(server, handle.id, adjusted);
                             return;
@@ -2339,6 +2471,9 @@ async fn handle_poly_fill_arc<S: AsyncRead + AsyncWrite + Unpin>(
         let angle2 = read_i16(conn, &data[offset+10..offset+12]);
         offset += 12;
 
+        debug!("PolyFillArc: drawable=0x{:08X} gc=0x{:08X} ({},{} {}x{}) a1={} a2={} color=0x{:06X}",
+              drawable, gcid, x, y, width, height, angle1, angle2, fg_color);
+
         commands.push(crate::display::RenderCommand::FillArc {
             x, y, width, height, angle1, angle2,
             color: fg_color,
@@ -2371,6 +2506,12 @@ async fn handle_put_image<S: AsyncRead + AsyncWrite + Unpin>(
 
     debug!("PutImage: drawable=0x{:08X} {}x{} at ({},{}) depth={} format={}", drawable, width, height, dst_x, dst_y, depth, format);
     let image_data = data[24..].to_vec();
+
+    // Track PutImage position as IME cursor hint (xterm Xft renders glyphs via PutImage)
+    // Heuristic: glyph-sized images (height 8-40, width 4-30) likely represent text
+    if height >= 8 && height <= 40 && width >= 4 && width <= 30 {
+        update_ime_spot(server, drawable, dst_x + width as i16, dst_y);
+    }
 
     let command = crate::display::RenderCommand::PutImage {
         x: dst_x,
@@ -2458,8 +2599,128 @@ async fn handle_image_text8<S: AsyncRead + AsyncWrite + Unpin>(
     let text = data[16..text_end].to_vec();
 
     if !text.is_empty() {
+        // Update IME cursor position: end of drawn text in native window coords
+        let cursor_x = x + (str_len as i16) * 6; // GLYPH_W = 6
+        update_ime_spot(server, drawable, cursor_x, y);
+
         let command = crate::display::RenderCommand::DrawText {
             x, y, text, font_id, color: fg_color, bg_color,
+        };
+        dispatch_render_commands(server, drawable, vec![command]);
+    }
+    Ok(())
+}
+
+/// PolyText16 (opcode 75): 16-bit text drawing (no background fill).
+/// Each character is 2 bytes (big-endian). Convert to UTF-8 for rendering.
+async fn handle_poly_text16<S: AsyncRead + AsyncWrite + Unpin>(
+    server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
+    data: &[u8],
+    _stream: &mut S,
+) -> Result<(), ServerError> {
+    if data.len() < 16 {
+        return Err(ServerError::Protocol);
+    }
+
+    let drawable = read_u32(conn, &data[4..8]);
+    let gcid = read_u32(conn, &data[8..12]);
+    let x = read_i16(conn, &data[12..14]);
+    let y = read_i16(conn, &data[14..16]);
+
+    let (fg_color, font_id) = if let Some(res) = server.resources.get(&gcid) {
+        if let super::resources::Resource::GContext(gc) = res.value() {
+            let gc = gc.read();
+            (gc.foreground, gc.font)
+        } else { (0xFFFFFF, 0) }
+    } else { (0xFFFFFF, 0) };
+
+    // Parse text items: each item has len (in 2-byte chars), delta, then len*2 bytes
+    let mut text_bytes = Vec::new();
+    let mut offset = 16;
+    while offset < data.len() {
+        let len = data[offset] as usize;
+        if len == 0 || len == 255 { break; }
+        let _delta = data[offset + 1] as i8;
+        offset += 2;
+        let byte_len = len * 2;
+        if offset + byte_len <= data.len() {
+            // Convert 16-bit big-endian chars to UTF-8 bytes
+            for j in 0..len {
+                let hi = data[offset + j * 2] as u16;
+                let lo = data[offset + j * 2 + 1] as u16;
+                let codepoint = (hi << 8) | lo;
+                if let Some(ch) = char::from_u32(codepoint as u32) {
+                    let mut buf = [0u8; 4];
+                    let s = ch.encode_utf8(&mut buf);
+                    text_bytes.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+        offset += byte_len;
+    }
+
+    if !text_bytes.is_empty() {
+        let command = crate::display::RenderCommand::DrawText {
+            x, y, text: text_bytes, font_id, color: fg_color, bg_color: None,
+        };
+        dispatch_render_commands(server, drawable, vec![command]);
+    }
+    Ok(())
+}
+
+/// ImageText16 (opcode 77): 16-bit text drawing with background fill.
+/// Each character is 2 bytes (big-endian). Convert to UTF-8 for rendering.
+async fn handle_image_text16<S: AsyncRead + AsyncWrite + Unpin>(
+    server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
+    data: &[u8],
+    _stream: &mut S,
+) -> Result<(), ServerError> {
+    if data.len() < 16 {
+        return Err(ServerError::Protocol);
+    }
+
+    let str_len = data[1] as usize; // number of 2-byte characters
+    let drawable = read_u32(conn, &data[4..8]);
+    let gcid = read_u32(conn, &data[8..12]);
+    let x = read_i16(conn, &data[12..14]);
+    let y = read_i16(conn, &data[14..16]);
+
+    let (fg_color, bg_color, font_id) = if let Some(res) = server.resources.get(&gcid) {
+        if let super::resources::Resource::GContext(gc) = res.value() {
+            let gc = gc.read();
+            (gc.foreground, Some(gc.background), gc.font)
+        } else { (0xFFFFFF, Some(0), 0) }
+    } else { (0xFFFFFF, Some(0), 0) };
+
+    let byte_len = str_len * 2;
+    let text_end = (16 + byte_len).min(data.len());
+    let raw = &data[16..text_end];
+
+    // Convert 16-bit big-endian chars to UTF-8
+    let mut text_bytes = Vec::new();
+    let mut char_count = 0usize;
+    for i in 0..str_len {
+        if i * 2 + 1 >= raw.len() { break; }
+        let hi = raw[i * 2] as u16;
+        let lo = raw[i * 2 + 1] as u16;
+        let codepoint = (hi << 8) | lo;
+        if let Some(ch) = char::from_u32(codepoint as u32) {
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            text_bytes.extend_from_slice(s.as_bytes());
+            char_count += 1;
+        }
+    }
+
+    if !text_bytes.is_empty() {
+        // Update IME cursor position
+        let cursor_x = x + (char_count as i16) * 12; // CJK chars are typically double-width (2 * GLYPH_W)
+        update_ime_spot(server, drawable, cursor_x, y);
+
+        let command = crate::display::RenderCommand::DrawText {
+            x, y, text: text_bytes, font_id, color: fg_color, bg_color,
         };
         dispatch_render_commands(server, drawable, vec![command]);
     }
@@ -2782,7 +3043,7 @@ async fn handle_list_extensions<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 async fn handle_get_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
-    _server: &Arc<XServer>,
+    server: &Arc<XServer>,
     conn: &Arc<ClientConnection>,
     data: &[u8],
     stream: &mut S,
@@ -2809,15 +3070,29 @@ async fn handle_get_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
     // So X11 keycode 8 = macOS key 0 (A), keycode 9 = macOS key 1 (S), etc.
     for i in 0..count {
         let keycode = first_keycode + i;
-        let mac_key = keycode.wrapping_sub(8); // reverse the +8 offset
 
-        // macOS virtual keycode → (normal keysym, shifted keysym)
-        let (keysym, shifted) = macos_keycode_to_keysym(mac_key);
-
-        write_u32_to(conn, &mut reply, keysym);
-        write_u32_to(conn, &mut reply, shifted);
-        write_u32_to(conn, &mut reply, 0); // NoSymbol (mode switch)
-        write_u32_to(conn, &mut reply, 0); // NoSymbol (mode+shift)
+        if keycode >= 200 {
+            // Virtual keycodes 200+ for IME input (Unicode keysyms)
+            let vk = server.virtual_keysyms.read();
+            let idx = (keycode - 200) as usize;
+            let ks = if idx < vk.len() { vk[idx] } else { 0 };
+            if ks != 0 {
+                log::info!("GetKeyboardMapping: keycode={} → keysym 0x{:08x} (U+{:04X})",
+                    keycode, ks, ks & 0x00FFFFFF);
+            }
+            write_u32_to(conn, &mut reply, ks);
+            write_u32_to(conn, &mut reply, 0);
+            write_u32_to(conn, &mut reply, 0);
+            write_u32_to(conn, &mut reply, 0);
+        } else {
+            let mac_key = keycode.wrapping_sub(8); // reverse the +8 offset
+            // macOS virtual keycode → (normal keysym, shifted keysym)
+            let (keysym, shifted) = macos_keycode_to_keysym(mac_key);
+            write_u32_to(conn, &mut reply, keysym);
+            write_u32_to(conn, &mut reply, shifted);
+            write_u32_to(conn, &mut reply, 0); // NoSymbol (mode switch)
+            write_u32_to(conn, &mut reply, 0); // NoSymbol (mode+shift)
+        }
     }
 
     stream.write_all(&reply).await?;
@@ -2929,6 +3204,10 @@ fn macos_keycode_to_keysym(mac_key: u32) -> (u32, u32) {
         121 => (0xFF56, 0xFF56), // Page Down
         117 => (0xFFFF, 0xFFFF), // Forward Delete
 
+        // JIS keyboard keys
+        102 => (0xFF30, 0xFF30), // JIS_Eisuu → Eisu_toggle (英数)
+        104 => (0xFF27, 0xFF27), // JIS_Kana → Hiragana_Katakana (かな)
+
         // Keypad
         65  => (0xFFAE, 0xFFAE), // KP_Decimal
         67  => (0xFFAA, 0xFFAA), // KP_Multiply
@@ -3026,31 +3305,51 @@ async fn handle_get_modifier_mapping<S: AsyncRead + AsyncWrite + Unpin>(
     reply.extend(std::iter::repeat(0).take(24)); // padding
 
     // Modifier mapping: 8 modifiers x keycodes_per_modifier keycodes
-    // Shift
-    reply.push(50); // Shift_L
-    reply.push(62); // Shift_R
-    // Lock
-    reply.push(66); // Caps_Lock
+    // Keycodes MUST match actual key events: X11 keycode = macOS keycode + 8
+    // Shift (macOS 56=LShift, 60=RShift → X11 64, 68)
+    reply.push(64); // Shift_L (macOS 56 + 8)
+    reply.push(68); // Shift_R (macOS 60 + 8)
+    // Lock (macOS 57=CapsLock → X11 65)
+    reply.push(65); // Caps_Lock (macOS 57 + 8)
     reply.push(0);
-    // Control
-    reply.push(37); // Control_L
-    reply.push(105); // Control_R
-    // Mod1 (Alt)
-    reply.push(64); // Alt_L
-    reply.push(108); // Alt_R
-    // Mod2 (Num Lock)
-    reply.push(77); // Num_Lock
+    // Control (macOS 59=LCtrl, 62=RCtrl → X11 67, 70)
+    reply.push(67); // Control_L (macOS 59 + 8)
+    reply.push(70); // Control_R (macOS 62 + 8)
+    // Mod1 (Alt/Option: macOS 58=LOpt, 61=ROpt → X11 66, 69)
+    reply.push(66); // Alt_L (macOS 58 + 8)
+    reply.push(69); // Alt_R (macOS 61 + 8)
+    // Mod2 (Num Lock) - not typically present on Mac keyboards
+    reply.push(0);
     reply.push(0);
     // Mod3
     reply.push(0);
     reply.push(0);
-    // Mod4 (Super)
-    reply.push(133); // Super_L
-    reply.push(134); // Super_R
+    // Mod4 (Super/Command: macOS 55=LCmd → X11 63)
+    reply.push(63); // Super_L/Meta_L (macOS 55 + 8)
+    reply.push(0);
     // Mod5
     reply.push(0);
     reply.push(0);
 
+    stream.write_all(&reply).await?;
+    Ok(())
+}
+
+async fn handle_set_modifier_mapping<S: AsyncRead + AsyncWrite + Unpin>(
+    _server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
+    _data: &[u8],
+    stream: &mut S,
+) -> Result<(), ServerError> {
+    // SetModifierMapping requires a reply.
+    // Reply with MappingSuccess (0) — we accept but ignore the client's mapping.
+    let seq = conn.current_request_sequence();
+    let mut reply = Vec::with_capacity(32);
+    reply.push(1); // reply
+    reply.push(0); // status: MappingSuccess
+    write_u16_to(conn, &mut reply, seq);
+    write_u32_to(conn, &mut reply, 0); // additional data length
+    reply.extend(std::iter::repeat(0).take(24)); // padding
     stream.write_all(&reply).await?;
     Ok(())
 }
@@ -3496,6 +3795,54 @@ async fn handle_alloc_color<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn handle_alloc_named_color<S: AsyncRead + AsyncWrite + Unpin>(
+    _server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
+    data: &[u8],
+    stream: &mut S,
+) -> Result<(), ServerError> {
+    // AllocNamedColor: cmap=data[4..8], name_len=data[8..10], name=data[12..]
+    if data.len() < 12 {
+        return Err(ServerError::Protocol);
+    }
+    let name_len = read_u16(conn, &data[8..10]) as usize;
+    if data.len() < 12 + name_len {
+        return Err(ServerError::Protocol);
+    }
+    let name = std::str::from_utf8(&data[12..12 + name_len])
+        .unwrap_or("")
+        .to_lowercase();
+
+    let (r, g, b) = lookup_x11_color(&name).unwrap_or_else(|| {
+        debug!("AllocNamedColor: unknown color '{}', defaulting to black", name);
+        (0, 0, 0)
+    });
+
+    // TrueColor: pixel = (R8 << 16) | (G8 << 8) | B8
+    let r8 = (r >> 8) as u32;
+    let g8 = (g >> 8) as u32;
+    let b8 = (b >> 8) as u32;
+    let pixel = (r8 << 16) | (g8 << 8) | b8;
+
+    let seq = conn.current_request_sequence();
+    let mut reply = Vec::with_capacity(32);
+    reply.push(1); // reply
+    reply.push(0); // unused
+    write_u16_to(conn, &mut reply, seq);
+    write_u32_to(conn, &mut reply, 0); // additional data length
+    write_u32_to(conn, &mut reply, pixel); // pixel
+    write_u16_to(conn, &mut reply, r); // exact red
+    write_u16_to(conn, &mut reply, g); // exact green
+    write_u16_to(conn, &mut reply, b); // exact blue
+    write_u16_to(conn, &mut reply, r); // visual red
+    write_u16_to(conn, &mut reply, g); // visual green
+    write_u16_to(conn, &mut reply, b); // visual blue
+    reply.extend(std::iter::repeat(0).take(8)); // padding to 32
+
+    stream.write_all(&reply).await?;
+    Ok(())
+}
+
 async fn handle_query_colors<S: AsyncRead + AsyncWrite + Unpin>(
     _server: &Arc<XServer>,
     conn: &Arc<ClientConnection>,
@@ -3556,23 +3903,11 @@ async fn handle_lookup_color<S: AsyncRead + AsyncWrite + Unpin>(
         .unwrap_or("")
         .to_lowercase();
 
-    // Basic X11 color name lookup
-    let (r, g, b) = match name.as_str() {
-        "white" => (0xFFFF_u16, 0xFFFF_u16, 0xFFFF_u16),
-        "black" => (0, 0, 0),
-        "red" => (0xFFFF, 0, 0),
-        "green" => (0, 0xFFFF, 0),
-        "blue" => (0, 0, 0xFFFF),
-        "yellow" => (0xFFFF, 0xFFFF, 0),
-        "cyan" => (0, 0xFFFF, 0xFFFF),
-        "magenta" => (0xFFFF, 0, 0xFFFF),
-        "grey" | "gray" => (0xBEBE, 0xBEBE, 0xBEBE),
-        _ => {
-            debug!("LookupColor: unknown color '{}'", name);
-            // Return Name error (opcode 15)
-            return Err(ServerError::Protocol);
-        }
-    };
+    // X11 color name lookup using rgb.txt database
+    let (r, g, b) = lookup_x11_color(&name).unwrap_or_else(|| {
+        debug!("LookupColor: unknown color '{}', defaulting to black", name);
+        (0, 0, 0)
+    });
 
     let seq = conn.current_request_sequence();
     let mut reply = Vec::with_capacity(32);
@@ -3586,7 +3921,7 @@ async fn handle_lookup_color<S: AsyncRead + AsyncWrite + Unpin>(
     write_u16_to(conn, &mut reply, r); // visual red
     write_u16_to(conn, &mut reply, g); // visual green
     write_u16_to(conn, &mut reply, b); // visual blue
-    reply.extend(std::iter::repeat(0).take(8)); // padding to 32
+    reply.extend(std::iter::repeat(0).take(12)); // padding to 32
 
     stream.write_all(&reply).await?;
     Ok(())
@@ -3771,4 +4106,53 @@ fn write_u16_at(conn: &ClientConnection, buf: &mut [u8], offset: usize, val: u16
         ByteOrder::LittleEndian => val.to_le_bytes(),
     };
     buf[offset..offset + 2].copy_from_slice(&bytes);
+}
+
+/// Look up an X11 color name from the system rgb.txt database.
+/// Returns 16-bit (r, g, b) values suitable for X11 LookupColor/AllocNamedColor replies.
+fn lookup_x11_color(name: &str) -> Option<(u16, u16, u16)> {
+    use std::sync::OnceLock;
+    use std::collections::HashMap;
+
+    static COLOR_DB: OnceLock<HashMap<String, (u16, u16, u16)>> = OnceLock::new();
+
+    let db = COLOR_DB.get_or_init(|| {
+        let mut map = HashMap::new();
+        let paths = [
+            "/opt/X11/share/X11/rgb.txt",
+            "/usr/share/X11/rgb.txt",
+            "/etc/X11/rgb.txt",
+        ];
+        for path in &paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('!') || line.starts_with('#') {
+                        continue;
+                    }
+                    let parts: Vec<&str> = line.splitn(4, |c: char| c.is_whitespace()).collect();
+                    if parts.len() >= 4 {
+                        if let (Ok(r), Ok(g), Ok(b)) = (
+                            parts[0].trim().parse::<u8>(),
+                            parts[1].trim().parse::<u8>(),
+                            parts[2].trim().parse::<u8>(),
+                        ) {
+                            let color_name = parts[3..].join(" ").trim().to_lowercase();
+                            // X11 colors are 16-bit: scale 8-bit to 16-bit
+                            let r16 = (r as u16) << 8 | r as u16;
+                            let g16 = (g as u16) << 8 | g as u16;
+                            let b16 = (b as u16) << 8 | b as u16;
+                            map.insert(color_name, (r16, g16, b16));
+                        }
+                    }
+                }
+                if !map.is_empty() {
+                    break;
+                }
+            }
+        }
+        map
+    });
+
+    db.get(name).copied()
 }

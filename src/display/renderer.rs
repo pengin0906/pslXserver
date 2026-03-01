@@ -17,8 +17,8 @@ pub fn render_to_buffer(
         RenderCommand::FillRectangle { x, y, width: w, height: h, color } => {
             let x0 = (*x as i32).max(0) as u32;
             let y0 = (*y as i32).max(0) as u32;
-            let x1 = ((*x as i32 + *w as i32) as u32).min(width);
-            let y1 = ((*y as i32 + *h as i32) as u32).min(height);
+            let x1 = ((*x as i32 + *w as i32).max(0) as u32).min(width);
+            let y1 = ((*y as i32 + *h as i32).max(0) as u32).min(height);
 
             if x0 >= x1 || y0 >= y1 { return; }
 
@@ -458,33 +458,81 @@ fn draw_text_bitmap(
 
     let top_y = y as i32 - ASCENT as i32;
 
-    for (i, &ch) in text.iter().enumerate() {
-        let cx = x as i32 + (i as i32 * GLYPH_W as i32);
+    // Try to decode as UTF-8; if valid, render char-by-char with width awareness
+    let text_str = std::str::from_utf8(text);
+    let mut cursor_x = x as i32;
 
-        // Fill background per character cell if ImageText
-        if let Some(bg) = bg_color {
-            let fill = RenderCommand::FillRectangle {
-                x: cx as i16, y: top_y as i16,
-                width: GLYPH_W as u16, height: GLYPH_H as u16,
-                color: bg,
-            };
-            render_to_buffer(buffer, buf_w, buf_h, stride, &fill);
+    if let Ok(s) = text_str {
+        for ch in s.chars() {
+            // Determine character width: CJK/fullwidth = 2 cells, ASCII = 1 cell
+            let char_cells = if ch.is_ascii() { 1u32 } else { 2u32 };
+            let cell_w = char_cells * GLYPH_W;
+
+            // Fill background per character cell if ImageText
+            if let Some(bg) = bg_color {
+                let fill = RenderCommand::FillRectangle {
+                    x: cursor_x as i16, y: top_y as i16,
+                    width: cell_w as u16, height: GLYPH_H as u16,
+                    color: bg,
+                };
+                render_to_buffer(buffer, buf_w, buf_h, stride, &fill);
+            }
+
+            if ch.is_ascii() {
+                // ASCII: use bitmap font
+                let glyph = get_glyph_bitmap(ch as u8);
+                for row in 0..GLYPH_H {
+                    let bits = glyph[row as usize];
+                    if bits == 0 { continue; }
+                    let py = top_y + row as i32;
+                    if py < 0 || py >= buf_h as i32 { continue; }
+                    for col in 0..GLYPH_W {
+                        if bits & (0x80 >> col) != 0 {
+                            let px = cursor_x + col as i32;
+                            if px >= 0 && (px as u32) < buf_w {
+                                let off = (py as usize) * (stride as usize) + (px as usize) * 4;
+                                if off + 4 <= buffer.len() {
+                                    buffer[off..off + 4].copy_from_slice(&pixel);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Non-ASCII (CJK etc.): render using CoreText
+                render_coretext_char(buffer, buf_w, buf_h, stride, cursor_x, top_y, ch, &pixel, cell_w, GLYPH_H);
+            }
+
+            cursor_x += cell_w as i32;
         }
+    } else {
+        // Not valid UTF-8: fall back to byte-by-byte rendering
+        for (i, &ch) in text.iter().enumerate() {
+            let cx = x as i32 + (i as i32 * GLYPH_W as i32);
 
-        // Get glyph bitmap
-        let glyph = get_glyph_bitmap(ch);
-        for row in 0..GLYPH_H {
-            let bits = glyph[row as usize];
-            if bits == 0 { continue; }
-            let py = top_y + row as i32;
-            if py < 0 || py >= buf_h as i32 { continue; }
-            for col in 0..GLYPH_W {
-                if bits & (0x80 >> col) != 0 {
-                    let px = cx + col as i32;
-                    if px >= 0 && (px as u32) < buf_w {
-                        let off = (py as usize) * (stride as usize) + (px as usize) * 4;
-                        if off + 4 <= buffer.len() {
-                            buffer[off..off + 4].copy_from_slice(&pixel);
+            if let Some(bg) = bg_color {
+                let fill = RenderCommand::FillRectangle {
+                    x: cx as i16, y: top_y as i16,
+                    width: GLYPH_W as u16, height: GLYPH_H as u16,
+                    color: bg,
+                };
+                render_to_buffer(buffer, buf_w, buf_h, stride, &fill);
+            }
+
+            let glyph = get_glyph_bitmap(ch);
+            for row in 0..GLYPH_H {
+                let bits = glyph[row as usize];
+                if bits == 0 { continue; }
+                let py = top_y + row as i32;
+                if py < 0 || py >= buf_h as i32 { continue; }
+                for col in 0..GLYPH_W {
+                    if bits & (0x80 >> col) != 0 {
+                        let px = cx + col as i32;
+                        if px >= 0 && (px as u32) < buf_w {
+                            let off = (py as usize) * (stride as usize) + (px as usize) * 4;
+                            if off + 4 <= buffer.len() {
+                                buffer[off..off + 4].copy_from_slice(&pixel);
+                            }
                         }
                     }
                 }
@@ -594,5 +642,200 @@ fn get_glyph_bitmap(ch: u8) -> [u8; 13] {
         b'~' => [0x00,0x00,0x48,0xB0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00],
         // Default: filled rectangle for unprintable chars
         _ => [0x00,0x00,0xF8,0xF8,0xF8,0xF8,0xF8,0xF8,0xF8,0x00,0x00,0x00,0x00],
+    }
+}
+
+/// Render a single non-ASCII character using CoreText into the pixel buffer.
+/// Falls back to a box glyph if CoreText is unavailable.
+fn render_coretext_char(
+    buffer: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    stride: u32,
+    cx: i32,
+    top_y: i32,
+    ch: char,
+    pixel: &[u8; 4],
+    cell_w: u32,
+    cell_h: u32,
+) {
+    use std::ptr;
+
+    // Create a temporary BGRA bitmap to render the character
+    let w = cell_w as usize;
+    let h = cell_h as usize;
+    let tmp_stride = w * 4;
+    let mut tmp = vec![0u8; tmp_stride * h];
+
+    unsafe {
+        extern "C" {
+            fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
+            fn CGBitmapContextCreate(
+                data: *mut std::ffi::c_void, width: usize, height: usize,
+                bits_per_component: usize, bytes_per_row: usize,
+                colorspace: *mut std::ffi::c_void, bitmap_info: u32,
+            ) -> *mut std::ffi::c_void;
+            fn CGContextSetRGBFillColor(ctx: *mut std::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
+            fn CGContextRelease(ctx: *mut std::ffi::c_void);
+            fn CGColorSpaceRelease(cs: *mut std::ffi::c_void);
+            fn CFRelease(cf: *mut std::ffi::c_void);
+        }
+
+        let cs = CGColorSpaceCreateDeviceRGB();
+        if cs.is_null() {
+            render_box_glyph(buffer, buf_w, buf_h, stride, cx, top_y, pixel, cell_w, cell_h);
+            return;
+        }
+
+        // kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little = 0x2002
+        let ctx = CGBitmapContextCreate(
+            tmp.as_mut_ptr() as *mut _,
+            w, h, 8, tmp_stride,
+            cs, 0x2002,
+        );
+        if ctx.is_null() {
+            CGColorSpaceRelease(cs);
+            render_box_glyph(buffer, buf_w, buf_h, stride, cx, top_y, pixel, cell_w, cell_h);
+            return;
+        }
+
+        // Set text color (pixel is BGRA)
+        let r = pixel[2] as f64 / 255.0;
+        let g = pixel[1] as f64 / 255.0;
+        let b = pixel[0] as f64 / 255.0;
+        CGContextSetRGBFillColor(ctx, r, g, b, 1.0);
+
+        // Create CTFont and draw the character
+        extern "C" {
+            fn CTFontCreateWithName(name: *const std::ffi::c_void, size: f64, matrix: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CTLineDraw(line: *const std::ffi::c_void, ctx: *mut std::ffi::c_void);
+            fn CGContextSetTextPosition(ctx: *mut std::ffi::c_void, x: f64, y: f64);
+        }
+
+        // Use objc to create the attributed string and CTLine
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+
+        // Create NSString from the character
+        let mut char_buf = [0u8; 4];
+        let char_str = ch.encode_utf8(&mut char_buf);
+        let ns_string: *mut AnyObject = msg_send![
+            objc2::class!(NSString),
+            stringWithUTF8String: char_str.as_ptr() as *const std::ffi::c_char
+        ];
+
+        if !ns_string.is_null() {
+            // Create font: use Hiragino Sans or system font for CJK
+            let font_name: *mut AnyObject = msg_send![
+                objc2::class!(NSString),
+                stringWithUTF8String: c"HiraginoSans-W3".as_ptr()
+            ];
+            let ct_font = CTFontCreateWithName(font_name as *const _, cell_h as f64 - 2.0, ptr::null());
+
+            if !ct_font.is_null() {
+                // Create attributes dictionary
+                extern "C" {
+                    fn kCTFontAttributeName() -> *const std::ffi::c_void;
+                    fn kCTForegroundColorFromContextAttributeName() -> *const std::ffi::c_void;
+                }
+                // Use CoreText key constants
+                let ct_font_key: *const AnyObject = kCTFontAttributeName() as *const _;
+                let ct_fg_key: *const AnyObject = kCTForegroundColorFromContextAttributeName() as *const _;
+                let yes: *mut AnyObject = msg_send![objc2::class!(NSNumber), numberWithBool: true];
+
+                let keys = [ct_font_key, ct_fg_key];
+                let vals = [ct_font as *const AnyObject, yes as *const AnyObject];
+                let attrs: *mut AnyObject = msg_send![
+                    objc2::class!(NSDictionary),
+                    dictionaryWithObjects: vals.as_ptr()
+                    forKeys: keys.as_ptr()
+                    count: 2usize
+                ];
+
+                // Create attributed string
+                let attr_str: *mut AnyObject = msg_send![
+                    objc2::class!(NSAttributedString),
+                    alloc
+                ];
+                let attr_str: *mut AnyObject = msg_send![
+                    attr_str,
+                    initWithString: ns_string
+                    attributes: attrs
+                ];
+
+                if !attr_str.is_null() {
+                    // Create CTLine
+                    extern "C" {
+                        fn CTLineCreateWithAttributedString(attr_str: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+                    }
+                    let ct_line = CTLineCreateWithAttributedString(attr_str as *const _);
+                    if !ct_line.is_null() {
+                        // Draw at baseline position (CoreGraphics Y is flipped: 0 at bottom)
+                        let baseline_y = 2.0; // small offset from bottom
+                        CGContextSetTextPosition(ctx, 0.0, baseline_y);
+                        CTLineDraw(ct_line as *const _, ctx);
+                        CFRelease(ct_line);
+                    }
+                    let _: () = msg_send![&*attr_str, release];
+                }
+
+                CFRelease(ct_font);
+            }
+        }
+
+        CGContextRelease(ctx);
+        CGColorSpaceRelease(cs);
+    }
+
+    // Copy rendered pixels to the main buffer (non-zero alpha only)
+    for row in 0..h {
+        let py = top_y + row as i32;
+        if py < 0 || py >= buf_h as i32 { continue; }
+        for col in 0..w {
+            let px = cx + col as i32;
+            if px < 0 || px >= buf_w as i32 { continue; }
+            let src_off = row * tmp_stride + col * 4;
+            // CoreGraphics renders with Y flipped (row 0 = bottom)
+            let flipped_row = h - 1 - row;
+            let src_off = flipped_row * tmp_stride + col * 4;
+            let alpha = tmp[src_off + 3];
+            if alpha > 0 {
+                let dst_off = (py as usize) * (stride as usize) + (px as usize) * 4;
+                if dst_off + 4 <= buffer.len() {
+                    buffer[dst_off..dst_off + 4].copy_from_slice(&tmp[src_off..src_off + 4]);
+                }
+            }
+        }
+    }
+}
+
+/// Fallback box glyph for when CoreText rendering fails.
+fn render_box_glyph(
+    buffer: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    stride: u32,
+    cx: i32,
+    top_y: i32,
+    pixel: &[u8; 4],
+    cell_w: u32,
+    cell_h: u32,
+) {
+    // Draw a box outline
+    for row in 0..cell_h {
+        let py = top_y + row as i32;
+        if py < 0 || py >= buf_h as i32 { continue; }
+        for col in 0..cell_w {
+            let is_border = row == 0 || row == cell_h - 1 || col == 0 || col == cell_w - 1;
+            if is_border {
+                let px = cx + col as i32;
+                if px >= 0 && (px as u32) < buf_w {
+                    let off = (py as usize) * (stride as usize) + (px as usize) * 4;
+                    if off + 4 <= buffer.len() {
+                        buffer[off..off + 4].copy_from_slice(pixel);
+                    }
+                }
+            }
+        }
     }
 }

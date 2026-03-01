@@ -8,6 +8,16 @@ use crate::util::coord::{X11Point, X11Rect};
 pub type Xid = u32;
 pub type Atom = u32;
 
+/// Global IME cursor position — written by protocol thread, read by macOS display thread.
+/// Stored in X11 window coordinates relative to the top-level native window.
+pub static IME_SPOT_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub static IME_SPOT_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub static IME_SPOT_LINE_H: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(13);
+/// Flag: true while IME is composing (setMarkedText active). Suppress KeyRelease during composition.
+pub static IME_COMPOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Flag: suppress the very next KeyRelease after IME commit (the confirmation key like Enter/Space).
+pub static SUPPRESS_NEXT_KEYUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Shared render mailbox: native_window_id -> pending render commands.
 /// Protocol handlers append commands; display thread drains each frame.
 pub type RenderMailbox = std::sync::Arc<dashmap::DashMap<u64, Vec<RenderCommand>>>;

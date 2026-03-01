@@ -32,14 +32,13 @@ tokio = { version = "1", features = [
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
-toml = "0.8"
-serde = { version = "1", features = ["derive"] }
 bitflags = "2"
 thiserror = "2"
 dashmap = "6"
 bytes = "1"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+encoding_rs = "0.8"
 
 # macOS dependencies (only on macOS)
 [target.'cfg(target_os = "macos")'.dependencies]

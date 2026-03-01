@@ -99,6 +99,9 @@ pub struct XServer {
     pub focus_window: AtomicU32,
     /// Focus revert-to mode (0=None, 1=PointerRoot, 2=Parent).
     pub focus_revert_to: AtomicU32,
+    /// Virtual keysyms for IME input. Keycodes 200..200+len are mapped to these keysyms.
+    /// Written by send_ime_text, read by handle_get_keyboard_mapping.
+    pub virtual_keysyms: parking_lot::RwLock<Vec<u32>>,
 }
 
 impl XServer {
@@ -205,6 +208,7 @@ impl XServer {
             render_mailbox: std::sync::Arc::new(DashMap::new()),
             focus_window: AtomicU32::new(1), // PointerRoot by default
             focus_revert_to: AtomicU32::new(1), // PointerRoot
+            virtual_keysyms: parking_lot::RwLock::new(Vec::new()),
         }
     }
 
@@ -328,6 +332,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
     info!("Event dispatch task started");
     let mut focused_window: Xid = 0;
     let mut entered_window: Xid = 0;
+    let mut preedit_char_count: usize = 0;
     loop {
         // Use spawn_blocking to avoid blocking the tokio runtime
         let evt = {
@@ -378,6 +383,34 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
             DisplayEvent::KeyRelease { window, keycode, state, time } => {
                 send_key_event(&server, protocol::event_type::KEY_RELEASE, window, keycode, state, time);
             }
+            DisplayEvent::ImeCommit { window, text } => {
+                // Erase inline preedit before inserting committed text
+                if preedit_char_count > 0 {
+                    info!("ImeCommit: erasing {} preedit chars first", preedit_char_count);
+                    send_backspaces(&server, window, preedit_char_count);
+                    preedit_char_count = 0;
+                }
+                send_ime_text(&server, window, &text);
+            }
+            DisplayEvent::ImePreeditDraw { window, text, .. } => {
+                // Erase old preedit, then send new preedit as temporary characters
+                if preedit_char_count > 0 {
+                    send_backspaces(&server, window, preedit_char_count);
+                }
+                let new_count = text.chars().count();
+                if !text.is_empty() {
+                    info!("ImePreeditDraw: showing '{}' ({} chars, was {})", text, new_count, preedit_char_count);
+                    send_ime_text(&server, window, &text);
+                }
+                preedit_char_count = new_count;
+            }
+            DisplayEvent::ImePreeditDone { window } => {
+                if preedit_char_count > 0 {
+                    info!("ImePreeditDone: erasing {} preedit chars", preedit_char_count);
+                    send_backspaces(&server, window, preedit_char_count);
+                    preedit_char_count = 0;
+                }
+            }
             DisplayEvent::Expose { window, x, y, width, height, count } => {
                 send_expose_event(&server, window, x, y, width, height, count);
             }
@@ -403,30 +436,10 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 // Send Expose for full window so client redraws
                 send_expose_event(&server, window, 0, 0, width, height, 0);
 
-                // Resize child windows, accounting for their position offsets.
-                // Each child's new size = parent's new size - child's (x,y) offset.
-                for child_id in &children {
-                    if let Some(cres) = server.resources.get(child_id) {
-                        if let Resource::Window(cwin) = cres.value() {
-                            let mut cw = cwin.write();
-                            let child_x = cw.x.max(0) as u16;
-                            let child_y = cw.y.max(0) as u16;
-                            let new_cw = width.saturating_sub(child_x);
-                            let new_ch = height.saturating_sub(child_y);
-                            if new_cw > 0 && new_ch > 0 {
-                                let old_cw = cw.width;
-                                let old_ch = cw.height;
-                                cw.width = new_cw;
-                                cw.height = new_ch;
-                                info!("  Child 0x{:08X} (at {},{}) resize: {}x{} -> {}x{}",
-                                      child_id, child_x, child_y, old_cw, old_ch, new_cw, new_ch);
-                                drop(cw);
-                                send_configure_notify_event(&server, *child_id, child_x as i16, child_y as i16, new_cw, new_ch);
-                                send_expose_event(&server, *child_id, 0, 0, new_cw, new_ch, 0);
-                            }
-                        }
-                    }
-                }
+                // Don't force-resize child windows here. The client (e.g. xterm)
+                // is responsible for resizing its own children via ConfigureWindow
+                // after receiving the parent's ConfigureNotify.
+                let _ = children;
             }
             DisplayEvent::GlobalPointerUpdate { root_x, root_y } => {
                 server.pointer_x.store(root_x as i32, Ordering::Relaxed);
@@ -576,6 +589,302 @@ fn send_key_event(
         }
         current = parent;
     }
+}
+
+/// Send IME committed text as X11 key events using Unicode keysyms.
+///
+/// This is the same approach XQuartz uses:
+/// - ASCII chars use their normal X11 keycodes directly
+/// - Non-ASCII chars use Unicode keysyms (0x01000000 + Unicode codepoint)
+/// - XLookupString returns 0 bytes for Unicode keysyms (keysym > 0xFF)
+/// - xterm in UTF-8 mode (OPT_WIDE_CHARS) detects nbytes==0 && keysym >= 0x01000100
+///   and converts the Unicode keysym directly to UTF-8
+///
+/// Requires xterm to be launched with UTF-8 locale (LANG=ja_JP.UTF-8).
+fn send_ime_text(server: &XServer, window: Xid, text: &str) {
+    const VIRTUAL_BASE: u8 = 200;
+    info!("send_ime_text: window=0x{:08x} text='{}'", window, text);
+
+    let focus = server.focus_window.load(Ordering::Relaxed);
+    let target = if focus > 1 {
+        focus
+    } else if focus == 1 {
+        find_deepest_child(server, window)
+    } else {
+        info!("send_ime_text: focus=None, discarding");
+        return;
+    };
+
+    // Find the connection that selected key events on target (or ancestors)
+    let (conn_id, event_window) = {
+        let mut current = target;
+        let mut result = None;
+        for _ in 0..32 {
+            if current == 0 { break; }
+            if let Some(res) = server.resources.get(&current) {
+                if let Resource::Window(win) = res.value() {
+                    let w = win.read();
+                    for &(cid, emask) in &w.event_selections {
+                        if (emask & protocol::event_mask::KEY_PRESS) != 0 {
+                            result = Some((cid, current));
+                            break;
+                        }
+                    }
+                    if result.is_some() { break; }
+                    current = w.parent;
+                } else { break; }
+            } else { break; }
+        }
+        match result {
+            Some(r) => r,
+            None => {
+                info!("send_ime_text: no conn with KEY_PRESS mask found for target=0x{:08x}", target);
+                return;
+            },
+        }
+    };
+
+    info!("send_ime_text: target=0x{:08x} conn={} event_window=0x{:08x}", target, conn_id, event_window);
+
+    let conn_ref = match server.connections.get(&conn_id) {
+        Some(c) => c,
+        None => return,
+    };
+    let conn = conn_ref.value();
+
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32;
+
+    // Unicode keysym approach: for each non-ASCII character, use keysym 0x01000000 | codepoint
+    // on virtual keycodes 200+. Send MappingNotify first, then KeyPress events.
+    let chars: Vec<char> = text.chars().collect();
+    let mut virtual_idx = 0usize;
+    let mut char_keys: Vec<(u8, u16)> = Vec::with_capacity(chars.len());
+    const MAX_VIRTUAL: usize = 55;
+
+    {
+        let mut vk = server.virtual_keysyms.write();
+        vk.clear();
+        for &ch in &chars {
+            let ch = if ch >= '\u{FF01}' && ch <= '\u{FF5E}' {
+                char::from_u32(ch as u32 - 0xFF01 + 0x0021).unwrap_or(ch)
+            } else if ch == '\u{3000}' {
+                ' '
+            } else {
+                ch
+            };
+
+            if ch.is_ascii() {
+                let keycode = ascii_to_x11_keycode(ch as u32);
+                let state = if needs_shift(ch) { 0x0001u16 } else { 0u16 };
+                char_keys.push((keycode, state));
+            } else if virtual_idx < MAX_VIRTUAL {
+                let keysym = 0x01000000 | (ch as u32);
+                info!("send_ime_text: char '{}' U+{:04X} → keysym 0x{:08X} on keycode {}",
+                    ch, ch as u32, keysym, VIRTUAL_BASE + virtual_idx as u8);
+                vk.push(keysym);
+                char_keys.push((VIRTUAL_BASE + virtual_idx as u8, 0));
+                virtual_idx += 1;
+            }
+        }
+    }
+
+    // Send MappingNotify covering all virtual keycodes used
+    if virtual_idx > 0 {
+        info!("send_ime_text: {} Unicode keysyms on virtual keycodes (200..{})", virtual_idx, 200 + virtual_idx);
+        for conn_entry in server.connections.iter() {
+            let c = conn_entry.value();
+            let mut mapping_notify = [0u8; 32];
+            mapping_notify[0] = 34; // MappingNotify
+            mapping_notify[4] = 1;  // request = Keyboard
+            mapping_notify[5] = VIRTUAL_BASE;
+            mapping_notify[6] = virtual_idx as u8;
+            let _ = c.event_tx.send(mapping_notify.to_vec());
+        }
+    }
+
+    // Send KeyPress + KeyRelease for each character
+    for &(keycode, state) in &char_keys {
+        let press = events::build_key_event(
+            conn, protocol::event_type::KEY_PRESS, keycode, time,
+            server.screens[0].root_window, event_window, 0,
+            0, 0, 0, 0, state, true,
+        );
+        let _ = conn.event_tx.send(press);
+
+        let release = events::build_key_event(
+            conn, protocol::event_type::KEY_RELEASE, keycode, time,
+            server.screens[0].root_window, event_window, 0,
+            0, 0, 0, 0, state, true,
+        );
+        let _ = conn.event_tx.send(release);
+    }
+}
+
+/// Send `count` BackSpace key events to erase preedit text.
+/// BackSpace = macOS keycode 51 + 8 = X11 keycode 59.
+fn send_backspaces(server: &XServer, window: Xid, count: usize) {
+    if count == 0 { return; }
+    const BACKSPACE_KEYCODE: u8 = 59; // macOS 51 + 8
+
+    let focus = server.focus_window.load(Ordering::Relaxed);
+    let target = if focus > 1 {
+        focus
+    } else if focus == 1 {
+        find_deepest_child(server, window)
+    } else {
+        return;
+    };
+
+    // Find connection with KEY_PRESS mask (same logic as send_ime_text)
+    let (conn_id, event_window) = {
+        let mut current = target;
+        let mut result = None;
+        for _ in 0..32 {
+            if current == 0 { break; }
+            if let Some(res) = server.resources.get(&current) {
+                if let Resource::Window(win) = res.value() {
+                    let w = win.read();
+                    for &(cid, emask) in &w.event_selections {
+                        if (emask & protocol::event_mask::KEY_PRESS) != 0 {
+                            result = Some((cid, current));
+                            break;
+                        }
+                    }
+                    if result.is_some() { break; }
+                    current = w.parent;
+                } else { break; }
+            } else { break; }
+        }
+        match result {
+            Some(r) => r,
+            None => return,
+        }
+    };
+
+    let conn_ref = match server.connections.get(&conn_id) {
+        Some(c) => c,
+        None => return,
+    };
+    let conn = conn_ref.value();
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32;
+
+    info!("send_backspaces: {} backspaces to conn={} window=0x{:08x}", count, conn_id, event_window);
+
+    for _ in 0..count {
+        let press = events::build_key_event(
+            conn, protocol::event_type::KEY_PRESS, BACKSPACE_KEYCODE, time,
+            server.screens[0].root_window, event_window, 0,
+            0, 0, 0, 0, 0, true,
+        );
+        let _ = conn.event_tx.send(press);
+
+        let release = events::build_key_event(
+            conn, protocol::event_type::KEY_RELEASE, BACKSPACE_KEYCODE, time,
+            server.screens[0].root_window, event_window, 0,
+            0, 0, 0, 0, 0, true,
+        );
+        let _ = conn.event_tx.send(release);
+    }
+}
+
+/// Map ASCII character to X11 keycode (reverse of macos_keycode_to_keysym).
+/// Returns the X11 keycode (macOS keycode + 8).
+fn ascii_to_x11_keycode(ascii: u32) -> u8 {
+    // Map of ASCII keysym -> macOS keycode (ANSI US layout)
+    let mac_key = match ascii {
+        0x61 => 0,  // a
+        0x73 => 1,  // s
+        0x64 => 2,  // d
+        0x66 => 3,  // f
+        0x68 => 4,  // h
+        0x67 => 5,  // g
+        0x7A => 6,  // z
+        0x78 => 7,  // x
+        0x63 => 8,  // c
+        0x76 => 9,  // v
+        0x62 => 11, // b
+        0x71 => 12, // q
+        0x77 => 13, // w
+        0x65 => 14, // e
+        0x72 => 15, // r
+        0x79 => 16, // y
+        0x74 => 17, // t
+        0x31 => 18, // 1
+        0x32 => 19, // 2
+        0x33 => 20, // 3
+        0x34 => 21, // 4
+        0x36 => 22, // 6
+        0x35 => 23, // 5
+        0x3D => 24, // =
+        0x39 => 25, // 9
+        0x37 => 26, // 7
+        0x2D => 27, // -
+        0x38 => 28, // 8
+        0x30 => 29, // 0
+        0x5D => 30, // ]
+        0x6F => 31, // o
+        0x75 => 32, // u
+        0x5B => 33, // [
+        0x69 => 34, // i
+        0x70 => 35, // p
+        0x6C => 37, // l
+        0x6A => 38, // j
+        0x27 => 39, // '
+        0x6B => 40, // k
+        0x3B => 41, // ;
+        0x5C => 42, // backslash
+        0x2C => 43, // ,
+        0x2F => 44, // /
+        0x6E => 45, // n
+        0x6D => 46, // m
+        0x2E => 47, // .
+        0x60 => 50, // `
+        0x20 => 49, // space
+        0x0D | 0x0A => 36, // Return/Enter
+        0x09 => 48, // Tab
+        0x08 | 0x7F => 51, // Backspace/Delete
+        0x1B => 53, // Escape
+        // Uppercase -> same key as lowercase
+        0x41..=0x5A => return ascii_to_x11_keycode(ascii + 0x20),
+        // Shifted symbols -> find base key
+        0x21 => 18, // ! (shift+1)
+        0x40 => 19, // @ (shift+2)
+        0x23 => 20, // # (shift+3)
+        0x24 => 21, // $ (shift+4)
+        0x5E => 22, // ^ (shift+6)
+        0x25 => 23, // % (shift+5)
+        0x2B => 24, // + (shift+=)
+        0x28 => 25, // ( (shift+9)
+        0x26 => 26, // & (shift+7)
+        0x5F => 27, // _ (shift+-)
+        0x2A => 28, // * (shift+8)
+        0x29 => 29, // ) (shift+0)
+        0x7D => 30, // } (shift+])
+        0x7B => 33, // { (shift+[)
+        0x22 => 39, // " (shift+')
+        0x3A => 41, // : (shift+;)
+        0x7C => 42, // | (shift+\)
+        0x3C => 43, // < (shift+,)
+        0x3F => 44, // ? (shift+/)
+        0x3E => 47, // > (shift+.)
+        0x7E => 50, // ~ (shift+`)
+        _ => 49, // fallback to space
+    };
+    (mac_key as u8).wrapping_add(8) // macOS keycode + 8 = X11 keycode
+}
+
+/// Returns true if the ASCII character requires Shift modifier to produce.
+fn needs_shift(ch: char) -> bool {
+    ch.is_ascii_uppercase() || matches!(ch,
+        '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '(' | ')' |
+        '_' | '+' | '{' | '}' | '|' | ':' | '"' | '<' | '>' | '?' | '~'
+    )
 }
 
 /// Find the deepest mapped child window under the pointer in the given window tree.
