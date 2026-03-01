@@ -752,12 +752,12 @@ fn render_coretext_char(
             if !ct_font.is_null() {
                 // Create attributes dictionary
                 extern "C" {
-                    fn kCTFontAttributeName() -> *const std::ffi::c_void;
-                    fn kCTForegroundColorFromContextAttributeName() -> *const std::ffi::c_void;
+                    static kCTFontAttributeName: *const std::ffi::c_void;
+                    static kCTForegroundColorFromContextAttributeName: *const std::ffi::c_void;
                 }
                 // Use CoreText key constants
-                let ct_font_key: *const AnyObject = kCTFontAttributeName() as *const _;
-                let ct_fg_key: *const AnyObject = kCTForegroundColorFromContextAttributeName() as *const _;
+                let ct_font_key: *const AnyObject = kCTFontAttributeName as *const _;
+                let ct_fg_key: *const AnyObject = kCTForegroundColorFromContextAttributeName as *const _;
                 let yes: *mut AnyObject = msg_send![objc2::class!(NSNumber), numberWithBool: true];
 
                 let keys = [ct_font_key, ct_fg_key];
@@ -812,9 +812,6 @@ fn render_coretext_char(
             let px = cx + col as i32;
             if px < 0 || px >= buf_w as i32 { continue; }
             let src_off = row * tmp_stride + col * 4;
-            // CoreGraphics renders with Y flipped (row 0 = bottom)
-            let flipped_row = h - 1 - row;
-            let src_off = flipped_row * tmp_stride + col * 4;
             let alpha = tmp[src_off + 3];
             if alpha > 0 {
                 let dst_off = (py as usize) * (stride as usize) + (px as usize) * 4;

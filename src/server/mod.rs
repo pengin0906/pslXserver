@@ -717,6 +717,8 @@ fn send_ime_text(server: &XServer, window: Xid, text: &str) {
                 char::from_u32(ch as u32 - 0xFF01 + 0x0021).unwrap_or(ch)
             } else if ch == '\u{3000}' {
                 ' '
+            } else if ch == '\u{00A5}' {
+                '\\' // Japanese keyboard ¥ → backslash
             } else {
                 ch
             };
