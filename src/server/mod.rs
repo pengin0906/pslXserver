@@ -5,7 +5,7 @@ pub mod extensions;
 pub mod protocol;
 pub mod resources;
 
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -102,6 +102,8 @@ pub struct XServer {
     /// Virtual keysyms for IME input. Keycodes 200..200+len are mapped to these keysyms.
     /// Written by send_ime_text, read by handle_get_keyboard_mapping.
     pub virtual_keysyms: parking_lot::RwLock<Vec<u32>>,
+    /// Flag: server is waiting for X11 selection data to copy to macOS clipboard.
+    pub pending_clipboard_copy: AtomicBool,
 }
 
 impl XServer {
@@ -209,6 +211,7 @@ impl XServer {
             focus_window: AtomicU32::new(1), // PointerRoot by default
             focus_revert_to: AtomicU32::new(1), // PointerRoot
             virtual_keysyms: parking_lot::RwLock::new(Vec::new()),
+            pending_clipboard_copy: AtomicBool::new(false),
         }
     }
 
@@ -346,36 +349,40 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
         log::debug!("Dispatching event: {:?}", evt);
         match evt {
             DisplayEvent::ButtonPress { window, button, x, y, root_x, root_y, state, time } => {
+                // Find deepest child window at the click point
+                let (target, cx, cy) = find_child_at_point(&server, window, x, y);
                 // Send EnterNotify if we haven't entered this window yet
-                if entered_window != window {
+                if entered_window != target {
                     send_enter_leave_event(&server, protocol::event_type::ENTER_NOTIFY,
-                        window, x, y, root_x, root_y, state, time);
-                    entered_window = window;
+                        target, cx, cy, root_x, root_y, state, time);
+                    entered_window = target;
                 }
                 // Send FocusIn if this window doesn't have focus yet
-                if focused_window != window {
-                    send_focus_event(&server, protocol::event_type::FOCUS_IN, window);
-                    focused_window = window;
+                if focused_window != target {
+                    send_focus_event(&server, protocol::event_type::FOCUS_IN, target);
+                    focused_window = target;
                 }
                 send_button_event(&server, protocol::event_type::BUTTON_PRESS,
-                    window, button, x, y, root_x, root_y, state, time);
+                    target, button, cx, cy, root_x, root_y, state, time);
             }
             DisplayEvent::ButtonRelease { window, button, x, y, root_x, root_y, state, time } => {
+                let (target, cx, cy) = find_child_at_point(&server, window, x, y);
                 send_button_event(&server, protocol::event_type::BUTTON_RELEASE,
-                    window, button, x, y, root_x, root_y, state, time);
+                    target, button, cx, cy, root_x, root_y, state, time);
             }
             DisplayEvent::MotionNotify { window, x, y, root_x, root_y, state, time } => {
                 // Update stored pointer position for QueryPointer
                 server.pointer_x.store(root_x as i32, Ordering::Relaxed);
                 server.pointer_y.store(root_y as i32, Ordering::Relaxed);
-                // Store per-window relative coordinates for child window QueryPointer
-                server.window_pointer.insert(window, (x, y));
-                if entered_window != window {
+                // Find deepest child at pointer position
+                let (target, cx, cy) = find_child_at_point(&server, window, x, y);
+                server.window_pointer.insert(target, (cx, cy));
+                if entered_window != target {
                     send_enter_leave_event(&server, protocol::event_type::ENTER_NOTIFY,
-                        window, x, y, root_x, root_y, state, time);
-                    entered_window = window;
+                        target, cx, cy, root_x, root_y, state, time);
+                    entered_window = target;
                 }
-                send_motion_event(&server, window, x, y, root_x, root_y, state, time);
+                send_motion_event(&server, target, cx, cy, root_x, root_y, state, time);
             }
             DisplayEvent::KeyPress { window, keycode, state, time } => {
                 send_key_event(&server, protocol::event_type::KEY_PRESS, window, keycode, state, time);
@@ -444,8 +451,46 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
             DisplayEvent::GlobalPointerUpdate { root_x, root_y } => {
                 server.pointer_x.store(root_x as i32, Ordering::Relaxed);
                 server.pointer_y.store(root_y as i32, Ordering::Relaxed);
-                // MotionNotify is now sent directly from macOS side with accurate
-                // window-relative coords (see process_commands in macos.rs).
+            }
+            DisplayEvent::ClipboardCopyRequest { window: _ } => {
+                // Cmd+C: grab X11 PRIMARY selection data and copy to macOS clipboard
+                use crate::server::atoms::predefined;
+                let primary = predefined::PRIMARY;
+                if let Some(entry) = server.selections.get(&primary) {
+                    let (owner, _ts) = *entry;
+                    info!("ClipboardCopyRequest: PRIMARY owner=0x{:08x}, requesting data", owner);
+                    // Find the connection that owns this window
+                    for conn_entry in server.connections.iter() {
+                        let c = conn_entry.value();
+                        if (owner & !c.resource_id_mask) == (c.resource_id_base & !c.resource_id_mask) {
+                            // Intern UTF8_STRING and _PSLX_CLIP atoms
+                            let utf8_atom = server.atoms.intern("UTF8_STRING", false).unwrap_or(31);
+                            let clip_prop = server.atoms.intern("_PSLX_CLIP", false).unwrap_or(100);
+                            let root = server.screens[0].root_window;
+
+                            // Send SelectionRequest to the owner
+                            let time = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u32;
+                            let mut event = [0u8; 32];
+                            event[0] = 30; // SelectionRequest
+                            crate::server::connection::write_u32_at(c, &mut event, 4, time);
+                            crate::server::connection::write_u32_at(c, &mut event, 8, owner);
+                            crate::server::connection::write_u32_at(c, &mut event, 12, root); // requestor = root
+                            crate::server::connection::write_u32_at(c, &mut event, 16, primary);
+                            crate::server::connection::write_u32_at(c, &mut event, 20, utf8_atom); // target
+                            crate::server::connection::write_u32_at(c, &mut event, 24, clip_prop); // property
+                            let _ = c.event_tx.send(event.to_vec());
+
+                            // Mark that we're waiting for selection data
+                            server.pending_clipboard_copy.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                } else {
+                    info!("ClipboardCopyRequest: no PRIMARY owner");
+                }
             }
             _ => {
                 log::debug!("Unhandled display event: {:?}", evt);
@@ -888,6 +933,51 @@ fn needs_shift(ch: char) -> bool {
 }
 
 /// Find the deepest mapped child window under the pointer in the given window tree.
+/// Find the deepest child window at (x, y) in the parent's coordinate space.
+/// Returns (child_id, child_relative_x, child_relative_y).
+fn find_child_at_point(server: &XServer, window: Xid, x: i16, y: i16) -> (Xid, i16, i16) {
+    let mut current = window;
+    let mut cx = x;
+    let mut cy = y;
+    for _ in 0..16 {
+        let children = if let Some(res) = server.resources.get(&current) {
+            if let Resource::Window(win) = res.value() {
+                let w = win.read();
+                w.children.clone()
+            } else { Vec::new() }
+        } else { Vec::new() };
+
+        let mut found = None;
+        // Check children in reverse order (top-most first)
+        for &child_id in children.iter().rev() {
+            if let Some(res) = server.resources.get(&child_id) {
+                if let Resource::Window(win) = res.value() {
+                    let w = win.read();
+                    if w.mapped {
+                        let x1 = w.x as i16;
+                        let y1 = w.y as i16;
+                        let x2 = x1 + w.width as i16;
+                        let y2 = y1 + w.height as i16;
+                        if cx >= x1 && cx < x2 && cy >= y1 && cy < y2 {
+                            found = Some((child_id, cx - x1, cy - y1));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((child, rx, ry)) = found {
+            current = child;
+            cx = rx;
+            cy = ry;
+        } else {
+            break;
+        }
+    }
+    (current, cx, cy)
+}
+
 fn find_deepest_child(server: &XServer, window: Xid) -> Xid {
     let mut current = window;
     for _ in 0..16 {

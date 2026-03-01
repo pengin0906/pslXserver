@@ -1304,6 +1304,29 @@ async fn handle_change_property<S: AsyncRead + AsyncWrite + Unpin>(
     let prop_name = server.atoms.get_name(property).unwrap_or_default();
     let _type_name = server.atoms.get_name(type_atom).unwrap_or_default();
 
+    // Check if this is a clipboard copy response (property = _PSLX_CLIP on root window)
+    if server.pending_clipboard_copy.load(std::sync::atomic::Ordering::Relaxed)
+        && prop_name == "_PSLX_CLIP"
+    {
+        server.pending_clipboard_copy.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(text) = std::str::from_utf8(&prop_data) {
+            if !text.is_empty() {
+                info!("Clipboard copy: got {} bytes from X11 selection, writing to macOS clipboard", text.len());
+                // Write to macOS clipboard via pbcopy
+                if let Ok(mut child) = std::process::Command::new("pbcopy")
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(ref mut stdin) = child.stdin {
+                        use std::io::Write;
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+
     if let Some(res) = server.resources.get(&wid) {
         if let super::resources::Resource::Window(win) = res.value() {
             let mut w = win.write();
@@ -1947,8 +1970,8 @@ fn offset_render_commands(
     use crate::display::RenderCommand;
     commands.into_iter().map(|cmd| {
         match cmd {
-            RenderCommand::FillRectangle { x, y, width, height, color } =>
-                RenderCommand::FillRectangle { x: x + dx, y: y + dy, width, height, color },
+            RenderCommand::FillRectangle { x, y, width, height, color, gc_function } =>
+                RenderCommand::FillRectangle { x: x + dx, y: y + dy, width, height, color, gc_function },
             RenderCommand::ClearArea { x, y, width, height, bg_color } =>
                 RenderCommand::ClearArea { x: x + dx, y: y + dy, width, height, bg_color },
             RenderCommand::DrawLine { x1, y1, x2, y2, color, line_width } =>
@@ -1985,12 +2008,13 @@ async fn handle_poly_fill_rectangle<S: AsyncRead + AsyncWrite + Unpin>(
     let drawable = read_u32(conn, &data[4..8]);
     let gcid = read_u32(conn, &data[8..12]);
 
-    // Get foreground color from GC
-    let fg_color = if let Some(res) = server.resources.get(&gcid) {
+    // Get foreground color and GC function from GC
+    let (fg_color, gc_fn) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
-            gc.read().foreground
-        } else { 0 }
-    } else { 0 };
+            let g = gc.read();
+            (g.foreground, g.function as u8)
+        } else { (0, 3) }
+    } else { (0, 3) }; // 3 = GXcopy
 
     // Parse rectangles (each is 8 bytes: x, y, width, height)
     let mut commands = Vec::new();
@@ -2003,7 +2027,7 @@ async fn handle_poly_fill_rectangle<S: AsyncRead + AsyncWrite + Unpin>(
         offset += 8;
 
         commands.push(crate::display::RenderCommand::FillRectangle {
-            x, y, width, height, color: fg_color,
+            x, y, width, height, color: fg_color, gc_function: gc_fn,
         });
     }
 
@@ -2217,7 +2241,7 @@ async fn handle_poly_point<S: AsyncRead + AsyncWrite + Unpin>(
         prev_y = py;
         // Draw a single pixel as a 1x1 rectangle
         commands.push(crate::display::RenderCommand::FillRectangle {
-            x: px, y: py, width: 1, height: 1, color: fg_color,
+            x: px, y: py, width: 1, height: 1, color: fg_color, gc_function: 3,
         });
     }
 
@@ -3491,13 +3515,91 @@ async fn handle_get_selection_owner<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 async fn handle_convert_selection<S: AsyncRead + AsyncWrite + Unpin>(
-    _server: &Arc<XServer>,
-    _conn: &Arc<ClientConnection>,
-    _data: &[u8],
+    server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
+    data: &[u8],
     _stream: &mut S,
 ) -> Result<(), ServerError> {
-    // ConvertSelection: no-op for now
+    // ConvertSelection: [4..8]=requestor [8..12]=selection [12..16]=target [16..20]=property [20..24]=time
+    if data.len() < 24 { return Err(ServerError::Protocol); }
+    let requestor = read_u32(conn, &data[4..8]);
+    let selection = read_u32(conn, &data[8..12]);
+    let target = read_u32(conn, &data[12..16]);
+    let property = read_u32(conn, &data[16..20]);
+    let time = read_u32(conn, &data[20..24]);
+
+    let sel_name = server.atoms.get_name(selection).unwrap_or_default();
+    let tgt_name = server.atoms.get_name(target).unwrap_or_default();
+    info!("ConvertSelection: requestor=0x{:08x} selection={}({}) target={}({}) property={} time={}",
+        requestor, selection, sel_name, target, tgt_name, property, time);
+
+    // Find the owner of the selection
+    let owner_opt = server.selections.get(&selection).map(|e| (e.0, e.1));
+
+    if let Some((owner, _ts)) = owner_opt {
+        // Build SelectionRequest event (type=30) and send to the owner's connection
+        let mut event = [0u8; 32];
+        event[0] = 30; // SelectionRequest
+        // event[1] = 0; // unused
+        // seq will be stamped by the connection loop
+        write_u32_at(conn, &mut event, 4, time);
+        write_u32_at(conn, &mut event, 8, owner);
+        write_u32_at(conn, &mut event, 12, requestor);
+        write_u32_at(conn, &mut event, 16, selection);
+        write_u32_at(conn, &mut event, 20, target);
+        write_u32_at(conn, &mut event, 24, property);
+
+        // Find which connection owns the owner window
+        let mut sent = false;
+        for entry in server.connections.iter() {
+            let target_conn = entry.value();
+            if (owner & !target_conn.resource_id_mask) == (target_conn.resource_id_base & !target_conn.resource_id_mask) {
+                let _ = target_conn.event_tx.send(event.to_vec());
+                sent = true;
+                info!("ConvertSelection: sent SelectionRequest to conn {} (owner=0x{:08x})", target_conn.id, owner);
+                break;
+            }
+        }
+
+        if !sent {
+            // Owner not found — send SelectionNotify with property=None to requestor
+            send_selection_notify(server, conn, requestor, selection, target, 0, time);
+        }
+    } else {
+        // No owner — send SelectionNotify with property=None (0) to indicate failure
+        info!("ConvertSelection: no owner for selection {}, sending failure SelectionNotify", selection);
+        send_selection_notify(server, conn, requestor, selection, target, 0, time);
+    }
+
     Ok(())
+}
+
+/// Send a SelectionNotify event (type=31) to the requestor
+fn send_selection_notify(
+    server: &XServer,
+    _conn: &Arc<ClientConnection>,
+    requestor: u32,
+    selection: u32,
+    target: u32,
+    property: u32, // 0 = None (failure)
+    time: u32,
+) {
+    // Find the connection that owns the requestor window
+    for entry in server.connections.iter() {
+        let c = entry.value();
+        if (requestor & !c.resource_id_mask) == (c.resource_id_base & !c.resource_id_mask) {
+            let mut event = [0u8; 32];
+            event[0] = 31; // SelectionNotify
+            // seq will be stamped by connection loop
+            write_u32_at(c, &mut event, 4, time);
+            write_u32_at(c, &mut event, 8, requestor);
+            write_u32_at(c, &mut event, 12, selection);
+            write_u32_at(c, &mut event, 16, target);
+            write_u32_at(c, &mut event, 20, property);
+            let _ = c.event_tx.send(event.to_vec());
+            break;
+        }
+    }
 }
 
 async fn handle_send_event<S: AsyncRead + AsyncWrite + Unpin>(
@@ -4092,7 +4194,7 @@ fn write_u32_to(conn: &ClientConnection, buf: &mut Vec<u8>, val: u32) {
     }
 }
 
-fn write_u32_at(conn: &ClientConnection, buf: &mut [u8], offset: usize, val: u32) {
+pub fn write_u32_at(conn: &ClientConnection, buf: &mut [u8], offset: usize, val: u32) {
     let bytes = match conn.byte_order {
         ByteOrder::BigEndian => val.to_be_bytes(),
         ByteOrder::LittleEndian => val.to_le_bytes(),

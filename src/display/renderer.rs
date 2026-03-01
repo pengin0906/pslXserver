@@ -14,7 +14,7 @@ pub fn render_to_buffer(
     command: &RenderCommand,
 ) {
     match command {
-        RenderCommand::FillRectangle { x, y, width: w, height: h, color } => {
+        RenderCommand::FillRectangle { x, y, width: w, height: h, color, gc_function } => {
             let x0 = (*x as i32).max(0) as u32;
             let y0 = (*y as i32).max(0) as u32;
             let x1 = ((*x as i32 + *w as i32).max(0) as u32).min(width);
@@ -22,35 +22,52 @@ pub fn render_to_buffer(
 
             if x0 >= x1 || y0 >= y1 { return; }
 
-            // BGRA pixel as u32 for fast fill
-            let pixel_u32: u32 = (*color & 0x00FFFFFF) | 0xFF000000;
-            let row_bytes = (x1 - x0) as usize * 4;
-
-            // Fill first row
-            let first_start = (y0 * stride + x0 * 4) as usize;
-            let first_end = first_start + row_bytes;
-            if first_end > buffer.len() { return; }
-            {
-                // Write as u32 for speed (4x fewer stores)
-                let row = &mut buffer[first_start..first_end];
-                // Safety: buffer is u8, aligned to 4 on IOSurface; write u32 via bytes
-                for chunk in row.chunks_exact_mut(4) {
-                    chunk.copy_from_slice(&pixel_u32.to_ne_bytes());
+            if *gc_function == 6 {
+                // GXxor: macOS-style translucent highlight (light blue, 30% opacity)
+                let hr: u32 = 60;  // highlight R
+                let hg: u32 = 140; // highlight G
+                let hb: u32 = 255; // highlight B
+                let alpha: u32 = 77; // ~30% of 255
+                let inv_alpha: u32 = 255 - alpha;
+                for py in y0..y1 {
+                    for px in x0..x1 {
+                        let off = (py * stride + px * 4) as usize;
+                        if off + 3 >= buffer.len() { continue; }
+                        let db = buffer[off] as u32;
+                        let dg = buffer[off + 1] as u32;
+                        let dr = buffer[off + 2] as u32;
+                        buffer[off]     = ((hb * alpha + db * inv_alpha) / 255) as u8;
+                        buffer[off + 1] = ((hg * alpha + dg * inv_alpha) / 255) as u8;
+                        buffer[off + 2] = ((hr * alpha + dr * inv_alpha) / 255) as u8;
+                        buffer[off + 3] = 255;
+                    }
                 }
-            }
+            } else {
+                // GXcopy (or other): solid fill
+                let pixel_u32: u32 = (*color & 0x00FFFFFF) | 0xFF000000;
+                let row_bytes = (x1 - x0) as usize * 4;
 
-            // Copy first row to remaining rows (memcpy is much faster than per-pixel fill)
-            for py in (y0 + 1)..y1 {
-                let dst_start = (py * stride + x0 * 4) as usize;
-                let dst_end = dst_start + row_bytes;
-                if dst_end > buffer.len() { break; }
-                buffer.copy_within(first_start..first_end, dst_start);
+                let first_start = (y0 * stride + x0 * 4) as usize;
+                let first_end = first_start + row_bytes;
+                if first_end > buffer.len() { return; }
+                {
+                    let row = &mut buffer[first_start..first_end];
+                    for chunk in row.chunks_exact_mut(4) {
+                        chunk.copy_from_slice(&pixel_u32.to_ne_bytes());
+                    }
+                }
+                for py in (y0 + 1)..y1 {
+                    let dst_start = (py * stride + x0 * 4) as usize;
+                    let dst_end = dst_start + row_bytes;
+                    if dst_end > buffer.len() { break; }
+                    buffer.copy_within(first_start..first_end, dst_start);
+                }
             }
         }
         RenderCommand::ClearArea { x, y, width: w, height: h, bg_color } => {
             // Same as FillRectangle with background color
             let fill = RenderCommand::FillRectangle {
-                x: *x, y: *y, width: *w, height: *h, color: *bg_color,
+                x: *x, y: *y, width: *w, height: *h, color: *bg_color, gc_function: 3,
             };
             render_to_buffer(buffer, width, height, stride, &fill);
         }
@@ -473,7 +490,7 @@ fn draw_text_bitmap(
                 let fill = RenderCommand::FillRectangle {
                     x: cursor_x as i16, y: top_y as i16,
                     width: cell_w as u16, height: GLYPH_H as u16,
-                    color: bg,
+                    color: bg, gc_function: 3,
                 };
                 render_to_buffer(buffer, buf_w, buf_h, stride, &fill);
             }
@@ -514,7 +531,7 @@ fn draw_text_bitmap(
                 let fill = RenderCommand::FillRectangle {
                     x: cx as i16, y: top_y as i16,
                     width: GLYPH_W as u16, height: GLYPH_H as u16,
-                    color: bg,
+                    color: bg, gc_function: 3,
                 };
                 render_to_buffer(buffer, buf_w, buf_h, stride, &fill);
             }

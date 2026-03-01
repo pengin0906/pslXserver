@@ -222,6 +222,10 @@ pub enum DisplayEvent {
         root_x: i16,
         root_y: i16,
     },
+    /// Cmd+C: request X11 selection data and copy to macOS clipboard.
+    ClipboardCopyRequest {
+        window: Xid,
+    },
 }
 
 /// Individual rendering commands mapped from X11 drawing operations.
@@ -233,6 +237,8 @@ pub enum RenderCommand {
         width: u16,
         height: u16,
         color: u32,
+        /// GC function: 3=Copy(default), 6=Xor. Xor renders as translucent highlight.
+        gc_function: u8,
     },
     DrawLine {
         x1: i16,

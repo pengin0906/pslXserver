@@ -251,6 +251,45 @@ unsafe extern "C" fn view_key_down(this: *mut AnyObject, _sel: Sel, event: *mut 
     if this.is_null() || event.is_null() { return; }
     info!("PSLXInputView keyDown: called");
 
+    // Check for Cmd+V (paste) and Cmd+C (copy)
+    let modifier_flags: u64 = msg_send![&*event, modifierFlags];
+    let keycode: u16 = msg_send![&*event, keyCode];
+    let cmd_pressed = (modifier_flags & (1 << 20)) != 0; // Command key
+
+    if cmd_pressed && keycode == 9 { // Cmd+V (keycode 9 = 'v')
+        // Read macOS pasteboard and send as ImeCommit
+        let pb: *mut AnyObject = msg_send![objc2::class!(NSPasteboard), generalPasteboard];
+        let ns_string_type: *mut AnyObject = msg_send![objc2::class!(NSString), stringWithUTF8String: c"public.utf8-plain-text".as_ptr()];
+        let text: *mut AnyObject = msg_send![&*pb, stringForType: ns_string_type];
+        if !text.is_null() {
+            let utf8: *const std::os::raw::c_char = msg_send![&*text, UTF8String];
+            if !utf8.is_null() {
+                if let Ok(s) = std::ffi::CStr::from_ptr(utf8).to_str() {
+                    if !s.is_empty() {
+                        let ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
+                        let x11_id = *ivar.load::<u32>(&*this) as crate::display::Xid;
+                        info!("Cmd+V paste: '{}' to window 0x{:08x}", s, x11_id);
+                        send_display_event(DisplayEvent::ImeCommit {
+                            window: x11_id,
+                            text: s.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        return; // Don't process further
+    }
+
+    if cmd_pressed && keycode == 8 { // Cmd+C (keycode 8 = 'c')
+        // Copy X11 selection to macOS pasteboard
+        // Run pbcopy with the selection data (request via pbpaste-like mechanism)
+        info!("Cmd+C: requesting X11 selection for macOS clipboard");
+        let ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
+        let x11_id = *ivar.load::<u32>(&*this) as crate::display::Xid;
+        send_display_event(DisplayEvent::ClipboardCopyRequest { window: x11_id });
+        return;
+    }
+
     // Clear the textInserted flag
     let flag_ivar = (*this).class().instance_variable(c"textInserted").unwrap();
     *flag_ivar.load_mut::<u8>(&mut *this) = 0;
