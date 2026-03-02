@@ -233,6 +233,9 @@ fn get_input_view_class() -> &'static AnyClass {
             // doCommandBySelector: (non-text keys like arrows, delete)
             class_addMethod(raw_cls, objc2::sel!(doCommandBySelector:),
                 do_command_by_selector as *const std::ffi::c_void, c"v@::".as_ptr() as _);
+            // setFrameSize: override — immediate IOSurface resize when macOS window is resized
+            class_addMethod(raw_cls, objc2::sel!(setFrameSize:),
+                set_frame_size as *const std::ffi::c_void, c"v@:{CGSize=dd}".as_ptr() as _);
 
             CLASS = raw_cls as *const AnyClass;
         }
@@ -493,6 +496,156 @@ unsafe extern "C" fn first_rect(this: *mut AnyObject, _sel: Sel, _range: NSRange
         screen_rect.origin.x as i32, screen_rect.origin.y as i32);
 
     screen_rect
+}
+
+/// setFrameSize: override — called by AppKit immediately when the content view resizes
+/// (e.g. user drags the window edge). Creates a new IOSurface at the new size so content
+/// is properly clipped, then sends ConfigureNotify + Expose to X11 clients.
+///
+/// Throttled: IOSurface recreation + event sending happens at most once per 50ms during
+/// rapid drag resize to avoid overwhelming xterm. check_window_resizes() ensures the
+/// final size is always processed.
+unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: NSSize) {
+    // Call super's setFrameSize: via objc_msgSendSuper
+    #[repr(C)]
+    struct ObjcSuper {
+        receiver: *mut AnyObject,
+        super_class: *const AnyClass,
+    }
+    extern "C" {
+        fn objc_msgSendSuper(sup: *const ObjcSuper, sel: Sel, size: NSSize);
+    }
+    let sup = ObjcSuper {
+        receiver: this,
+        super_class: objc2::class!(NSView),
+    };
+    objc_msgSendSuper(&sup, objc2::sel!(setFrameSize:), new_size);
+
+    if this.is_null() { return; }
+
+    // Read x11WindowId ivar
+    let ivar = match (*this).class().instance_variable(c"x11WindowId") {
+        Some(v) => v,
+        None => return,
+    };
+    let x11_id = *ivar.load::<u32>(&*this);
+    if x11_id == 0 { return; }
+
+    let new_w = new_size.width as u16;
+    let new_h = new_size.height as u16;
+    if new_w == 0 || new_h == 0 { return; }
+
+    extern "C" {
+        fn IOSurfaceGetWidth(surface: *mut c_void) -> usize;
+        fn IOSurfaceGetHeight(surface: *mut c_void) -> usize;
+    }
+
+    // Resize IOSurface and update WindowInfo; collect event info for after borrow ends.
+    // Optimization: only recreate IOSurface when GROWING beyond current surface size.
+    // When shrinking, masksToBounds clips the existing surface — no allocation needed.
+    // Use try_borrow_mut to gracefully handle re-entrant calls.
+    let event_info: Option<(i16, i16, u16, u16)> = WINDOWS.with(|w| {
+        let mut ws = match w.try_borrow_mut() {
+            Ok(ws) => ws,
+            Err(_) => {
+                return None;
+            }
+        };
+        let (win_id, info) = match ws.iter_mut().find(|(_, info)| info.x11_id == x11_id) {
+            Some(e) => e,
+            None => return None,
+        };
+
+        if info.width == new_w && info.height == new_h {
+            return None; // No change
+        }
+
+        let old_w = info.width;
+        let old_h = info.height;
+
+        // Check if we need a new IOSurface (only when growing beyond allocated size)
+        let surface_w = IOSurfaceGetWidth(info.surface) as u16;
+        let surface_h = IOSurfaceGetHeight(info.surface) as u16;
+        let need_new_surface = new_w > surface_w || new_h > surface_h;
+
+        debug!("setFrameSize: window {} (x11 0x{:08X}) resize {}x{} -> {}x{} (surface={}x{} need_new={})",
+              win_id, x11_id, old_w, old_h, new_w, new_h, surface_w, surface_h, need_new_surface);
+
+        // Always update logical dimensions
+        info.width = new_w;
+        info.height = new_h;
+
+        if need_new_surface {
+            // Growing: create new IOSurface
+            let new_surface = create_iosurface(new_w, new_h);
+            if new_surface.is_null() {
+                log::error!("Failed to create IOSurface in setFrameSize");
+                return None;
+            }
+
+            // Copy old content to new surface
+            IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
+            IOSurfaceLock(new_surface, 0, std::ptr::null_mut());
+
+            let old_base = IOSurfaceGetBaseAddress(info.surface) as *const u8;
+            let old_stride = IOSurfaceGetBytesPerRow(info.surface);
+            let new_base = IOSurfaceGetBaseAddress(new_surface) as *mut u8;
+            let new_stride = IOSurfaceGetBytesPerRow(new_surface);
+
+            // Clear new surface to white
+            let total_new = new_stride * new_h as usize;
+            std::ptr::write_bytes(new_base, 0xFF, total_new);
+
+            // Copy overlapping region
+            let copy_rows = (old_h as usize).min(new_h as usize);
+            let copy_bytes_per_row = (old_w as usize * 4).min(new_w as usize * 4)
+                .min(old_stride).min(new_stride);
+            for row in 0..copy_rows {
+                std::ptr::copy_nonoverlapping(
+                    old_base.add(row * old_stride),
+                    new_base.add(row * new_stride),
+                    copy_bytes_per_row,
+                );
+            }
+
+            IOSurfaceUnlock(new_surface, 0, std::ptr::null_mut());
+            IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
+
+            let old_surface = info.surface;
+            info.surface = new_surface;
+            CFRelease(old_surface as *const c_void);
+        }
+
+        // Flush to CALayer (clipped by masksToBounds when shrinking)
+        flush_window(info);
+        ca_transaction_flush();
+
+        // Update position cache
+        let (new_x, new_y) = macos_frame_to_x11_pos(&info.window);
+        info.x11_x = new_x;
+        info.x11_y = new_y;
+
+        Some((new_x, new_y, new_w, new_h))
+    });
+
+    // Send ConfigureNotify + Expose outside the WINDOWS borrow
+    if let Some((x, y, w, h)) = event_info {
+        send_display_event(DisplayEvent::ConfigureNotify {
+            window: x11_id,
+            x,
+            y,
+            width: w,
+            height: h,
+        });
+        send_display_event(DisplayEvent::Expose {
+            window: x11_id,
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+            count: 0,
+        });
+    }
 }
 
 extern "C" fn timer_callback(_timer: *mut c_void, _info: *mut c_void) {
@@ -968,22 +1121,41 @@ fn handle_command(cmd: DisplayCommand) {
         }
 
         DisplayCommand::MoveResizeWindow { handle, x, y, width, height } => {
-            WINDOWS.with(|w| {
-                if let Some(info) = w.borrow().get(&handle.id) {
+            // Extract window ref and computed frame BEFORE dropping the WINDOWS borrow.
+            // setFrame_display triggers setFrameSize: override which needs borrow_mut.
+            let window_and_frame = WINDOWS.with(|w| {
+                let ws = w.borrow();
+                if let Some(info) = ws.get(&handle.id) {
                     let screen_h = info.window.screen()
                         .map(|s| s.frame().size.height)
                         .unwrap_or(956.0);
                     let pt_w = width as f64;
                     let pt_h = height as f64;
-                    // Convert X11 top-left to macOS bottom-left coordinates
-                    let mac_y = screen_h - y as f64 - pt_h;
-                    let frame = NSRect::new(
-                        NSPoint::new(x as f64, mac_y),
+                    // X11 size = content area size (not including title bar)
+                    // Use frameRectForContentRect to compute the full frame
+                    let content_rect = NSRect::new(
+                        NSPoint::new(0.0, 0.0),
                         NSSize::new(pt_w, pt_h),
                     );
-                    info.window.setFrame_display(frame, true);
+                    let frame_for_content: NSRect = unsafe {
+                        msg_send![&*info.window, frameRectForContentRect: content_rect]
+                    };
+                    let title_bar_h = frame_for_content.size.height - pt_h;
+                    // Convert X11 top-left to macOS bottom-left
+                    let mac_y = screen_h - y as f64 - pt_h - title_bar_h;
+                    let frame = NSRect::new(
+                        NSPoint::new(x as f64, mac_y),
+                        NSSize::new(pt_w, pt_h + title_bar_h),
+                    );
+                    Some((info.window.clone(), frame))
+                } else {
+                    None
                 }
             });
+            // Call setFrame_display outside the borrow so setFrameSize: can borrow_mut
+            if let Some((window, frame)) = window_and_frame {
+                window.setFrame_display(frame, true);
+            }
         }
 
         DisplayCommand::Shutdown => {

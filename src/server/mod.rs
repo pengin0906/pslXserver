@@ -510,8 +510,19 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 // Send Expose for full window so client redraws
                 send_expose_event(&server, window, 0, 0, width, height, 0);
 
-                // Recursively resize all descendant windows to match parent size
-                resize_descendants(&server, &children, width, height);
+                // macOS window size = top-level X11 window size = direct children size
+                // Only resize direct children (1 level), app manages its own descendants
+                for child_id in &children {
+                    if let Some(res) = server.resources.get(child_id) {
+                        if let Resource::Window(win) = res.value() {
+                            let mut w = win.write();
+                            w.width = width;
+                            w.height = height;
+                        }
+                    }
+                    send_configure_notify_event(&server, *child_id, 0, 0, width, height);
+                    send_expose_event(&server, *child_id, 0, 0, width, height, 0);
+                }
             }
             DisplayEvent::GlobalPointerUpdate { root_x, root_y } => {
                 server.pointer_x.store(root_x as i32, Ordering::Relaxed);
@@ -1180,31 +1191,6 @@ fn send_configure_notify_event(
     }
 }
 
-/// Recursively resize all descendant windows and send ConfigureNotify+Expose.
-fn resize_descendants(server: &XServer, child_ids: &[Xid], width: u16, height: u16) {
-    for child_id in child_ids {
-        let grandchildren = if let Some(res) = server.resources.get(child_id) {
-            if let Resource::Window(win) = res.value() {
-                let mut w = win.write();
-                w.width = width;
-                w.height = height;
-                w.children.clone()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        send_configure_notify_event(server, *child_id, 0, 0, width, height);
-        send_expose_event(server, *child_id, 0, 0, width, height, 0);
-
-        // Recurse into grandchildren
-        if !grandchildren.is_empty() {
-            resize_descendants(server, &grandchildren, width, height);
-        }
-    }
-}
 
 fn send_expose_event(
     server: &XServer, window: Xid,
@@ -1213,6 +1199,7 @@ fn send_expose_event(
     if let Some(res) = server.resources.get(&window) {
         if let Resource::Window(win) = res.value() {
             let w = win.read();
+            let mut sent = false;
             for &(conn_id, emask) in &w.event_selections {
                 if (emask & protocol::event_mask::EXPOSURE) != 0 {
                     if let Some(conn_ref) = server.connections.get(&conn_id) {
@@ -1221,9 +1208,11 @@ fn send_expose_event(
                             conn, window, x, y, width, height, count,
                         );
                         let _ = conn.event_tx.send(evt_data);
+                        sent = true;
                     }
                 }
             }
+            info!("send_expose: window=0x{:08X} {}x{} sent={}", window, width, height, sent);
         }
     }
 }

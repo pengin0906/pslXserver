@@ -222,6 +222,16 @@ where
                         }
                     }
                 }
+
+                // After processing client requests, also deliver any pending events.
+                // Without this, biased select! would starve event delivery during
+                // heavy client output (e.g., ls -lR in xterm) because the read branch
+                // is always ready and events in event_rx never get selected.
+                while let Ok(mut event_data) = event_rx.try_recv() {
+                    let cur_seq = conn.current_request_sequence();
+                    set_event_sequence(&conn, &mut event_data, cur_seq);
+                    if stream.write_all(&event_data).await.is_err() { break; }
+                }
             }
 
             // Events from the server's event dispatcher
@@ -1311,7 +1321,7 @@ async fn handle_configure_window<S: AsyncRead + AsyncWrite + Unpin>(
             // 0x20 = Sibling, 0x40 = StackMode
             let _ = offset;
 
-            debug!("ConfigureWindow: 0x{:08X} mask=0x{:04X} => {}x{} at ({},{}) border={} old={}x{}",
+            info!("ConfigureWindow: 0x{:08X} mask=0x{:04X} => {}x{} at ({},{}) border={} old={}x{}",
                 wid, value_mask, w.width, w.height, w.x, w.y, w.border_width, old_width, old_height);
 
             // Update native window if exists
@@ -1346,20 +1356,44 @@ async fn handle_configure_window<S: AsyncRead + AsyncWrite + Unpin>(
             set_event_sequence(conn, &mut config_notify, seq);
             stream.write_all(&config_notify).await?;
         }
-        // When a child window is resized by the client, send Expose so it redraws
+        // When a window is resized, send Expose so it redraws
         if size_changed {
             let seq = conn.current_request_sequence();
-            let mut expose = [0u8; 32];
-            expose[0] = 12; // Expose event type
-            expose[2..4].copy_from_slice(&(seq as u16).to_le_bytes());
-            expose[4..8].copy_from_slice(&wid.to_le_bytes());
-            expose[8..10].copy_from_slice(&0u16.to_le_bytes()); // x
-            expose[10..12].copy_from_slice(&0u16.to_le_bytes()); // y
-            expose[12..14].copy_from_slice(&width.to_le_bytes()); // width
-            expose[14..16].copy_from_slice(&height.to_le_bytes()); // height
-            expose[16..18].copy_from_slice(&0u16.to_le_bytes()); // count
+            let mut expose = super::events::build_expose_event(conn, wid, 0, 0, width, height, 0);
             set_event_sequence(conn, &mut expose, seq);
             stream.write_all(&expose).await?;
+
+            // Parent size = direct child size: resize direct children to same dimensions
+            let children = if let Some(res) = server.resources.get(&wid) {
+                if let super::resources::Resource::Window(win) = res.value() {
+                    win.read().children.clone()
+                } else { Vec::new() }
+            } else { Vec::new() };
+            for child_id in children {
+                if let Some(res) = server.resources.get(&child_id) {
+                    if let super::resources::Resource::Window(win) = res.value() {
+                        let mut w = win.write();
+                        w.width = width;
+                        w.height = height;
+                    }
+                }
+                // Send ConfigureNotify + Expose to child via event queue
+                let child_border = if let Some(res) = server.resources.get(&child_id) {
+                    if let super::resources::Resource::Window(win) = res.value() {
+                        let w = win.read();
+                        w.border_width
+                    } else { 0 }
+                } else { 0 };
+                let mut child_config = super::events::build_configure_notify(
+                    conn, child_id, child_id, 0, 0, 0, width, height, child_border, false,
+                );
+                set_event_sequence(conn, &mut child_config, seq);
+                let _ = conn.event_tx.send(child_config);
+
+                let mut child_expose = super::events::build_expose_event(conn, child_id, 0, 0, width, height, 0);
+                set_event_sequence(conn, &mut child_expose, seq);
+                let _ = conn.event_tx.send(child_expose);
+            }
         }
     }
 
