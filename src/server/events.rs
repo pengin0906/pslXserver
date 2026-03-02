@@ -175,3 +175,129 @@ pub fn build_client_message(
       .set_u32(28, data[4]);
     eb.build()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU16;
+    use tokio::sync::mpsc;
+
+    fn make_test_conn(byte_order: ByteOrder, seq: u16) -> ClientConnection {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let conn = ClientConnection {
+            id: 1,
+            resource_id_base: 0x00200000,
+            resource_id_mask: 0x001FFFFF,
+            byte_order,
+            sequence_number: AtomicU16::new(seq),
+            event_tx: tx,
+        };
+        conn
+    }
+
+    #[test]
+    fn test_event_builder_size() {
+        let conn = make_test_conn(ByteOrder::LittleEndian, 5);
+        let event = EventBuilder::new(&conn, 12).build(); // Expose
+        assert_eq!(event.len(), 32); // All X11 events are exactly 32 bytes
+    }
+
+    #[test]
+    fn test_event_builder_type_and_sequence() {
+        let conn = make_test_conn(ByteOrder::LittleEndian, 42);
+        let event = EventBuilder::new(&conn, 12).build();
+        assert_eq!(event[0], 12); // event type
+        // Sequence is current_request_sequence() = 42 - 1 = 41
+        assert_eq!(u16::from_le_bytes([event[2], event[3]]), 41);
+    }
+
+    #[test]
+    fn test_event_builder_big_endian() {
+        let conn = make_test_conn(ByteOrder::BigEndian, 42);
+        let event = EventBuilder::new(&conn, 2).build();
+        assert_eq!(event[0], 2); // event type
+        assert_eq!(u16::from_be_bytes([event[2], event[3]]), 41);
+    }
+
+    #[test]
+    fn test_key_event_little_endian() {
+        let conn = make_test_conn(ByteOrder::LittleEndian, 10);
+        let event = build_key_event(
+            &conn, 2, 38, // KeyPress, keycode 38 ('a')
+            12345, 0x80, 0x100, 0, // time, root, event_window, child
+            100, 200, 50, 75, 0x0001, true, // root_x/y, event_x/y, state, same_screen
+        );
+        assert_eq!(event.len(), 32);
+        assert_eq!(event[0], 2); // KeyPress
+        assert_eq!(event[1], 38); // keycode
+        assert_eq!(u32::from_le_bytes([event[4], event[5], event[6], event[7]]), 12345); // time
+        assert_eq!(u32::from_le_bytes([event[8], event[9], event[10], event[11]]), 0x80); // root
+        assert_eq!(u32::from_le_bytes([event[12], event[13], event[14], event[15]]), 0x100); // event
+        assert_eq!(i16::from_le_bytes([event[20], event[21]]), 100); // root_x
+        assert_eq!(i16::from_le_bytes([event[22], event[23]]), 200); // root_y
+        assert_eq!(i16::from_le_bytes([event[24], event[25]]), 50); // event_x
+        assert_eq!(i16::from_le_bytes([event[26], event[27]]), 75); // event_y
+        assert_eq!(u16::from_le_bytes([event[28], event[29]]), 0x0001); // state
+        assert_eq!(event[30], 1); // same_screen
+    }
+
+    #[test]
+    fn test_expose_event() {
+        let conn = make_test_conn(ByteOrder::LittleEndian, 5);
+        let event = build_expose_event(&conn, 0x100, 10, 20, 640, 480, 0);
+        assert_eq!(event[0], 12); // Expose type
+        assert_eq!(u32::from_le_bytes([event[4], event[5], event[6], event[7]]), 0x100);
+        assert_eq!(u16::from_le_bytes([event[8], event[9]]), 10); // x
+        assert_eq!(u16::from_le_bytes([event[10], event[11]]), 20); // y
+        assert_eq!(u16::from_le_bytes([event[12], event[13]]), 640); // width
+        assert_eq!(u16::from_le_bytes([event[14], event[15]]), 480); // height
+        assert_eq!(u16::from_le_bytes([event[16], event[17]]), 0); // count
+    }
+
+    #[test]
+    fn test_configure_notify_event() {
+        let conn = make_test_conn(ByteOrder::LittleEndian, 5);
+        let event = build_configure_notify(
+            &conn, 0x100, 0x100, 0, 50, 75, 800, 600, 0, false
+        );
+        assert_eq!(event[0], 22); // ConfigureNotify type
+        assert_eq!(u32::from_le_bytes([event[4], event[5], event[6], event[7]]), 0x100); // event
+        assert_eq!(u32::from_le_bytes([event[8], event[9], event[10], event[11]]), 0x100); // window
+        assert_eq!(i16::from_le_bytes([event[16], event[17]]), 50); // x
+        assert_eq!(i16::from_le_bytes([event[18], event[19]]), 75); // y
+        assert_eq!(u16::from_le_bytes([event[20], event[21]]), 800); // width
+        assert_eq!(u16::from_le_bytes([event[22], event[23]]), 600); // height
+        assert_eq!(event[26], 0); // override_redirect = false
+    }
+
+    #[test]
+    fn test_map_notify_event() {
+        let conn = make_test_conn(ByteOrder::LittleEndian, 1);
+        let event = build_map_notify(&conn, 0x80, 0x100, true);
+        assert_eq!(event[0], 19); // MapNotify type
+        assert_eq!(u32::from_le_bytes([event[4], event[5], event[6], event[7]]), 0x80);
+        assert_eq!(u32::from_le_bytes([event[8], event[9], event[10], event[11]]), 0x100);
+        assert_eq!(event[12], 1); // override_redirect = true
+    }
+
+    #[test]
+    fn test_client_message_event() {
+        let conn = make_test_conn(ByteOrder::LittleEndian, 1);
+        let data = [0xDEADBEEF_u32, 0xCAFEBABE, 0, 0, 0];
+        let event = build_client_message(&conn, 32, 0x100, 42, &data);
+        assert_eq!(event[0], 33); // ClientMessage type
+        assert_eq!(event[1], 32); // format
+        assert_eq!(u32::from_le_bytes([event[4], event[5], event[6], event[7]]), 0x100); // window
+        assert_eq!(u32::from_le_bytes([event[8], event[9], event[10], event[11]]), 42); // type
+        assert_eq!(u32::from_le_bytes([event[12], event[13], event[14], event[15]]), 0xDEADBEEF);
+    }
+
+    #[test]
+    fn test_event_big_endian_byte_order() {
+        let conn = make_test_conn(ByteOrder::BigEndian, 10);
+        let event = build_expose_event(&conn, 0x100, 10, 20, 640, 480, 0);
+        // In big-endian, bytes should be big-endian
+        assert_eq!(u32::from_be_bytes([event[4], event[5], event[6], event[7]]), 0x100);
+        assert_eq!(u16::from_be_bytes([event[12], event[13]]), 640);
+    }
+}

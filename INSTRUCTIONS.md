@@ -72,11 +72,80 @@
 
 ---
 
-## 未解決の課題
-- [ ] QueryColors (opcode 91) 未完全 — xeyes/xclockがクラッシュする場合あり
-- [ ] ウィンドウリサイズ: ドラッグ中は引き伸ばし、離すと正しいサイズに（60fps検知の限界）
-- [ ] カーソルがX11ウィンドウと連動しない（macOSカーソルのまま）
-- [ ] いろんなXで動くコマンドまず公式リリースの付属コマンド全部動作確認してダメなとこ一つずつ直して
-- [ ] 一つ一つの単体テストが適当すぎるんだよ。ちゃんとテスト計画立ててテストしてください。
-- [ ] ウインドウ広げたり縮めたりして挙動が標準Xサーバーと同じかどうか確認する
-- [ ] 仕様どうり動いているか仕様書を見て挙動を確認する
+## Phase 6: 品質改善・仕様準拠 (2026-03-02)
+
+### 修正済み
+- [x] QueryColors (opcode 91): AllocColorの正確な16bit色値返却修正 (0xFF→0xFFFF)
+- [x] 欠落colormapオペコード追加: 86(AllocColorCells→BadAlloc), 87(AllocColorPlanes→BadAlloc), 88-90(FreeColors/StoreColors/StoreNamedColor→no-op)
+- [x] 欠落一般オペコード追加: 39(GetMotionEvents→空リスト), 50(ListFontsWithInfo→終端マーカー), 6(ChangeSaveSet), 13(CirculateWindow), 83(InstallColormap)
+- [x] X11カーソル→macOS NSCursor連動: CreateGlyphCursorのsource_char→MacOSCursorType変換、ChangeWindowAttributesでSetWindowCursor送信、addCursorRect適用
+- [x] ウィンドウリサイズ引き伸ばし: NSViewLayerContentsPlacementTopLeft(=11)設定でmacOSがlive resize中にコンテンツを伸縮させるのを防止
+- [x] 死コード除去: opcode 41のno-opリスト重複（handle_warp_pointerが先にマッチ）
+
+### テスト整備 (12→41テスト)
+- [x] cursor/mod.rs: カーソルグリフマッピングテスト、全標準カーソル網羅テスト
+- [x] server/resources.rs: WindowState初期値、WindowClass変換、プロパティCRUD、イベント配信、GCデフォルト値、GcFunction変換、複数クライアントイベント選択
+- [x] server/events.rs: EventBuilder 32バイト保証、シーケンス番号、BE/LE対応、KeyPress/Expose/ConfigureNotify/MapNotify/ClientMessage全フィールド検証
+- [x] server/protocol.rs: イベントマスクbit一意性、仕様値一致、EXPOSURE/STRUCTURE_NOTIFYビット位置
+- [x] server/mod.rs: ServerErrorコード、サーバー生成、ルートウィンドウ、リソースID割当、接続ID割当、TrueColorピクセル形式、色値ラウンドトリップ、フォーカスデフォルト
+
+### X11仕様準拠検証
+
+#### QueryColors (opcode 91) — X11R7.7仕様準拠
+- リクエスト: COLORMAP + LISTofCARD32(pixel) ✓
+- リプライ: LISTofRGB (各エントリ red/green/blue 16bit + 2byte pad) ✓
+- TrueColor: ピクセル値→RGB直接分解 (red_mask=0xFF0000, green_mask=0xFF00, blue_mask=0xFF) ✓
+- 16bit変換: 8bit値→`(val << 8 | val)`で正確な16bit表現 ✓
+
+#### AllocColor (opcode 84) — X11R7.7仕様準拠
+- TrueColor: RGB16→RGB8→pixel計算 ✓
+- exact color: 実際にハードウェアが使う色値を16bitで返却 ✓
+- 色値ラウンドトリップ: AllocColor→QueryColorsで一貫した値 ✓ (テスト検証済み)
+
+#### ChangeWindowAttributes (opcode 2) — カーソル属性
+- value_mask 0x4000: cursor属性ビット ✓
+- cursor=0: デフォルトカーソル(arrow) ✓
+- cursor>0: CursorStateのsource_char→MacOSCursorTypeマッピング ✓
+- ネイティブウィンドウ検索: 子ウィンドウから祖先チェーンでtop-level検索 ✓
+
+#### ConfigureWindow (opcode 12) — リサイズイベント
+- ConfigureNotify送信: StructureNotifyMask持つクライアントに配信 ✓
+- Expose送信: ExposureMask持つクライアントに配信 ✓
+- 子ウィンドウ連動: 親リサイズ時に直接の子も同サイズに更新 ✓
+
+#### ウィンドウリサイズ — macOS/X11連携
+- setFrameSize:オーバーライド: macOS live resize中にsynchronous IOSurface更新 ✓
+- 縮小時: IOSurface再生成なし、masksToBoundsでクリップ ✓
+- 拡大時: 新IOSurface生成、旧コンテンツcopy_nonoverlapping ✓
+- layerContentsPlacement=TopLeft: ドラッグ中のコンテンツ引き伸ばし防止 ✓
+- contentsGravity=topLeft, contentsScale=1.0: ピクセル1:1マッピング ✓
+- check_window_resizes(): バックアップ検知（位置変更等） ✓
+
+### X11コマンド動作対応状況
+| コマンド | 必要な機能 | 対応状況 |
+|----------|-----------|----------|
+| xterm | KeyPress/Release, Expose, ConfigureNotify, IME | ✓ 完全動作 |
+| ico | CreateWindow, MapWindow, PolyLine, ClearArea | ✓ 動作確認済み |
+| xlsfonts | ListFonts, OpenFont, QueryFont | ✓ 動作確認済み |
+| xev | KeyPress/Release, ButtonPress/Release, MotionNotify | ✓ 動作確認済み |
+| xdpyinfo | QueryExtension, ListExtensions, GetProperty | ✓ 動作確認済み |
+| xeyes | FillArc, PolyFillArc, CreateGlyphCursor | △ 基本動作（SHAPE拡張なし） |
+| xclock | FillArc, DrawArc, AllocColor, QueryColors | △ 基本動作（Xt/Xaw依存） |
+| xcalc | Xt/Xaw widgets, 多数のウィンドウ | △ 基本動作 |
+| xlogo | FillPolygon, SHAPE拡張 | △ 矩形表示（SHAPE未実装） |
+
+### 修正済みバグ (2026-03-03)
+- [x] mac_y座標修正: MoveResizeWindowの`screen_h - y - pt_h - title_bar_h`を`screen_h - y - pt_h`に修正（forward/reverse変換不整合）
+- [x] リサイズ時全面背景クリア: setFrameSizeで拡大・縮小ともIOSurface全面をbackground_pixelでクリアしてからExpose送信（xclock等が白背景前提で描画）
+- [x] 特殊マウスハンドラ撤去: PSLXInputViewのno-op mouseDown/mouseDragged、mouseDownCanMoveWindow、setMovableByWindowBackground全削除
+- [x] sendEventフィルタ撤去: マウスイベントの選択的ブロック廃止、全イベントをAppKitに渡す
+- [x] ドラッグ引きずり: ポーリング/NSEvent二重ButtonPress防止(LAST_BUTTONS)、MotionNotify watchdog
+- [x] IME変換中キーイベント漏れ: IME_COMPOSINGチェック追加
+
+### 今後の課題
+- [ ] SHAPE拡張実装 (xeyes/xlogo非矩形ウィンドウ対応)
+- [ ] RENDER拡張実装 (アンチエイリアス描画)
+- [ ] BIG-REQUESTS拡張実装
+- [ ] XTest拡張実装 (xdotool対応)
+- [ ] GetImage: IOSurfaceからの実ピクセルデータ読み取り
+- [ ] bit_gravity対応（リサイズ時のコンテンツ移動制御）

@@ -3,6 +3,59 @@
 
 use crate::display::RenderCommand;
 
+/// X11 GC raster operation: combine src and dst pixels according to gc_function,
+/// then apply plane_mask. Alpha channel is always preserved at 0xFF (XQuartz approach).
+/// gc_function values 0-15 map to the standard X11 GC functions (GXclear..GXset).
+#[inline]
+fn apply_rop(gc_function: u8, src: u32, dst: u32, plane_mask: u32) -> u32 {
+    let result = match gc_function {
+        0  => 0,                    // GXclear
+        1  => src & dst,            // GXand
+        2  => src & !dst,           // GXandReverse
+        3  => src,                  // GXcopy (default)
+        4  => !src & dst,           // GXandInverted
+        5  => dst,                  // GXnoop
+        6  => src ^ dst,            // GXxor
+        7  => src | dst,            // GXor
+        8  => !(src | dst),         // GXnor
+        9  => !(src ^ dst),         // GXequiv
+        10 => !dst,                 // GXinvert
+        11 => src | !dst,           // GXorReverse
+        12 => !src,                 // GXcopyInverted
+        13 => !src | dst,           // GXorInverted
+        14 => !(src & dst),         // GXnand
+        15 => 0xFFFFFFFF,           // GXset
+        _  => src,
+    };
+    // Apply plane_mask: only modify bits selected by plane_mask
+    // Alpha always stays 0xFF
+    ((dst & !plane_mask) | (result & plane_mask)) | 0xFF000000
+}
+
+/// Apply ROP to a single pixel in BGRA buffer (bounds-checked).
+/// Fast path: gc_function==3 && plane_mask==0xFFFFFFFF → direct copy (no ROP overhead).
+#[inline]
+fn rop_pixel(buffer: &mut [u8], buf_w: u32, buf_h: u32, stride: u32,
+             px: i32, py: i32, src_color: u32, gc_function: u8, plane_mask: u32) {
+    if px >= 0 && (px as u32) < buf_w && py >= 0 && (py as u32) < buf_h {
+        let offset = (py as usize) * (stride as usize) + (px as usize) * 4;
+        if offset + 4 <= buffer.len() {
+            if gc_function == 3 && plane_mask == 0xFFFFFFFF {
+                // Fast path: GXcopy with full plane_mask — just write the pixel
+                let pixel_u32 = (src_color & 0x00FFFFFF) | 0xFF000000;
+                buffer[offset..offset + 4].copy_from_slice(&pixel_u32.to_ne_bytes());
+            } else if gc_function == 5 {
+                // GXnoop — do nothing
+                return;
+            } else {
+                let dst = u32::from_ne_bytes([buffer[offset], buffer[offset+1], buffer[offset+2], buffer[offset+3]]);
+                let result = apply_rop(gc_function, src_color | 0xFF000000, dst, plane_mask & 0x00FFFFFF);
+                buffer[offset..offset + 4].copy_from_slice(&result.to_ne_bytes());
+            }
+        }
+    }
+}
+
 /// Apply a render command to a pixel buffer (software rendering fallback).
 /// This works on all platforms for testing.
 /// On macOS, we'll use CGContext instead.
@@ -22,28 +75,10 @@ pub fn render_to_buffer(
 
             if x0 >= x1 || y0 >= y1 { return; }
 
-            if *gc_function == 6 {
-                // GXxor: macOS-style translucent highlight (light blue, 30% opacity)
-                let hr: u32 = 60;  // highlight R
-                let hg: u32 = 140; // highlight G
-                let hb: u32 = 255; // highlight B
-                let alpha: u32 = 77; // ~30% of 255
-                let inv_alpha: u32 = 255 - alpha;
-                for py in y0..y1 {
-                    for px in x0..x1 {
-                        let off = (py * stride + px * 4) as usize;
-                        if off + 3 >= buffer.len() { continue; }
-                        let db = buffer[off] as u32;
-                        let dg = buffer[off + 1] as u32;
-                        let dr = buffer[off + 2] as u32;
-                        buffer[off]     = ((hb * alpha + db * inv_alpha) / 255) as u8;
-                        buffer[off + 1] = ((hg * alpha + dg * inv_alpha) / 255) as u8;
-                        buffer[off + 2] = ((hr * alpha + dr * inv_alpha) / 255) as u8;
-                        buffer[off + 3] = 255;
-                    }
-                }
-            } else {
-                // GXcopy (or other): solid fill
+            if *gc_function == 5 { return; } // GXnoop
+
+            if *gc_function == 3 {
+                // Fast path: GXcopy — direct fill, no ROP overhead (preserves IME perf)
                 let pixel_u32: u32 = (*color & 0x00FFFFFF) | 0xFF000000;
                 let row_bytes = (x1 - x0) as usize * 4;
 
@@ -62,6 +97,36 @@ pub fn render_to_buffer(
                     if dst_end > buffer.len() { break; }
                     buffer.copy_within(first_start..first_end, dst_start);
                 }
+            } else if *gc_function == 6 {
+                // GXxor on FillRectangle: light blue translucent highlight (selection)
+                let hr: u32 = 60;  let hg: u32 = 140; let hb: u32 = 255;
+                let alpha: u32 = 77; // ~30%
+                let inv_alpha: u32 = 255 - alpha;
+                for py in y0..y1 {
+                    for px in x0..x1 {
+                        let off = (py * stride + px * 4) as usize;
+                        if off + 3 >= buffer.len() { continue; }
+                        let db = buffer[off] as u32;
+                        let dg = buffer[off + 1] as u32;
+                        let dr = buffer[off + 2] as u32;
+                        buffer[off]     = ((hb * alpha + db * inv_alpha) / 255) as u8;
+                        buffer[off + 1] = ((hg * alpha + dg * inv_alpha) / 255) as u8;
+                        buffer[off + 2] = ((hr * alpha + dr * inv_alpha) / 255) as u8;
+                        buffer[off + 3] = 255;
+                    }
+                }
+            } else {
+                // All other GC functions: per-pixel ROP
+                let src = (*color & 0x00FFFFFF) | 0xFF000000;
+                for py in y0..y1 {
+                    for px in x0..x1 {
+                        let off = (py * stride + px * 4) as usize;
+                        if off + 4 > buffer.len() { continue; }
+                        let dst = u32::from_ne_bytes([buffer[off], buffer[off+1], buffer[off+2], buffer[off+3]]);
+                        let result = apply_rop(*gc_function, src, dst, 0x00FFFFFF);
+                        buffer[off..off + 4].copy_from_slice(&result.to_ne_bytes());
+                    }
+                }
             }
         }
         RenderCommand::ClearArea { x, y, width: w, height: h, bg_color } => {
@@ -71,7 +136,8 @@ pub fn render_to_buffer(
             };
             render_to_buffer(buffer, width, height, stride, &fill);
         }
-        RenderCommand::DrawLine { x1, y1, x2, y2, color, .. } => {
+        RenderCommand::DrawLine { x1, y1, x2, y2, color, gc_function, .. } => {
+            if *gc_function == 5 { return; } // GXnoop
             // Bresenham's line algorithm
             let mut x = *x1 as i32;
             let mut y = *y1 as i32;
@@ -84,23 +150,8 @@ pub fn render_to_buffer(
             let sy = if y < y2 { 1 } else { -1 };
             let mut err = dx + dy;
 
-            // BGRA pixel
-            let pixel: [u8; 4] = [
-                (*color & 0xFF) as u8,
-                ((*color >> 8) & 0xFF) as u8,
-                ((*color >> 16) & 0xFF) as u8,
-                0xFF,
-            ];
-
-            let w = width as i32;
-            let h = height as i32;
-
             loop {
-                if x >= 0 && x < w && y >= 0 && y < h {
-                    let offset = (y as usize) * (stride as usize) + (x as usize) * 4;
-                    // Safety: bounds already checked above
-                    buffer[offset..offset + 4].copy_from_slice(&pixel);
-                }
+                rop_pixel(buffer, width, height, stride, x, y, *color, *gc_function, 0xFFFFFFFF);
 
                 if x == x2 && y == y2 { break; }
                 let e2 = 2 * err;
@@ -108,94 +159,92 @@ pub fn render_to_buffer(
                 if e2 <= dx { err += dx; y += sy; }
             }
         }
-        RenderCommand::PutImage { x, y, width: w, height: h, depth, format, data } => {
+        RenderCommand::PutImage { x, y, width: w, height: h, depth, format, data, gc_function } => {
+            if *gc_function == 5 { return; } // GXnoop
             let dst_x = (*x as i32).max(0) as u32;
             let dst_y = (*y as i32).max(0) as u32;
             let src_w = *w as u32;
             let src_h = *h as u32;
 
-            if *format == 2 && *depth == 24 {
-                // ZPixmap format, 24-bit depth (stored as 32-bit BGRX in X11)
+            if *format == 2 && (*depth == 24 || *depth == 32) {
                 let src_stride = src_w * 4;
-                for row in 0..src_h {
-                    let dy = dst_y + row;
-                    if dy >= height { break; }
-                    let src_off = (row * src_stride) as usize;
-                    let dst_off = (dy * stride + dst_x * 4) as usize;
-                    let copy_w = src_w.min(width.saturating_sub(dst_x)) as usize;
-                    let src_end = src_off + copy_w * 4;
-                    let dst_end = dst_off + copy_w * 4;
-                    if src_end <= data.len() && dst_end <= buffer.len() {
-                        // X11 sends BGRX, IOSurface expects BGRA — just copy and set alpha
-                        let src_row = &data[src_off..src_end];
-                        let dst_row = &mut buffer[dst_off..dst_end];
-                        dst_row.copy_from_slice(src_row);
-                        // Set alpha to 0xFF for every pixel
-                        for chunk in dst_row.chunks_exact_mut(4) {
-                            chunk[3] = 0xFF;
+                if *gc_function == 3 {
+                    // Fast path: GXcopy — direct memcpy (preserves IME/xterm perf)
+                    for row in 0..src_h {
+                        let dy = dst_y + row;
+                        if dy >= height { break; }
+                        let src_off = (row * src_stride) as usize;
+                        let dst_off = (dy * stride + dst_x * 4) as usize;
+                        let copy_w = src_w.min(width.saturating_sub(dst_x)) as usize;
+                        let src_end = src_off + copy_w * 4;
+                        let dst_end = dst_off + copy_w * 4;
+                        if src_end <= data.len() && dst_end <= buffer.len() {
+                            buffer[dst_off..dst_end].copy_from_slice(&data[src_off..src_end]);
+                            // Set alpha to 0xFF for every pixel
+                            for chunk in buffer[dst_off..dst_end].chunks_exact_mut(4) {
+                                chunk[3] = 0xFF;
+                            }
                         }
                     }
-                }
-            } else if *format == 2 && *depth == 32 {
-                // ZPixmap 32-bit (BGRA)
-                let src_stride = src_w * 4;
-                for row in 0..src_h {
-                    let dy = dst_y + row;
-                    if dy >= height { break; }
-                    let src_off = (row * src_stride) as usize;
-                    let dst_off = (dy * stride + dst_x * 4) as usize;
-                    let copy_w = src_w.min(width.saturating_sub(dst_x)) as usize;
-                    let src_end = src_off + copy_w * 4;
-                    let dst_end = dst_off + copy_w * 4;
-                    if src_end <= data.len() && dst_end <= buffer.len() {
-                        buffer[dst_off..dst_end].copy_from_slice(&data[src_off..src_end]);
+                } else {
+                    // Per-pixel ROP for non-copy functions
+                    for row in 0..src_h {
+                        let dy = dst_y + row;
+                        if dy >= height { break; }
+                        let copy_w = src_w.min(width.saturating_sub(dst_x));
+                        for col in 0..copy_w {
+                            let src_off = (row * src_stride + col * 4) as usize;
+                            let dst_off = (dy * stride + (dst_x + col) * 4) as usize;
+                            if src_off + 4 <= data.len() && dst_off + 4 <= buffer.len() {
+                                let src_pixel = u32::from_ne_bytes([data[src_off], data[src_off+1], data[src_off+2], 0xFF]);
+                                let dst_pixel = u32::from_ne_bytes([buffer[dst_off], buffer[dst_off+1], buffer[dst_off+2], buffer[dst_off+3]]);
+                                let result = apply_rop(*gc_function, src_pixel, dst_pixel, 0x00FFFFFF);
+                                buffer[dst_off..dst_off + 4].copy_from_slice(&result.to_ne_bytes());
+                            }
+                        }
                     }
                 }
             } else {
                 log::debug!("PutImage: unsupported format={} depth={}", format, depth);
             }
         }
-        RenderCommand::DrawRectangle { x, y, width: w, height: h, color, .. } => {
-            let pixel: [u8; 4] = [
-                (*color & 0xFF) as u8,
-                ((*color >> 8) & 0xFF) as u8,
-                ((*color >> 16) & 0xFF) as u8,
-                0xFF,
-            ];
+        RenderCommand::DrawRectangle { x, y, width: w, height: h, color, line_width: _, gc_function } => {
+            if *gc_function == 5 { return; } // GXnoop
             let x0 = *x as i32;
             let y0 = *y as i32;
             let x1 = x0 + *w as i32;
             let y1 = y0 + *h as i32;
             // Top and bottom edges
             for px in x0..=x1 {
-                set_pixel(buffer, width, height, stride, px, y0, &pixel);
-                set_pixel(buffer, width, height, stride, px, y1, &pixel);
+                rop_pixel(buffer, width, height, stride, px, y0, *color, *gc_function, 0xFFFFFFFF);
+                rop_pixel(buffer, width, height, stride, px, y1, *color, *gc_function, 0xFFFFFFFF);
             }
             // Left and right edges
             for py in y0..=y1 {
-                set_pixel(buffer, width, height, stride, x0, py, &pixel);
-                set_pixel(buffer, width, height, stride, x1, py, &pixel);
+                rop_pixel(buffer, width, height, stride, x0, py, *color, *gc_function, 0xFFFFFFFF);
+                rop_pixel(buffer, width, height, stride, x1, py, *color, *gc_function, 0xFFFFFFFF);
             }
         }
-        RenderCommand::FillArc { x, y, width: w, height: h, angle1, angle2, color } => {
+        RenderCommand::FillArc { x, y, width: w, height: h, angle1, angle2, color, gc_function } => {
             fill_arc(buffer, width, height, stride,
-                     *x, *y, *w, *h, *angle1, *angle2, *color);
+                     *x, *y, *w, *h, *angle1, *angle2, *color, *gc_function);
         }
-        RenderCommand::DrawArc { x, y, width: w, height: h, angle1, angle2, color, .. } => {
+        RenderCommand::DrawArc { x, y, width: w, height: h, angle1, angle2, color, gc_function, .. } => {
             draw_arc(buffer, width, height, stride,
-                     *x, *y, *w, *h, *angle1, *angle2, *color);
+                     *x, *y, *w, *h, *angle1, *angle2, *color, *gc_function);
         }
-        RenderCommand::DrawText { x, y, text, font_id: _, color, bg_color } => {
+        RenderCommand::DrawText { x, y, text, font_id: _, color, bg_color, gc_function } => {
+            if *gc_function == 5 { return; } // GXnoop
             log::debug!("DrawText at ({},{}) len={} fg=0x{:06X} bg={:?}", x, y, text.len(), color, bg_color);
             draw_text_bitmap(buffer, width, height, stride,
                               *x, *y, text, *color, *bg_color);
         }
-        RenderCommand::CopyArea { src_x, src_y, dst_x, dst_y, width: w, height: h } => {
+        RenderCommand::CopyArea { src_x, src_y, dst_x, dst_y, width: w, height: h, gc_function } => {
             copy_area(buffer, width, height, stride,
-                      *src_x, *src_y, *dst_x, *dst_y, *w, *h);
+                      *src_x, *src_y, *dst_x, *dst_y, *w, *h, *gc_function);
         }
-        RenderCommand::FillPolygon { points, color } => {
-            fill_polygon(buffer, width, height, stride, points, *color);
+        RenderCommand::FillPolygon { points, color, gc_function } => {
+            fill_polygon(buffer, width, height, stride, points, *color, *gc_function);
         }
         _ => {
             log::trace!("Unimplemented render command: {:?}", command);
@@ -205,6 +254,7 @@ pub fn render_to_buffer(
 
 /// Copy a rectangular region within the same buffer (for scrolling).
 /// Handles overlapping regions correctly by using a temporary buffer.
+/// Respects gc_function for raster operations during copy.
 fn copy_area(
     buffer: &mut [u8],
     buf_w: u32,
@@ -213,7 +263,10 @@ fn copy_area(
     src_x: i16, src_y: i16,
     dst_x: i16, dst_y: i16,
     width: u16, height: u16,
+    gc_function: u8,
 ) {
+    if gc_function == 5 { return; } // GXnoop
+
     let w = width as u32;
     let h = height as u32;
 
@@ -230,7 +283,7 @@ fn copy_area(
 
     let row_bytes = actual_w as usize * 4;
 
-    // Copy to temp buffer first to handle overlapping regions
+    // Copy source to temp buffer first to handle overlapping regions
     let mut tmp = vec![0u8; row_bytes * actual_h as usize];
     for row in 0..actual_h {
         let src_off = ((sy0 + row) as usize) * (stride as usize) + (sx0 as usize) * 4;
@@ -240,17 +293,33 @@ fn copy_area(
         }
     }
 
-    // Copy from temp to destination
-    for row in 0..actual_h {
-        let dst_off = ((dy0 + row) as usize) * (stride as usize) + (dx0 as usize) * 4;
-        let tmp_off = (row as usize) * row_bytes;
-        if dst_off + row_bytes <= buffer.len() {
-            buffer[dst_off..dst_off + row_bytes].copy_from_slice(&tmp[tmp_off..tmp_off + row_bytes]);
+    if gc_function == 3 {
+        // Fast path: GXcopy — direct memcpy (preserves scroll perf)
+        for row in 0..actual_h {
+            let dst_off = ((dy0 + row) as usize) * (stride as usize) + (dx0 as usize) * 4;
+            let tmp_off = (row as usize) * row_bytes;
+            if dst_off + row_bytes <= buffer.len() {
+                buffer[dst_off..dst_off + row_bytes].copy_from_slice(&tmp[tmp_off..tmp_off + row_bytes]);
+            }
+        }
+    } else {
+        // Per-pixel ROP
+        for row in 0..actual_h {
+            for col in 0..actual_w {
+                let tmp_off = (row as usize) * row_bytes + (col as usize) * 4;
+                let dst_off = ((dy0 + row) as usize) * (stride as usize) + ((dx0 + col) as usize) * 4;
+                if tmp_off + 4 <= tmp.len() && dst_off + 4 <= buffer.len() {
+                    let src_pixel = u32::from_ne_bytes([tmp[tmp_off], tmp[tmp_off+1], tmp[tmp_off+2], tmp[tmp_off+3]]);
+                    let dst_pixel = u32::from_ne_bytes([buffer[dst_off], buffer[dst_off+1], buffer[dst_off+2], buffer[dst_off+3]]);
+                    let result = apply_rop(gc_function, src_pixel, dst_pixel, 0x00FFFFFF);
+                    buffer[dst_off..dst_off + 4].copy_from_slice(&result.to_ne_bytes());
+                }
+            }
         }
     }
 }
 
-/// Set a single pixel in BGRA buffer (bounds-checked).
+/// Set a single pixel in BGRA buffer (bounds-checked). Used by text rendering (always GXcopy).
 #[inline]
 fn set_pixel(buffer: &mut [u8], buf_w: u32, buf_h: u32, stride: u32, px: i32, py: i32, pixel: &[u8; 4]) {
     if px >= 0 && (px as u32) < buf_w && py >= 0 && (py as u32) < buf_h {
@@ -306,14 +375,9 @@ fn angle_in_arc(angle_deg64: f64, start: i16, extent: i16) -> bool {
 fn fill_arc(
     buffer: &mut [u8], buf_w: u32, buf_h: u32, stride: u32,
     ax: i16, ay: i16, aw: u16, ah: u16,
-    angle1: i16, angle2: i16, color: u32,
+    angle1: i16, angle2: i16, color: u32, gc_function: u8,
 ) {
-    let pixel: [u8; 4] = [
-        (color & 0xFF) as u8,
-        ((color >> 8) & 0xFF) as u8,
-        ((color >> 16) & 0xFF) as u8,
-        0xFF,
-    ];
+    if gc_function == 5 { return; } // GXnoop
 
     let cx = ax as f64 + aw as f64 / 2.0;
     let cy = ay as f64 + ah as f64 / 2.0;
@@ -331,7 +395,6 @@ fn fill_arc(
 
     for py in y0..y1 {
         let dy = py as f64 - cy;
-        // Solve ellipse: (dx/rx)^2 + (dy/ry)^2 <= 1
         let ry_term = (dy / ry) * (dy / ry);
         if ry_term > 1.0 { continue; }
         let dx_max = rx * (1.0 - ry_term).sqrt();
@@ -339,17 +402,17 @@ fn fill_arc(
         let right = ((cx + dx_max).floor() as i32 + 1).min(x1);
 
         for px in left..right {
-            if full_circle {
-                set_pixel(buffer, buf_w, buf_h, stride, px, py, &pixel);
+            let in_arc = if full_circle {
+                true
             } else {
-                let dx = px as f64 - cx;
+                let dxf = px as f64 - cx;
                 let dy2 = py as f64 - cy;
-                // atan2 with X11 convention: 0 at 3 o'clock, CCW positive
-                let angle = (-dy2).atan2(dx); // negate Y because screen Y is flipped
+                let angle = (-dy2).atan2(dxf);
                 let angle_deg64 = angle.to_degrees() * 64.0;
-                if angle_in_arc(angle_deg64, angle1, angle2) {
-                    set_pixel(buffer, buf_w, buf_h, stride, px, py, &pixel);
-                }
+                angle_in_arc(angle_deg64, angle1, angle2)
+            };
+            if in_arc {
+                rop_pixel(buffer, buf_w, buf_h, stride, px, py, color, gc_function, 0xFFFFFFFF);
             }
         }
     }
@@ -359,14 +422,9 @@ fn fill_arc(
 fn draw_arc(
     buffer: &mut [u8], buf_w: u32, buf_h: u32, stride: u32,
     ax: i16, ay: i16, aw: u16, ah: u16,
-    angle1: i16, angle2: i16, color: u32,
+    angle1: i16, angle2: i16, color: u32, gc_function: u8,
 ) {
-    let pixel: [u8; 4] = [
-        (color & 0xFF) as u8,
-        ((color >> 8) & 0xFF) as u8,
-        ((color >> 16) & 0xFF) as u8,
-        0xFF,
-    ];
+    if gc_function == 5 { return; } // GXnoop
 
     let cx = ax as f64 + aw as f64 / 2.0;
     let cy = ay as f64 + ah as f64 / 2.0;
@@ -386,23 +444,17 @@ fn draw_arc(
         let px = (cx + rx * t.cos()) as i32;
         // X11: positive angle is CCW, but screen Y goes down, so negate sin
         let py = (cy - ry * t.sin()) as i32;
-        set_pixel(buffer, buf_w, buf_h, stride, px, py, &pixel);
+        rop_pixel(buffer, buf_w, buf_h, stride, px, py, color, gc_function, 0xFFFFFFFF);
     }
 }
 
 /// Fill a polygon using scanline algorithm.
 fn fill_polygon(
     buffer: &mut [u8], buf_w: u32, buf_h: u32, stride: u32,
-    points: &[(i16, i16)], color: u32,
+    points: &[(i16, i16)], color: u32, gc_function: u8,
 ) {
     if points.len() < 3 { return; }
-
-    let pixel: [u8; 4] = [
-        (color & 0xFF) as u8,
-        ((color >> 8) & 0xFF) as u8,
-        ((color >> 16) & 0xFF) as u8,
-        0xFF,
-    ];
+    if gc_function == 5 { return; } // GXnoop
 
     // Find bounding box
     let min_y = points.iter().map(|p| p.1).min().unwrap().max(0) as i32;
@@ -437,10 +489,7 @@ fn fill_polygon(
             let x_start = intersections[i].max(0) as u32;
             let x_end = (intersections[i + 1] as u32).min(buf_w);
             for px in x_start..x_end {
-                let offset = (y as usize) * (stride as usize) + (px as usize) * 4;
-                if offset + 4 <= buffer.len() {
-                    buffer[offset..offset + 4].copy_from_slice(&pixel);
-                }
+                rop_pixel(buffer, buf_w, buf_h, stride, px as i32, y, color, gc_function, 0xFFFFFFFF);
             }
             i += 2;
         }

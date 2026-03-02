@@ -112,6 +112,11 @@ struct WindowInfo {
     /// Updated every frame to detect window moves.
     x11_x: i16,
     x11_y: i16,
+    /// Current cursor type for this window (MacOSCursorType as u8).
+    cursor_type: u8,
+    /// X11 background pixel color (BGRA). Used to fill new areas during resize
+    /// instead of white, matching XQuartz's behavior of preserving content with gravity.
+    background_pixel: u32,
 }
 
 impl Drop for WindowInfo {
@@ -318,10 +323,10 @@ unsafe extern "C" fn view_key_down(this: *mut AnyObject, _sel: Sel, event: *mut 
     let array: *mut AnyObject = msg_send![objc2::class!(NSArray), arrayWithObject: event];
     let _: () = msg_send![&*this, interpretKeyEvents: array];
 
-    // If insertText: was NOT called, this is a non-text key (arrows, backspace, etc.)
-    // Send it as a raw KeyPress event
+    // If insertText:/setMarkedText: was NOT called, this is a non-text key (arrows, backspace, etc.)
+    // Send it as a raw KeyPress event — but NOT during IME composition
     let inserted = *flag_ivar.load::<u8>(&*this);
-    if inserted == 0 {
+    if inserted == 0 && !crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) {
         let keycode: u16 = msg_send![&*event, keyCode];
         let state = get_modifier_state(&*event);
         let time = std::time::SystemTime::now()
@@ -561,7 +566,7 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
     // Optimization: only recreate IOSurface when GROWING beyond current surface size.
     // When shrinking, masksToBounds clips the existing surface — no allocation needed.
     // Use try_borrow_mut to gracefully handle re-entrant calls.
-    let event_info: Option<(i16, i16, u16, u16)> = WINDOWS.with(|w| {
+    let event_info: Option<(i16, i16, u16, u16, u16, u16)> = WINDOWS.with(|w| {
         let mut ws = match w.try_borrow_mut() {
             Ok(ws) => ws,
             Err(_) => {
@@ -593,44 +598,89 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
         info.height = new_h;
 
         if need_new_surface {
-            // Growing: create new IOSurface
-            let new_surface = create_iosurface(new_w, new_h);
+            // Flush any pending render commands to old surface BEFORE replacing it.
+            // This ensures the old surface has the latest app content before copy.
+            let win_id_u64 = *win_id;
+            RENDER_MAILBOX.with(|mb| {
+                let mb = mb.borrow();
+                if let Some(ref mailbox) = *mb {
+                    if let Some((_k, commands)) = mailbox.remove(&win_id_u64) {
+                        if !commands.is_empty() {
+                            let lock_result = IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
+                            if lock_result == 0 {
+                                let base = IOSurfaceGetBaseAddress(info.surface);
+                                let stride = IOSurfaceGetBytesPerRow(info.surface);
+                                let buf_len = stride * old_h as usize;
+                                let buffer = std::slice::from_raw_parts_mut(
+                                    base as *mut u8, buf_len);
+                                let w = old_w as u32;
+                                let h = old_h as u32;
+                                let s = stride as u32;
+                                for c in &commands {
+                                    render_to_buffer(buffer, w, h, s, c);
+                                }
+                                IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Growing: create new IOSurface with headroom to reduce re-allocations
+            let alloc_w = ((new_w as usize + 127) & !127).max(new_w as usize) as u16;
+            let alloc_h = ((new_h as usize + 127) & !127).max(new_h as usize) as u16;
+            let new_surface = create_iosurface(alloc_w, alloc_h);
             if new_surface.is_null() {
                 log::error!("Failed to create IOSurface in setFrameSize");
                 return None;
             }
 
-            // Copy old content to new surface
-            IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
+            // Clear ENTIRE new surface to background_pixel.
+            // X11 servers clear the window background before sending Expose.
+            // Apps (xclock etc.) draw on top without clearing first.
             IOSurfaceLock(new_surface, 0, std::ptr::null_mut());
-
-            let old_base = IOSurfaceGetBaseAddress(info.surface) as *const u8;
-            let old_stride = IOSurfaceGetBytesPerRow(info.surface);
             let new_base = IOSurfaceGetBaseAddress(new_surface) as *mut u8;
             let new_stride = IOSurfaceGetBytesPerRow(new_surface);
-
-            // Clear new surface to white
-            let total_new = new_stride * new_h as usize;
-            std::ptr::write_bytes(new_base, 0xFF, total_new);
-
-            // Copy overlapping region
-            let copy_rows = (old_h as usize).min(new_h as usize);
-            let copy_bytes_per_row = (old_w as usize * 4).min(new_w as usize * 4)
-                .min(old_stride).min(new_stride);
-            for row in 0..copy_rows {
-                std::ptr::copy_nonoverlapping(
-                    old_base.add(row * old_stride),
-                    new_base.add(row * new_stride),
-                    copy_bytes_per_row,
-                );
+            let bg = info.background_pixel;
+            let bg_bytes: [u8; 4] = [
+                (bg & 0xFF) as u8,
+                ((bg >> 8) & 0xFF) as u8,
+                ((bg >> 16) & 0xFF) as u8,
+                0xFF,
+            ];
+            for row in 0..(new_h as usize) {
+                let row_base = new_base.add(row * new_stride);
+                for col in 0..(new_w as usize) {
+                    let off = col * 4;
+                    std::ptr::copy_nonoverlapping(bg_bytes.as_ptr(), row_base.add(off), 4);
+                }
             }
-
             IOSurfaceUnlock(new_surface, 0, std::ptr::null_mut());
-            IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
 
             let old_surface = info.surface;
             info.surface = new_surface;
             CFRelease(old_surface as *const c_void);
+        } else {
+            // Shrinking or same-surface: clear visible area to background_pixel.
+            // X11 servers clear the window background before sending Expose.
+            let bg = info.background_pixel;
+            let bg_bytes: [u8; 4] = [
+                (bg & 0xFF) as u8,
+                ((bg >> 8) & 0xFF) as u8,
+                ((bg >> 16) & 0xFF) as u8,
+                0xFF,
+            ];
+            IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
+            let base = IOSurfaceGetBaseAddress(info.surface) as *mut u8;
+            let stride = IOSurfaceGetBytesPerRow(info.surface);
+            for row in 0..(new_h as usize) {
+                let row_base = base.add(row * stride);
+                for col in 0..(new_w as usize) {
+                    let off = col * 4;
+                    std::ptr::copy_nonoverlapping(bg_bytes.as_ptr(), row_base.add(off), 4);
+                }
+            }
+            IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
         }
 
         // Flush to CALayer (clipped by masksToBounds when shrinking)
@@ -642,26 +692,31 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
         info.x11_x = new_x;
         info.x11_y = new_y;
 
-        Some((new_x, new_y, new_w, new_h))
+        Some((new_x, new_y, old_w, old_h, new_w, new_h))
     });
 
-    // Send ConfigureNotify + Expose outside the WINDOWS borrow
-    if let Some((x, y, w, h)) = event_info {
-        send_display_event(DisplayEvent::ConfigureNotify {
-            window: x11_id,
-            x,
-            y,
-            width: w,
-            height: h,
-        });
-        send_display_event(DisplayEvent::Expose {
-            window: x11_id,
-            x: 0,
-            y: 0,
-            width: w,
-            height: h,
-            count: 0,
-        });
+    // Send ConfigureNotify + Expose outside the WINDOWS borrow.
+    // Skip if SUPPRESS_RESIZE_EVENTS is set (X11 ConfigureWindow already sent these).
+    let suppressed = crate::display::SUPPRESS_RESIZE_EVENTS.swap(false, std::sync::atomic::Ordering::Relaxed);
+    if let Some((x, y, _old_w, _old_h, w, h)) = event_info {
+        if !suppressed {
+            send_display_event(DisplayEvent::ConfigureNotify {
+                window: x11_id,
+                x,
+                y,
+                width: w,
+                height: h,
+            });
+            // Full Expose so app redraws at new size
+            send_display_event(DisplayEvent::Expose {
+                window: x11_id,
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+                count: 0,
+            });
+        }
     }
 }
 
@@ -764,20 +819,51 @@ fn check_window_resizes() {
         if change.resized {
             info!("Window {} resize detected: -> {}x{}", change.win_id, change.new_w, change.new_h);
 
-            WINDOWS.with(|w| {
+            let old_dims: Option<(u16, u16)> = WINDOWS.with(|w| {
                 let mut ws = w.borrow_mut();
                 if let Some(info) = ws.get_mut(&change.win_id) {
                     let old_w = info.width;
                     let old_h = info.height;
 
-                    // Create new IOSurface
-                    let new_surface = create_iosurface(change.new_w, change.new_h);
-                    if new_surface.is_null() {
-                        log::error!("Failed to create new IOSurface for resize");
-                        return;
+                    // Flush pending render commands to old surface before replacing
+                    unsafe {
+                        RENDER_MAILBOX.with(|mb| {
+                            let mb = mb.borrow();
+                            if let Some(ref mailbox) = *mb {
+                                if let Some((_k, commands)) = mailbox.remove(&change.win_id) {
+                                    if !commands.is_empty() {
+                                        let lock_result = IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
+                                        if lock_result == 0 {
+                                            let base = IOSurfaceGetBaseAddress(info.surface);
+                                            let stride = IOSurfaceGetBytesPerRow(info.surface);
+                                            let buf_len = stride * old_h as usize;
+                                            let buffer = std::slice::from_raw_parts_mut(
+                                                base as *mut u8, buf_len);
+                                            let bw = old_w as u32;
+                                            let bh = old_h as u32;
+                                            let bs = stride as u32;
+                                            for c in &commands {
+                                                render_to_buffer(buffer, bw, bh, bs, c);
+                                            }
+                                            IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
+                                        }
+                                    }
+                                }
+                            }
+                        });
                     }
 
-                    // Copy old content to new surface, clearing new area
+                    // Create new IOSurface with headroom
+                    let alloc_w = ((change.new_w as usize + 127) & !127).max(change.new_w as usize) as u16;
+                    let alloc_h = ((change.new_h as usize + 127) & !127).max(change.new_h as usize) as u16;
+                    let new_surface = create_iosurface(alloc_w, alloc_h);
+                    if new_surface.is_null() {
+                        log::error!("Failed to create new IOSurface for resize");
+                        return None;
+                    }
+
+                    // Copy old content to new surface using gravity approach (XQuartz):
+                    // preserve old content at top-left, fill only new strips with background_pixel
                     unsafe {
                         IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
                         IOSurfaceLock(new_surface, 0, std::ptr::null_mut());
@@ -787,10 +873,7 @@ fn check_window_resizes() {
                         let new_base = IOSurfaceGetBaseAddress(new_surface) as *mut u8;
                         let new_stride = IOSurfaceGetBytesPerRow(new_surface);
 
-                        // Clear entire new surface to white (xterm background)
-                        let total_new = new_stride * change.new_h as usize;
-                        std::ptr::write_bytes(new_base, 0xFF, total_new);
-
+                        // Step 1: Copy old content to top-left (NorthWest gravity)
                         let copy_rows = (old_h as usize).min(change.new_h as usize);
                         let copy_bytes_per_row = (old_w as usize * 4).min(change.new_w as usize * 4)
                             .min(old_stride).min(new_stride);
@@ -801,6 +884,30 @@ fn check_window_resizes() {
                                 new_base.add(row * new_stride),
                                 copy_bytes_per_row,
                             );
+                        }
+
+                        // Step 2: Fill only new strips with background_pixel
+                        let bg = info.background_pixel;
+                        let bg_bytes = bg.to_ne_bytes();
+
+                        // Right strip: columns old_w..new_w for rows 0..min(old_h, new_h)
+                        if change.new_w > old_w {
+                            for row in 0..copy_rows {
+                                let row_start = new_base.add(row * new_stride + old_w as usize * 4);
+                                let fill_pixels = (change.new_w - old_w) as usize;
+                                for px in 0..fill_pixels {
+                                    std::ptr::copy_nonoverlapping(bg_bytes.as_ptr(), row_start.add(px * 4), 4);
+                                }
+                            }
+                        }
+                        // Bottom strip: rows old_h..new_h for full width
+                        if change.new_h > old_h {
+                            for row in old_h as usize..change.new_h as usize {
+                                let row_start = new_base.add(row * new_stride);
+                                for px in 0..change.new_w as usize {
+                                    std::ptr::copy_nonoverlapping(bg_bytes.as_ptr(), row_start.add(px * 4), 4);
+                                }
+                            }
                         }
 
                         IOSurfaceUnlock(new_surface, 0, std::ptr::null_mut());
@@ -819,18 +926,21 @@ fn check_window_resizes() {
                     ca_transaction_flush();
 
                     debug!("Window {} resized: {}x{} -> {}x{}", change.win_id, old_w, old_h, change.new_w, change.new_h);
+                    return Some((old_w, old_h));
                 }
+                None
             });
 
-            // Send Expose for resize (content needs redraw)
-            send_display_event(DisplayEvent::Expose {
-                window: change.x11_id,
-                x: 0,
-                y: 0,
-                width: change.new_w,
-                height: change.new_h,
-                count: 0,
-            });
+            // Full Expose so app redraws at new size
+            if old_dims.is_some() {
+                send_display_event(DisplayEvent::Expose {
+                    window: change.x11_id,
+                    x: 0, y: 0,
+                    width: change.new_w,
+                    height: change.new_h,
+                    count: 0,
+                });
+            }
         }
 
         // Update cached position in WindowInfo
@@ -1093,7 +1203,7 @@ fn handle_command(cmd: DisplayCommand) {
 
             window.setTitle(&NSString::from_str(&title));
 
-            // Accept mouse moved events and make key window
+            // Accept mouse moved events
             unsafe {
                 let _: () = msg_send![&*window, setAcceptsMouseMovedEvents: true];
             }
@@ -1143,6 +1253,10 @@ fn handle_command(cmd: DisplayCommand) {
                     // Prevent AppKit from overwriting layer contents during redraw.
                     // NSViewLayerContentsRedrawNever = 0
                     let _: () = msg_send![&*view, setLayerContentsRedrawPolicy: 0_isize];
+                    // Pin content to top-left during live resize — prevents macOS from
+                    // stretching the layer contents between setFrameSize callbacks.
+                    // NSViewLayerContentsPlacementTopLeft = 11
+                    let _: () = msg_send![&*view, setLayerContentsPlacement: 11_isize];
 
                     // Make the custom view the first responder for keyboard events
                     let _: () = msg_send![&*window, makeFirstResponder: &*view];
@@ -1150,7 +1264,7 @@ fn handle_command(cmd: DisplayCommand) {
             }
 
             WINDOWS.with(|w| {
-                w.borrow_mut().insert(id, WindowInfo { window, surface, width, height, x11_id, x11_x, x11_y });
+                w.borrow_mut().insert(id, WindowInfo { window, surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF });
             });
 
             info!("Created window {} for X11 0x{:08X} ({}x{}) [IOSurface]", id, x11_id, width, height);
@@ -1219,8 +1333,10 @@ fn handle_command(cmd: DisplayCommand) {
                         msg_send![&*info.window, frameRectForContentRect: content_rect]
                     };
                     let title_bar_h = frame_for_content.size.height - pt_h;
-                    // Convert X11 top-left to macOS bottom-left
-                    let mac_y = screen_h - y as f64 - pt_h - title_bar_h;
+                    // Convert X11 content top-left to macOS frame bottom-left.
+                    // Content bottom in macOS Y = screen_h - y - pt_h.
+                    // Frame bottom = content bottom (no bottom border).
+                    let mac_y = screen_h - y as f64 - pt_h;
                     let frame = NSRect::new(
                         NSPoint::new(x as f64, mac_y),
                         NSSize::new(pt_w, pt_h + title_bar_h),
@@ -1235,6 +1351,34 @@ fn handle_command(cmd: DisplayCommand) {
             if let Some((window, frame)) = window_and_frame {
                 window.setFrame_display(frame, true);
             }
+        }
+
+        DisplayCommand::SetWindowCursor { handle, cursor_type } => {
+            WINDOWS.with(|w| {
+                let mut ws = w.borrow_mut();
+                if let Some(info) = ws.get_mut(&handle.id) {
+                    info.cursor_type = cursor_type;
+                    // Invalidate cursor rects to trigger resetCursorRects
+                    if let Some(view) = info.window.contentView() {
+                        unsafe {
+                            let _: () = msg_send![&*view, discardCursorRects];
+                            let bounds: NSRect = msg_send![&*view, bounds];
+                            let ns_cursor = get_ns_cursor(cursor_type);
+                            let _: () = msg_send![&*view, addCursorRect: bounds cursor: ns_cursor];
+                        }
+                    }
+                    debug!("SetWindowCursor: win={} cursor_type={}", handle.id, cursor_type);
+                }
+            });
+        }
+
+        DisplayCommand::SetWindowBackgroundPixel { handle, pixel } => {
+            WINDOWS.with(|w| {
+                let mut ws = w.borrow_mut();
+                if let Some(info) = ws.get_mut(&handle.id) {
+                    info.background_pixel = pixel;
+                }
+            });
         }
 
         DisplayCommand::Shutdown => {
@@ -1263,18 +1407,47 @@ fn ca_transaction_flush() {
     }
 }
 
+/// Get an NSCursor pointer for the given MacOSCursorType value.
+fn get_ns_cursor(cursor_type: u8) -> *mut AnyObject {
+    unsafe {
+        let cls = objc2::class!(NSCursor);
+        match cursor_type {
+            0 => msg_send![cls, arrowCursor],         // Arrow
+            1 => msg_send![cls, IBeamCursor],          // IBeam
+            2 => msg_send![cls, crosshairCursor],      // Crosshair
+            3 => msg_send![cls, pointingHandCursor],   // PointingHand
+            4 => msg_send![cls, openHandCursor],       // OpenHand
+            5 => msg_send![cls, closedHandCursor],     // ClosedHand
+            6 => msg_send![cls, resizeLeftRightCursor], // ResizeLeftRight
+            7 => msg_send![cls, resizeUpDownCursor],   // ResizeUpDown
+            8 => msg_send![cls, resizeLeftCursor],     // ResizeLeft
+            9 => msg_send![cls, resizeRightCursor],    // ResizeRight
+            10 => msg_send![cls, resizeUpCursor],      // ResizeUp
+            11 => msg_send![cls, resizeDownCursor],    // ResizeDown
+            12 => msg_send![cls, operationNotAllowedCursor], // OperationNotAllowed
+            _ => msg_send![cls, arrowCursor],          // Default
+        }
+    }
+}
+
 /// Set IOSurface directly as CALayer contents — zero-copy, no color space conversion.
 /// With wantsUpdateLayer=YES + layerContentsRedrawPolicy=Never, AppKit won't overwrite.
 /// nil→surface transition forces CALayer to re-read even for the same IOSurface pointer.
+/// Wrapped in explicit CATransaction to prevent momentary white flash between nil and set
+/// (NSWindow background shows through transparent CALayer when contents=nil).
 fn flush_window(info: &WindowInfo) {
     unsafe {
         if info.width == 0 || info.height == 0 || info.surface.is_null() { return; }
         if let Some(view) = info.window.contentView() {
             let layer: *mut AnyObject = msg_send![&*view, layer];
             if !layer.is_null() {
+                let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
+                let _: () = msg_send![ca_cls, begin];
+                let _: () = msg_send![ca_cls, setDisableActions: true];
                 let null_obj: *mut AnyObject = std::ptr::null_mut();
                 let _: () = msg_send![layer, setContents: null_obj];
                 let _: () = msg_send![layer, setContents: info.surface as *mut AnyObject];
+                let _: () = msg_send![ca_cls, commit];
             }
         }
     }
@@ -1380,7 +1553,8 @@ pub fn run_cocoa_app(
             }
             handle_ns_event(event_ref, event_type);
 
-            // Forward event to NSApp for normal processing
+            // Resizable style removed — sendEvent won't trigger macOS resize.
+            // Forward all events so title bar drag/close/minimize work.
             unsafe {
                 let _: () = msg_send![&*app, sendEvent: event_ref];
             }
@@ -1443,41 +1617,55 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
 
     match event_type {
         NS_LEFT_MOUSE_DOWN | NS_RIGHT_MOUSE_DOWN | NS_OTHER_MOUSE_DOWN => {
-            let (x, y) = get_event_location(event, x11_id, win_width, win_height);
-            let (root_x, root_y) = get_screen_mouse_location();
-            let button = match event_type {
+            let button: u8 = match event_type {
                 NS_LEFT_MOUSE_DOWN => 1,
                 NS_RIGHT_MOUSE_DOWN => 3,
                 _ => 2,
             };
-            // For ButtonPress, state should reflect state BEFORE this press.
-            // macOS pressedMouseButtons already includes the button being pressed,
-            // so we subtract it.
-            let button_mask: u16 = match button {
-                1 => 0x100, 2 => 0x200, 3 => 0x400, _ => 0,
-            };
-            let state = get_modifier_state(event) & !button_mask;
-            debug!("ButtonPress: window=0x{:08x} button={} x={} y={} root=({},{})", x11_id, button, x, y, root_x, root_y);
-            send_display_event(DisplayEvent::ButtonPress {
-                window: x11_id, button, x, y, root_x, root_y, state, time,
-            });
-            // Sync LAST_BUTTONS so the polling path doesn't re-fire this press
+            // Check if polling already detected this press (avoid duplicate ButtonPress)
+            let btn_bit: u64 = match button { 1 => 1, 3 => 2, 2 => 4, _ => 0 };
+            let prev = LAST_BUTTONS.with(|lb| lb.get());
+            if (prev & btn_bit) == 0 {
+                let (x, y) = get_event_location(event, x11_id, win_width, win_height);
+                let (root_x, root_y) = get_screen_mouse_location();
+                // For ButtonPress, state should reflect state BEFORE this press.
+                // macOS pressedMouseButtons already includes the button being pressed,
+                // so we subtract it.
+                let button_mask: u16 = match button {
+                    1 => 0x100, 2 => 0x200, 3 => 0x400, _ => 0,
+                };
+                let state = get_modifier_state(event) & !button_mask;
+                debug!("ButtonPress: window=0x{:08x} button={} x={} y={} root=({},{})", x11_id, button, x, y, root_x, root_y);
+                send_display_event(DisplayEvent::ButtonPress {
+                    window: x11_id, button, x, y, root_x, root_y, state, time,
+                });
+            } else {
+                log::debug!("ButtonPress: skipped (polling already sent) btn={}", button);
+            }
+            // Always sync LAST_BUTTONS so the polling path doesn't re-fire
             let cur: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
             LAST_BUTTONS.with(|lb| lb.set(cur));
         }
         NS_LEFT_MOUSE_UP | NS_RIGHT_MOUSE_UP | NS_OTHER_MOUSE_UP => {
-            let (x, y) = get_event_location(event, x11_id, win_width, win_height);
-            let (root_x, root_y) = get_screen_mouse_location();
-            let button = match event_type {
+            let button: u8 = match event_type {
                 NS_LEFT_MOUSE_UP => 1,
                 NS_RIGHT_MOUSE_UP => 3,
                 _ => 2,
             };
-            let state = get_modifier_state(event);
-            send_display_event(DisplayEvent::ButtonRelease {
-                window: x11_id, button, x, y, root_x, root_y, state, time,
-            });
-            // Sync LAST_BUTTONS so the polling path doesn't re-fire this release
+            // Check if polling already detected this release (avoid duplicate ButtonRelease)
+            let btn_bit: u64 = match button { 1 => 1, 3 => 2, 2 => 4, _ => 0 };
+            let prev = LAST_BUTTONS.with(|lb| lb.get());
+            if (prev & btn_bit) != 0 {
+                let (x, y) = get_event_location(event, x11_id, win_width, win_height);
+                let (root_x, root_y) = get_screen_mouse_location();
+                let state = get_modifier_state(event);
+                send_display_event(DisplayEvent::ButtonRelease {
+                    window: x11_id, button, x, y, root_x, root_y, state, time,
+                });
+            } else {
+                log::debug!("ButtonRelease: skipped (polling already sent) btn={}", button);
+            }
+            // Always sync LAST_BUTTONS so the polling path doesn't re-fire
             let cur: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
             LAST_BUTTONS.with(|lb| lb.set(cur));
         }

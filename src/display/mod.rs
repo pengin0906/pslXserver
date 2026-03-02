@@ -17,6 +17,9 @@ pub static IME_SPOT_LINE_H: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 pub static IME_COMPOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Flag: suppress the very next KeyRelease after IME commit (the confirmation key like Enter/Space).
 pub static SUPPRESS_NEXT_KEYUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Flag: suppress ConfigureNotify/Expose from setFrameSize when resize is initiated by X11 ConfigureWindow.
+/// Set by MoveResizeWindow handler before calling setFrame:display, cleared by setFrameSize or after.
+pub static SUPPRESS_RESIZE_EVENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Shared render mailbox: native_window_id -> pending render commands.
 /// Protocol handlers append commands; display thread drains each frame.
@@ -96,6 +99,16 @@ pub enum DisplayCommand {
     /// Get clipboard content.
     GetClipboard {
         reply: tokio::sync::oneshot::Sender<Option<String>>,
+    },
+    /// Set the cursor for a window.
+    SetWindowCursor {
+        handle: NativeWindowHandle,
+        cursor_type: u8, // MacOSCursorType as u8
+    },
+    /// Update the background pixel color for a window (used by setFrameSize during resize).
+    SetWindowBackgroundPixel {
+        handle: NativeWindowHandle,
+        pixel: u32,
     },
     /// Shut down the display.
     Shutdown,
@@ -247,6 +260,7 @@ pub enum RenderCommand {
         y2: i16,
         color: u32,
         line_width: u16,
+        gc_function: u8,
     },
     DrawRectangle {
         x: i16,
@@ -255,6 +269,7 @@ pub enum RenderCommand {
         height: u16,
         color: u32,
         line_width: u16,
+        gc_function: u8,
     },
     FillArc {
         x: i16,
@@ -264,6 +279,7 @@ pub enum RenderCommand {
         angle1: i16,
         angle2: i16,
         color: u32,
+        gc_function: u8,
     },
     DrawArc {
         x: i16,
@@ -274,6 +290,7 @@ pub enum RenderCommand {
         angle2: i16,
         color: u32,
         line_width: u16,
+        gc_function: u8,
     },
     PutImage {
         x: i16,
@@ -283,6 +300,7 @@ pub enum RenderCommand {
         depth: u8,
         format: u8,
         data: Vec<u8>,
+        gc_function: u8,
     },
     CopyArea {
         src_x: i16,
@@ -291,6 +309,7 @@ pub enum RenderCommand {
         dst_y: i16,
         width: u16,
         height: u16,
+        gc_function: u8,
     },
     DrawText {
         x: i16,
@@ -299,6 +318,7 @@ pub enum RenderCommand {
         font_id: Xid,
         color: u32,
         bg_color: Option<u32>,
+        gc_function: u8,
     },
     ClearArea {
         x: i16,
@@ -310,5 +330,6 @@ pub enum RenderCommand {
     FillPolygon {
         points: Vec<(i16, i16)>,
         color: u32,
+        gc_function: u8,
     },
 }

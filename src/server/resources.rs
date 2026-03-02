@@ -301,3 +301,119 @@ pub struct CursorState {
     pub back_green: u16,
     pub back_blue: u16,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_window_state_defaults() {
+        let w = WindowState::new(0x100, 0x80, 10, 20, 640, 480, 0, 24, WindowClass::InputOutput, 0x21);
+        assert_eq!(w.id, 0x100);
+        assert_eq!(w.parent, 0x80);
+        assert_eq!(w.x, 10);
+        assert_eq!(w.y, 20);
+        assert_eq!(w.width, 640);
+        assert_eq!(w.height, 480);
+        assert_eq!(w.depth, 24);
+        assert_eq!(w.class, WindowClass::InputOutput);
+        assert!(!w.mapped);
+        assert!(!w.viewable);
+        assert!(!w.override_redirect);
+        assert_eq!(w.background_pixel, None);
+        assert_eq!(w.border_pixel, None);
+        assert_eq!(w.event_mask, 0);
+        assert_eq!(w.cursor, 0);
+        assert_eq!(w.bit_gravity, 0); // ForgetGravity
+        assert_eq!(w.win_gravity, 1); // NorthWestGravity
+        assert!(w.children.is_empty());
+        assert!(w.properties.is_empty());
+        assert!(w.native_window.is_none());
+    }
+
+    #[test]
+    fn test_window_class_from_u16() {
+        assert_eq!(WindowClass::from(0), WindowClass::CopyFromParent);
+        assert_eq!(WindowClass::from(1), WindowClass::InputOutput);
+        assert_eq!(WindowClass::from(2), WindowClass::InputOnly);
+        assert_eq!(WindowClass::from(99), WindowClass::CopyFromParent); // Unknown defaults
+    }
+
+    #[test]
+    fn test_property_set_get_delete() {
+        let mut w = WindowState::new(1, 0, 0, 0, 100, 100, 0, 24, WindowClass::InputOutput, 0x21);
+
+        // Set property
+        w.set_property(Property { name: 39, type_atom: 31, format: 8, data: vec![72, 101, 108, 108, 111] });
+        assert!(w.get_property(39).is_some());
+        assert_eq!(w.get_property(39).unwrap().data, vec![72, 101, 108, 108, 111]);
+        assert_eq!(w.get_property(39).unwrap().type_atom, 31);
+
+        // Update property (same name atom)
+        w.set_property(Property { name: 39, type_atom: 31, format: 8, data: vec![87, 111, 114, 108, 100] });
+        assert_eq!(w.get_property(39).unwrap().data, vec![87, 111, 114, 108, 100]);
+        assert_eq!(w.properties.len(), 1); // No duplicate
+
+        // Delete property
+        w.delete_property(39);
+        assert!(w.get_property(39).is_none());
+        assert!(w.properties.is_empty());
+    }
+
+    #[test]
+    fn test_event_delivery() {
+        let mut w = WindowState::new(1, 0, 0, 0, 100, 100, 0, 24, WindowClass::InputOutput, 0x21);
+
+        // No selections yet
+        assert!(!w.should_deliver_event(1, 0x0001));
+
+        // Add selection for conn 1
+        w.event_selections.push((1, 0x0003)); // KEY_PRESS | KEY_RELEASE
+
+        assert!(w.should_deliver_event(1, 0x0001));  // KEY_PRESS
+        assert!(w.should_deliver_event(1, 0x0002));  // KEY_RELEASE
+        assert!(!w.should_deliver_event(1, 0x0004)); // BUTTON_PRESS not selected
+        assert!(!w.should_deliver_event(2, 0x0001)); // Different connection
+    }
+
+    #[test]
+    fn test_gc_state_defaults() {
+        let gc = GContextState::new(0x200, 0x100);
+        assert_eq!(gc.id, 0x200);
+        assert_eq!(gc.drawable, 0x100);
+        assert_eq!(gc.function, GcFunction::Copy);
+        assert_eq!(gc.plane_mask, 0xFFFFFFFF);
+        assert_eq!(gc.foreground, 0x00000000);
+        assert_eq!(gc.background, 0x00FFFFFF);
+        assert_eq!(gc.line_width, 0);
+        assert!(gc.graphics_exposures);
+        assert_eq!(gc.font, 0);
+    }
+
+    #[test]
+    fn test_gc_function_from_u8() {
+        assert_eq!(GcFunction::from(0), GcFunction::Clear);
+        assert_eq!(GcFunction::from(3), GcFunction::Copy);
+        assert_eq!(GcFunction::from(6), GcFunction::Xor);
+        assert_eq!(GcFunction::from(15), GcFunction::Set);
+        assert_eq!(GcFunction::from(99), GcFunction::Copy); // Unknown defaults to Copy
+    }
+
+    #[test]
+    fn test_multiple_event_selections() {
+        let mut w = WindowState::new(1, 0, 0, 0, 100, 100, 0, 24, WindowClass::InputOutput, 0x21);
+
+        // Two different connections select different events
+        w.event_selections.push((1, 0x8001)); // KEY_PRESS | EXPOSURE
+        w.event_selections.push((2, 0x0004)); // BUTTON_PRESS
+
+        // Conn 1 gets KEY_PRESS and EXPOSURE
+        assert!(w.should_deliver_event(1, 0x0001));
+        assert!(w.should_deliver_event(1, 0x8000));
+        assert!(!w.should_deliver_event(1, 0x0004));
+
+        // Conn 2 gets BUTTON_PRESS only
+        assert!(w.should_deliver_event(2, 0x0004));
+        assert!(!w.should_deliver_event(2, 0x0001));
+    }
+}

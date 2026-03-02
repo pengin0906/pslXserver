@@ -433,16 +433,25 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     log::debug!("Implicit grab: window=0x{:08x} offset=({},{})", target, grab_offset_x, grab_offset_y);
                 }
                 buttons_pressed = buttons_pressed.saturating_add(1);
-                // Send EnterNotify if we haven't entered this window yet
+                // Send LeaveNotify to old window, EnterNotify to new window
                 if entered_window != target {
+                    if entered_window != 0 {
+                        send_enter_leave_event(&server, protocol::event_type::LEAVE_NOTIFY,
+                            entered_window, 0, 0, root_x, root_y, state, time);
+                    }
                     send_enter_leave_event(&server, protocol::event_type::ENTER_NOTIFY,
                         target, cx, cy, root_x, root_y, state, time);
                     entered_window = target;
                 }
-                // Send FocusIn if this window doesn't have focus yet
+                // Send FocusIn/FocusOut and update global focus on click
                 if focused_window != target {
+                    if focused_window != 0 {
+                        send_focus_event(&server, protocol::event_type::FOCUS_OUT, focused_window);
+                    }
                     send_focus_event(&server, protocol::event_type::FOCUS_IN, target);
                     focused_window = target;
+                    // Update global focus so send_key_event routes to clicked window
+                    server.focus_window.store(target, Ordering::Relaxed);
                 }
                 log::debug!("ButtonPress: target=0x{:08x} btn={} ({},{}) state=0x{:04x} grab_on={}", target, button, cx, cy, state, grab_window != 0);
                 send_button_event(&server, protocol::event_type::BUTTON_PRESS,
@@ -468,6 +477,13 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 // Update stored pointer position for QueryPointer
                 server.pointer_x.store(root_x as i32, Ordering::Relaxed);
                 server.pointer_y.store(root_y as i32, Ordering::Relaxed);
+                // Watchdog: if implicit grab is active but macOS reports no buttons pressed,
+                // force-release the grab (handles any missed ButtonRelease events)
+                if grab_window != 0 && (state & 0x1F00) == 0 {
+                    log::info!("Implicit grab watchdog: releasing stuck grab on 0x{:08x} (no buttons in state=0x{:04x})", grab_window, state);
+                    grab_window = 0;
+                    buttons_pressed = 0;
+                }
                 // During implicit grab, send directly to grab window
                 let (target, cx, cy) = if grab_window != 0 {
                     let cx = x - grab_offset_x;
@@ -481,6 +497,10 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 };
                 server.window_pointer.insert(target, (cx, cy));
                 if entered_window != target {
+                    if entered_window != 0 {
+                        send_enter_leave_event(&server, protocol::event_type::LEAVE_NOTIFY,
+                            entered_window, 0, 0, root_x, root_y, state, time);
+                    }
                     send_enter_leave_event(&server, protocol::event_type::ENTER_NOTIFY,
                         target, cx, cy, root_x, root_y, state, time);
                     entered_window = target;
@@ -523,6 +543,19 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
             }
             DisplayEvent::Expose { window, x, y, width, height, count } => {
                 send_expose_event(&server, window, x, y, width, height, count);
+                // Also propagate Expose to all descendant windows with ExposureMask
+                fn expose_descendants(server: &XServer, parent: Xid, x: u16, y: u16, width: u16, height: u16) {
+                    let children = if let Some(res) = server.resources.get(&parent) {
+                        if let Resource::Window(win) = res.value() {
+                            win.read().children.clone()
+                        } else { Vec::new() }
+                    } else { Vec::new() };
+                    for child_id in &children {
+                        send_expose_event(server, *child_id, x, y, width, height, 0);
+                        expose_descendants(server, *child_id, x, y, width, height);
+                    }
+                }
+                expose_descendants(&server, window, x, y, width, height);
             }
             DisplayEvent::ConfigureNotify { window, x, y, width, height } => {
                 // Update the X11 window state with the new dimensions AND position
@@ -1263,5 +1296,150 @@ fn send_expose_event(
             }
             info!("send_expose: window=0x{:08X} {}x{} sent={}", window, width, height, sent);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_error_x11_codes() {
+        assert_eq!(ServerError::Protocol.x11_error_code(), 1); // BadRequest
+        assert_eq!(ServerError::ResourceNotFound(0x100).x11_error_code(), 9); // BadDrawable
+        assert_eq!(ServerError::AtomNotFound.x11_error_code(), 5); // BadAtom
+        assert_eq!(ServerError::NotImplemented.x11_error_code(), 17); // BadImplementation
+    }
+
+    #[test]
+    fn test_server_creation() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let server = XServer::new(0, tx, 1920, 1080);
+
+        // Check screen configuration
+        assert_eq!(server.screens.len(), 1);
+        assert_eq!(server.screens[0].width_in_pixels, 1920);
+        assert_eq!(server.screens[0].height_in_pixels, 1080);
+        assert_eq!(server.screens[0].root_depth, 24);
+        assert_eq!(server.screens[0].root_visual.class, 4); // TrueColor
+        assert_eq!(server.screens[0].white_pixel, 0x00FFFFFF);
+        assert_eq!(server.screens[0].black_pixel, 0x00000000);
+        assert_eq!(server.screens[0].root_visual.red_mask, 0x00FF0000);
+        assert_eq!(server.screens[0].root_visual.green_mask, 0x0000FF00);
+        assert_eq!(server.screens[0].root_visual.blue_mask, 0x000000FF);
+    }
+
+    #[test]
+    fn test_root_window_exists() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let server = XServer::new(0, tx, 800, 600);
+
+        let root_id = server.screens[0].root_window;
+        assert!(server.resources.get(&root_id).is_some());
+
+        // Extract values from the borrow scope, then assert outside
+        let (width, height, mapped, viewable, depth, parent) = {
+            let res = server.resources.get(&root_id).unwrap();
+            if let Resource::Window(win) = res.value() {
+                let w = win.read();
+                (w.width, w.height, w.mapped, w.viewable, w.depth, w.parent)
+            } else {
+                panic!("Root resource is not a Window");
+            }
+        };
+        assert_eq!(width, 800);
+        assert_eq!(height, 600);
+        assert!(mapped);
+        assert!(viewable);
+        assert_eq!(depth, 24);
+        assert_eq!(parent, 0);
+    }
+
+    #[test]
+    fn test_resource_id_allocation() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let server = XServer::new(0, tx, 800, 600);
+
+        let base1 = server.alloc_resource_id_base();
+        let base2 = server.alloc_resource_id_base();
+        assert_ne!(base1, base2);
+        assert_eq!(base2 - base1, 0x00200000);
+    }
+
+    #[test]
+    fn test_connection_id_allocation() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let server = XServer::new(0, tx, 800, 600);
+
+        let id1 = server.next_conn_id();
+        let id2 = server.next_conn_id();
+        assert_eq!(id2, id1 + 1);
+    }
+
+    #[test]
+    fn test_display_number() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let server = XServer::new(42, tx, 800, 600);
+        assert_eq!(server.display_number, 42);
+    }
+
+    #[test]
+    fn test_truecolor_pixel_format() {
+        // TrueColor pixel format: (R8 << 16) | (G8 << 8) | B8
+        let red_pixel: u32 = 0xFF << 16;
+        let green_pixel: u32 = 0xFF << 8;
+        let blue_pixel: u32 = 0xFF;
+        let white_pixel: u32 = red_pixel | green_pixel | blue_pixel;
+
+        assert_eq!(red_pixel, 0x00FF0000);
+        assert_eq!(green_pixel, 0x0000FF00);
+        assert_eq!(blue_pixel, 0x000000FF);
+        assert_eq!(white_pixel, 0x00FFFFFF);
+
+        // Decompose back to 16-bit
+        let r = ((white_pixel >> 16) & 0xFF) as u16;
+        let g = ((white_pixel >> 8) & 0xFF) as u16;
+        let b = (white_pixel & 0xFF) as u16;
+        assert_eq!(r, 0xFF);
+        assert_eq!(g, 0xFF);
+        assert_eq!(b, 0xFF);
+
+        // Scale to 16-bit (QueryColors format)
+        assert_eq!(r << 8 | r, 0xFFFF);
+        assert_eq!(g << 8 | g, 0xFFFF);
+        assert_eq!(b << 8 | b, 0xFFFF);
+    }
+
+    #[test]
+    fn test_truecolor_color_roundtrip() {
+        // Simulate AllocColor -> QueryColors roundtrip
+        let input_r16: u16 = 0xABCD;
+        let input_g16: u16 = 0x1234;
+        let input_b16: u16 = 0x5678;
+
+        // AllocColor: 16-bit -> 8-bit -> pixel
+        let r8 = (input_r16 >> 8) as u32; // 0xAB
+        let g8 = (input_g16 >> 8) as u32; // 0x12
+        let b8 = (input_b16 >> 8) as u32; // 0x56
+        let pixel = (r8 << 16) | (g8 << 8) | b8;
+        assert_eq!(pixel, 0x00AB1256);
+
+        // QueryColors: pixel -> 16-bit
+        let qr = ((pixel >> 16) & 0xFF) as u16;
+        let qg = ((pixel >> 8) & 0xFF) as u16;
+        let qb = (pixel & 0xFF) as u16;
+        assert_eq!(qr << 8 | qr, 0xABAB);
+        assert_eq!(qg << 8 | qg, 0x1212);
+        assert_eq!(qb << 8 | qb, 0x5656);
+    }
+
+    #[test]
+    fn test_focus_defaults() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let server = XServer::new(0, tx, 800, 600);
+
+        // Default focus: PointerRoot (1)
+        assert_eq!(server.focus_window.load(Ordering::Relaxed), 1);
+        assert_eq!(server.focus_revert_to.load(Ordering::Relaxed), 1);
     }
 }

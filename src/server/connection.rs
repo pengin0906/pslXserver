@@ -665,9 +665,54 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
             stream.write_all(&reply).await?;
             Ok(())
         }
+        86 => { // AllocColorCells — TrueColor: always fail with BadAlloc (read-only colormap)
+            let seq = conn.current_request_sequence();
+            let mut err = [0u8; 32];
+            err[0] = 0; // error
+            err[1] = 11; // BadAlloc
+            err[2] = (seq & 0xFF) as u8;
+            err[3] = ((seq >> 8) & 0xFF) as u8;
+            err[8] = opcode;
+            err[10] = opcode;
+            stream.write_all(&err).await?;
+            Ok(())
+        }
+        87 => { // AllocColorPlanes — TrueColor: always fail with BadAlloc (read-only colormap)
+            let seq = conn.current_request_sequence();
+            let mut err = [0u8; 32];
+            err[0] = 0; // error
+            err[1] = 11; // BadAlloc
+            err[2] = (seq & 0xFF) as u8;
+            err[3] = ((seq >> 8) & 0xFF) as u8;
+            err[8] = opcode;
+            err[10] = opcode;
+            stream.write_all(&err).await?;
+            Ok(())
+        }
+        39 => { // GetMotionEvents — return empty list
+            let seq = conn.current_request_sequence();
+            let mut reply = vec![1u8, 0];
+            write_u16_to(conn, &mut reply, seq);
+            write_u32_to(conn, &mut reply, 0); // additional data length
+            write_u32_to(conn, &mut reply, 0); // nEvents = 0
+            reply.extend(std::iter::repeat(0).take(20)); // padding to 32
+            stream.write_all(&reply).await?;
+            Ok(())
+        }
+        50 => { // ListFontsWithInfo — return end-of-list marker immediately
+            let seq = conn.current_request_sequence();
+            let mut reply = vec![1u8, 0]; // reply, name-length=0 (end marker)
+            write_u16_to(conn, &mut reply, seq);
+            write_u32_to(conn, &mut reply, 7); // additional data: 28 bytes = 7 words
+            // min-bounds (12 bytes) + max-bounds (12 bytes) padded
+            reply.extend(std::iter::repeat(0).take(24)); // padding to fill header to 32
+            reply.extend(std::iter::repeat(0).take(28)); // 7 words of font info
+            stream.write_all(&reply).await?;
+            Ok(())
+        }
         // No-op for common requests that don't need replies
-        5 | 11 | 28 | 29 | 30 | 33 | 34 | 41 | 51 | 57 | 58 | 59 |
-        63 | 100 | 104 | 105 | 107 | 109 | 111 | 112 | 113 | 114 => {
+        5 | 6 | 11 | 13 | 28 | 29 | 30 | 33 | 34 | 51 | 57 | 58 | 59 |
+        63 | 83 | 88 | 89 | 90 | 100 | 104 | 105 | 107 | 109 | 111 | 112 | 113 | 114 => {
             debug!("Stubbed opcode: {} (no-op)", opcode);
             Ok(())
         }
@@ -908,6 +953,8 @@ async fn handle_change_window_attributes<S: AsyncRead + AsyncWrite + Unpin>(
 
     debug!("ChangeWindowAttributes: window=0x{:08x} value_mask=0x{:04x}", wid, value_mask);
 
+    let mut bg_pixel_for_native: Option<(u32, Option<crate::display::NativeWindowHandle>)> = None;
+
     if let Some(res) = server.resources.get(&wid) {
         if let super::resources::Resource::Window(win) = res.value() {
             let mut w = win.write();
@@ -917,7 +964,10 @@ async fn handle_change_window_attributes<S: AsyncRead + AsyncWrite + Unpin>(
                 offset += 4;
             }
             if value_mask & 0x0002 != 0 { // BackPixel
-                w.background_pixel = Some(read_u32(conn, &data[offset..offset+4]));
+                let bg = read_u32(conn, &data[offset..offset+4]);
+                w.background_pixel = Some(bg);
+                // Save for propagation to native window (done outside lock)
+                bg_pixel_for_native = Some((bg, w.native_window.clone()));
                 offset += 4;
             }
             if value_mask & 0x0004 != 0 { // BorderPixmap
@@ -972,12 +1022,49 @@ async fn handle_change_window_attributes<S: AsyncRead + AsyncWrite + Unpin>(
                 offset += 4;
             }
             if value_mask & 0x4000 != 0 { // Cursor
-                w.cursor = read_u32(conn, &data[offset..offset+4]);
+                let cursor_id = read_u32(conn, &data[offset..offset+4]);
+                w.cursor = cursor_id;
                 offset += 4;
+
+                // Look up cursor glyph code and send to display thread
+                let cursor_type = if cursor_id == 0 {
+                    0 // None/default = arrow
+                } else if let Some(cres) = server.resources.get(&cursor_id) {
+                    if let super::resources::Resource::Cursor(cursor) = cres.value() {
+                        crate::cursor::x11_cursor_glyph_to_macos(cursor.source_char) as u8
+                    } else { 0 }
+                } else { 0 };
+
+                // Find native window and send cursor update
+                let native = w.native_window.clone();
+                drop(w); // Release lock before sending command
+                let handle = if let Some(h) = native {
+                    Some(h)
+                } else {
+                    find_native_handle(server, wid)
+                };
+                if let Some(handle) = handle {
+                    let _ = server.display_cmd_tx.send(
+                        crate::display::DisplayCommand::SetWindowCursor { handle, cursor_type }
+                    );
+                }
+                // Early return since we dropped the lock
+                return Ok(());
             }
             let _ = offset;
         }
     }
+
+    // Send background pixel to native window (outside of lock)
+    if let Some((bg, native)) = bg_pixel_for_native {
+        let handle = native.or_else(|| find_native_handle(server, wid));
+        if let Some(handle) = handle {
+            let _ = server.display_cmd_tx.send(
+                crate::display::DisplayCommand::SetWindowBackgroundPixel { handle, pixel: bg }
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -1171,15 +1258,17 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
 
         if let Ok(handle) = rx.await {
             // Re-acquire lock to store handle and check for deferred WM_NAME
-            let deferred_title = if let Some(res) = server.resources.get(&wid) {
+            let (deferred_title, bg_pixel) = if let Some(res) = server.resources.get(&wid) {
                 if let super::resources::Resource::Window(win) = res.value() {
                     let mut w = win.write();
                     w.native_window = Some(handle.clone());
                     // If WM_NAME was already set before MapWindow, apply it now
-                    w.get_property(crate::server::atoms::predefined::WM_NAME)
-                        .and_then(|p| std::str::from_utf8(&p.data).ok().map(|s| s.to_string()))
-                } else { None }
-            } else { None };
+                    let title = w.get_property(crate::server::atoms::predefined::WM_NAME)
+                        .and_then(|p| std::str::from_utf8(&p.data).ok().map(|s| s.to_string()));
+                    let bg = w.background_pixel.unwrap_or(0xFFFFFF);
+                    (title, bg)
+                } else { (None, 0xFFFFFF) }
+            } else { (None, 0xFFFFFF) };
             if let Some(title) = deferred_title {
                 let _ = server.display_cmd_tx.send(
                     crate::display::DisplayCommand::SetWindowTitle {
@@ -1188,6 +1277,13 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
                     },
                 );
             }
+            // Set background pixel for resize fill color
+            let _ = server.display_cmd_tx.send(
+                crate::display::DisplayCommand::SetWindowBackgroundPixel {
+                    handle: handle.clone(),
+                    pixel: bg_pixel,
+                },
+            );
             let _ = server.display_cmd_tx.send(
                 crate::display::DisplayCommand::ShowWindow { handle },
             );
@@ -1327,6 +1423,10 @@ async fn handle_configure_window<S: AsyncRead + AsyncWrite + Unpin>(
 
             // Update native window if exists
             if let Some(ref handle) = w.native_window {
+                // Suppress setFrameSize events — ConfigureWindow handler sends them itself
+                if w.width != old_width || w.height != old_height {
+                    crate::display::SUPPRESS_RESIZE_EVENTS.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let _ = server.display_cmd_tx.send(
                     crate::display::DisplayCommand::MoveResizeWindow {
                         handle: handle.clone(),
@@ -1342,12 +1442,12 @@ async fn handle_configure_window<S: AsyncRead + AsyncWrite + Unpin>(
             // Check if StructureNotify is selected on this window
             let wants_structure_notify = w.event_selections.iter()
                 .any(|&(_cid, emask)| (emask & 0x00020000) != 0); // StructureNotifyMask
-            Some((w.x, w.y, w.width, w.height, w.border_width, w.override_redirect, w.parent, size_changed, wants_structure_notify))
+            Some((w.x, w.y, w.width, w.height, w.border_width, w.override_redirect, w.parent, size_changed, wants_structure_notify, old_width, old_height))
         } else { None }
     } else { None };
 
     // Send ConfigureNotify event inline (must maintain sequence order)
-    if let Some((x, y, width, height, border_width, override_redirect, _parent, size_changed, wants_structure_notify)) = configure_info {
+    if let Some((x, y, width, height, border_width, override_redirect, _parent, size_changed, wants_structure_notify, old_width, old_height)) = configure_info {
         debug!("ConfigureWindow 0x{:08X}: size_changed={} wants_struct_notify={}", wid, size_changed, wants_structure_notify);
         if wants_structure_notify {
             let seq = conn.current_request_sequence();
@@ -1357,7 +1457,8 @@ async fn handle_configure_window<S: AsyncRead + AsyncWrite + Unpin>(
             set_event_sequence(conn, &mut config_notify, seq);
             stream.write_all(&config_notify).await?;
         }
-        // When a window is resized, send Expose so it redraws
+        // When a window is resized, send full Expose so app redraws at new size.
+        // Many apps (xterm, xclock, xeyes) depend on full Expose to relayout.
         if size_changed {
             let seq = conn.current_request_sequence();
             let mut expose = super::events::build_expose_event(conn, wid, 0, 0, width, height, 0);
@@ -1936,6 +2037,32 @@ fn update_ime_spot(server: &Arc<XServer>, drawable: u32, x: i16, y: i16) {
 }
 
 /// Find the native window for a drawable and compute position in native window coordinates.
+/// Find the native window handle for any X11 window (walks up to top-level).
+fn find_native_handle(server: &Arc<XServer>, wid: u32) -> Option<crate::display::NativeWindowHandle> {
+    if let Some(res) = server.resources.get(&wid) {
+        if let super::resources::Resource::Window(win) = res.value() {
+            let w = win.read();
+            if let Some(ref handle) = w.native_window {
+                return Some(handle.clone());
+            }
+            let mut current = w.parent;
+            drop(w);
+            for _ in 0..32 {
+                if let Some(pres) = server.resources.get(&current) {
+                    if let super::resources::Resource::Window(pwin) = pres.value() {
+                        let pw = pwin.read();
+                        if let Some(ref handle) = pw.native_window {
+                            return Some(handle.clone());
+                        }
+                        current = pw.parent;
+                    } else { break; }
+                } else { break; }
+            }
+        }
+    }
+    None
+}
+
 /// Returns (native_window_handle_id, adjusted_x, adjusted_y).
 fn find_native_position(server: &Arc<XServer>, drawable: u32, x: i16, y: i16) -> (u64, i16, i16) {
     if let Some(res) = server.resources.get(&drawable) {
@@ -2106,22 +2233,22 @@ fn offset_render_commands(
                 RenderCommand::FillRectangle { x: x + dx, y: y + dy, width, height, color, gc_function },
             RenderCommand::ClearArea { x, y, width, height, bg_color } =>
                 RenderCommand::ClearArea { x: x + dx, y: y + dy, width, height, bg_color },
-            RenderCommand::DrawLine { x1, y1, x2, y2, color, line_width } =>
-                RenderCommand::DrawLine { x1: x1 + dx, y1: y1 + dy, x2: x2 + dx, y2: y2 + dy, color, line_width },
-            RenderCommand::FillArc { x, y, width, height, angle1, angle2, color } =>
-                RenderCommand::FillArc { x: x + dx, y: y + dy, width, height, angle1, angle2, color },
-            RenderCommand::DrawArc { x, y, width, height, angle1, angle2, color, line_width } =>
-                RenderCommand::DrawArc { x: x + dx, y: y + dy, width, height, angle1, angle2, color, line_width },
-            RenderCommand::DrawRectangle { x, y, width, height, color, line_width } =>
-                RenderCommand::DrawRectangle { x: x + dx, y: y + dy, width, height, color, line_width },
-            RenderCommand::PutImage { x, y, width, height, depth, format, data } =>
-                RenderCommand::PutImage { x: x + dx, y: y + dy, width, height, depth, format, data },
-            RenderCommand::DrawText { x, y, text, font_id, color, bg_color } =>
-                RenderCommand::DrawText { x: x + dx, y: y + dy, text, font_id, color, bg_color },
-            RenderCommand::CopyArea { src_x, src_y, dst_x, dst_y, width, height } =>
-                RenderCommand::CopyArea { src_x: src_x + dx, src_y: src_y + dy, dst_x: dst_x + dx, dst_y: dst_y + dy, width, height },
-            RenderCommand::FillPolygon { points, color } =>
-                RenderCommand::FillPolygon { points: points.into_iter().map(|(x, y)| (x + dx, y + dy)).collect(), color },
+            RenderCommand::DrawLine { x1, y1, x2, y2, color, line_width, gc_function } =>
+                RenderCommand::DrawLine { x1: x1 + dx, y1: y1 + dy, x2: x2 + dx, y2: y2 + dy, color, line_width, gc_function },
+            RenderCommand::FillArc { x, y, width, height, angle1, angle2, color, gc_function } =>
+                RenderCommand::FillArc { x: x + dx, y: y + dy, width, height, angle1, angle2, color, gc_function },
+            RenderCommand::DrawArc { x, y, width, height, angle1, angle2, color, line_width, gc_function } =>
+                RenderCommand::DrawArc { x: x + dx, y: y + dy, width, height, angle1, angle2, color, line_width, gc_function },
+            RenderCommand::DrawRectangle { x, y, width, height, color, line_width, gc_function } =>
+                RenderCommand::DrawRectangle { x: x + dx, y: y + dy, width, height, color, line_width, gc_function },
+            RenderCommand::PutImage { x, y, width, height, depth, format, data, gc_function } =>
+                RenderCommand::PutImage { x: x + dx, y: y + dy, width, height, depth, format, data, gc_function },
+            RenderCommand::DrawText { x, y, text, font_id, color, bg_color, gc_function } =>
+                RenderCommand::DrawText { x: x + dx, y: y + dy, text, font_id, color, bg_color, gc_function },
+            RenderCommand::CopyArea { src_x, src_y, dst_x, dst_y, width, height, gc_function } =>
+                RenderCommand::CopyArea { src_x: src_x + dx, src_y: src_y + dy, dst_x: dst_x + dx, dst_y: dst_y + dy, width, height, gc_function },
+            RenderCommand::FillPolygon { points, color, gc_function } =>
+                RenderCommand::FillPolygon { points: points.into_iter().map(|(x, y)| (x + dx, y + dy)).collect(), color, gc_function },
             other => other, // Any other commands pass through unchanged
         }
     }).collect()
@@ -2187,19 +2314,20 @@ async fn handle_clear_area<S: AsyncRead + AsyncWrite + Unpin>(
     log::debug!("ClearArea: wid=0x{:08X} ({},{} {}x{}) exposures={}", wid, x, y, width, height, exposures);
 
     // Extract window info without holding locks across await
-    let (bg_color, is_window) = if let Some(res) = server.resources.get(&wid) {
+    // X11 spec: If background is None, ClearArea does nothing (no painting).
+    let (bg_color_opt, is_window) = if let Some(res) = server.resources.get(&wid) {
         match res.value() {
             super::resources::Resource::Window(win) => {
                 let w = win.read();
                 if width == 0 { width = w.width.saturating_sub(x as u16); }
                 if height == 0 { height = w.height.saturating_sub(y as u16); }
-                (w.background_pixel.unwrap_or(0), true)
+                (w.background_pixel, true)
             }
             super::resources::Resource::Pixmap(pix) => {
                 let p = pix.read();
                 if width == 0 { width = p.width.saturating_sub(x as u16); }
                 if height == 0 { height = p.height.saturating_sub(y as u16); }
-                (0u32, false)
+                (Some(0u32), false)
             }
             _ => return Ok(()),
         }
@@ -2207,6 +2335,9 @@ async fn handle_clear_area<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     };
 
+    // ClearArea: use background_pixel if set, otherwise default to black (0).
+    // X11 spec says None = do nothing, but many apps (xterm) rely on ClearArea always working.
+    let bg_color = bg_color_opt.unwrap_or(0);
     let command = crate::display::RenderCommand::ClearArea {
         x, y, width, height, bg_color,
     };
@@ -2250,12 +2381,13 @@ async fn handle_copy_area<S: AsyncRead + AsyncWrite + Unpin>(
     debug!("CopyArea: src=0x{:08X} dst=0x{:08X} gc=0x{:08X} ({},{}) -> ({},{}) {}x{}",
            src_drawable, dst_drawable, gcid, src_x, src_y, dst_x, dst_y, width, height);
 
-    // Check if GC has graphics_exposures set
-    let graphics_exposures = if let Some(res) = server.resources.get(&gcid) {
+    // Read GC properties
+    let (graphics_exposures, gc_function) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
-            gc.read().graphics_exposures
-        } else { false }
-    } else { false };
+            let gc = gc.read();
+            (gc.graphics_exposures, gc.function as u8)
+        } else { (false, 3) }
+    } else { (false, 3) };
 
     // Read pixels from source drawable
     let src_data = {
@@ -2283,7 +2415,7 @@ async fn handle_copy_area<S: AsyncRead + AsyncWrite + Unpin>(
                     // CopyArea from window to window — dispatch as a render command
                     // The renderer will handle it as an in-buffer copy (for scrolling)
                     let command = crate::display::RenderCommand::CopyArea {
-                        src_x, src_y, dst_x, dst_y, width, height,
+                        src_x, src_y, dst_x, dst_y, width, height, gc_function,
                     };
                     dispatch_render_commands(server, dst_drawable, vec![command]);
 
@@ -2318,6 +2450,7 @@ async fn handle_copy_area<S: AsyncRead + AsyncWrite + Unpin>(
             depth: 24,
             format: 2, // ZPixmap
             data: pixels,
+            gc_function,
         };
         dispatch_render_commands(server, dst_drawable, vec![command]);
     }
@@ -2351,11 +2484,12 @@ async fn handle_poly_point<S: AsyncRead + AsyncWrite + Unpin>(
     let drawable = read_u32(conn, &data[4..8]);
     let gcid = read_u32(conn, &data[8..12]);
 
-    let fg_color = if let Some(res) = server.resources.get(&gcid) {
+    let (fg_color, gc_function) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
-            gc.read().foreground
-        } else { 0 }
-    } else { 0 };
+            let gc = gc.read();
+            (gc.foreground, gc.function as u8)
+        } else { (0, 3) }
+    } else { (0, 3) };
 
     let mut commands = Vec::new();
     let mut prev_x: i16 = 0;
@@ -2373,7 +2507,7 @@ async fn handle_poly_point<S: AsyncRead + AsyncWrite + Unpin>(
         prev_y = py;
         // Draw a single pixel as a 1x1 rectangle
         commands.push(crate::display::RenderCommand::FillRectangle {
-            x: px, y: py, width: 1, height: 1, color: fg_color, gc_function: 3,
+            x: px, y: py, width: 1, height: 1, color: fg_color, gc_function,
         });
     }
 
@@ -2394,12 +2528,12 @@ async fn handle_poly_rectangle<S: AsyncRead + AsyncWrite + Unpin>(
     let drawable = read_u32(conn, &data[4..8]);
     let gcid = read_u32(conn, &data[8..12]);
 
-    let (fg_color, line_width) = if let Some(res) = server.resources.get(&gcid) {
+    let (fg_color, line_width, gc_function) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
             let gc = gc.read();
-            (gc.foreground, gc.line_width)
-        } else { (0xFFFFFF, 0) }
-    } else { (0xFFFFFF, 0) };
+            (gc.foreground, gc.line_width, gc.function as u8)
+        } else { (0xFFFFFF, 0, 3) }
+    } else { (0xFFFFFF, 0, 3) };
 
     let mut commands = Vec::new();
     let mut offset = 12;
@@ -2411,7 +2545,7 @@ async fn handle_poly_rectangle<S: AsyncRead + AsyncWrite + Unpin>(
         offset += 8;
 
         commands.push(crate::display::RenderCommand::DrawRectangle {
-            x, y, width: w, height: h, color: fg_color, line_width,
+            x, y, width: w, height: h, color: fg_color, line_width, gc_function,
         });
     }
 
@@ -2433,12 +2567,12 @@ async fn handle_poly_line<S: AsyncRead + AsyncWrite + Unpin>(
     let drawable = read_u32(conn, &data[4..8]);
     let gcid = read_u32(conn, &data[8..12]);
 
-    let (fg_color, line_width) = if let Some(res) = server.resources.get(&gcid) {
+    let (fg_color, line_width, gc_fn) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
             let gc = gc.read();
-            (gc.foreground, gc.line_width)
-        } else { (0xFFFFFF, 0) }
-    } else { (0xFFFFFF, 0) };
+            (gc.foreground, gc.line_width, gc.function as u8)
+        } else { (0xFFFFFF, 0, 3) }
+    } else { (0xFFFFFF, 0, 3) };
 
     let mut points = Vec::new();
     let mut offset = 12;
@@ -2462,7 +2596,7 @@ async fn handle_poly_line<S: AsyncRead + AsyncWrite + Unpin>(
         commands.push(crate::display::RenderCommand::DrawLine {
             x1: points[i].0, y1: points[i].1,
             x2: points[i+1].0, y2: points[i+1].1,
-            color: fg_color, line_width,
+            color: fg_color, line_width, gc_function: gc_fn,
         });
     }
 
@@ -2483,12 +2617,12 @@ async fn handle_poly_segment<S: AsyncRead + AsyncWrite + Unpin>(
     let drawable = read_u32(conn, &data[4..8]);
     let gcid = read_u32(conn, &data[8..12]);
 
-    let (fg_color, line_width) = if let Some(res) = server.resources.get(&gcid) {
+    let (fg_color, line_width, gc_fn) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
             let gc = gc.read();
-            (gc.foreground, gc.line_width)
-        } else { (0xFFFFFF, 0) }
-    } else { (0xFFFFFF, 0) };
+            (gc.foreground, gc.line_width, gc.function as u8)
+        } else { (0xFFFFFF, 0, 3) }
+    } else { (0xFFFFFF, 0, 3) };
 
     let mut commands = Vec::new();
     let mut offset = 12;
@@ -2499,7 +2633,7 @@ async fn handle_poly_segment<S: AsyncRead + AsyncWrite + Unpin>(
         let y2 = read_i16(conn, &data[offset+6..offset+8]);
         offset += 8;
         commands.push(crate::display::RenderCommand::DrawLine {
-            x1, y1, x2, y2, color: fg_color, line_width,
+            x1, y1, x2, y2, color: fg_color, line_width, gc_function: gc_fn,
         });
     }
 
@@ -2522,11 +2656,12 @@ async fn handle_fill_poly<S: AsyncRead + AsyncWrite + Unpin>(
     let _shape = data[12];
     let coordinate_mode = data[13];
 
-    let fg_color = if let Some(res) = server.resources.get(&gcid) {
+    let (fg_color, gc_fn) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
-            gc.read().foreground
-        } else { 0xFFFFFF }
-    } else { 0xFFFFFF };
+            let g = gc.read();
+            (g.foreground, g.function as u8)
+        } else { (0xFFFFFF, 3) }
+    } else { (0xFFFFFF, 3) };
 
     let mut points: Vec<(i16, i16)> = Vec::new();
     let mut offset = 16;
@@ -2548,6 +2683,7 @@ async fn handle_fill_poly<S: AsyncRead + AsyncWrite + Unpin>(
     let commands = vec![crate::display::RenderCommand::FillPolygon {
         points,
         color: fg_color,
+        gc_function: gc_fn,
     }];
 
     dispatch_render_commands(server, drawable, commands);
@@ -2567,12 +2703,12 @@ async fn handle_poly_arc<S: AsyncRead + AsyncWrite + Unpin>(
     let drawable = read_u32(conn, &data[4..8]);
     let gcid = read_u32(conn, &data[8..12]);
 
-    let (fg_color, line_width) = if let Some(res) = server.resources.get(&gcid) {
+    let (fg_color, line_width, gc_fn) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
             let gc = gc.read();
-            (gc.foreground, gc.line_width)
-        } else { (0xFFFFFF, 0) }
-    } else { (0xFFFFFF, 0) };
+            (gc.foreground, gc.line_width, gc.function as u8)
+        } else { (0xFFFFFF, 0, 3) }
+    } else { (0xFFFFFF, 0, 3) };
 
     // Each arc is 12 bytes: x(2), y(2), width(2), height(2), angle1(2), angle2(2)
     let mut commands = Vec::new();
@@ -2588,7 +2724,7 @@ async fn handle_poly_arc<S: AsyncRead + AsyncWrite + Unpin>(
 
         commands.push(crate::display::RenderCommand::DrawArc {
             x, y, width, height, angle1, angle2,
-            color: fg_color, line_width,
+            color: fg_color, line_width, gc_function: gc_fn,
         });
     }
 
@@ -2609,11 +2745,12 @@ async fn handle_poly_fill_arc<S: AsyncRead + AsyncWrite + Unpin>(
     let drawable = read_u32(conn, &data[4..8]);
     let gcid = read_u32(conn, &data[8..12]);
 
-    let fg_color = if let Some(res) = server.resources.get(&gcid) {
+    let (fg_color, gc_fn) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
-            gc.read().foreground
-        } else { 0xFFFFFF }
-    } else { 0xFFFFFF };
+            let g = gc.read();
+            (g.foreground, g.function as u8)
+        } else { (0xFFFFFF, 3) }
+    } else { (0xFFFFFF, 3) };
 
     // Each arc is 12 bytes: x(2), y(2), width(2), height(2), angle1(2), angle2(2)
     let mut commands = Vec::new();
@@ -2632,7 +2769,7 @@ async fn handle_poly_fill_arc<S: AsyncRead + AsyncWrite + Unpin>(
 
         commands.push(crate::display::RenderCommand::FillArc {
             x, y, width, height, angle1, angle2,
-            color: fg_color,
+            color: fg_color, gc_function: gc_fn,
         });
     }
 
@@ -2652,13 +2789,19 @@ async fn handle_put_image<S: AsyncRead + AsyncWrite + Unpin>(
 
     let format = data[1]; // 0=Bitmap, 1=XYPixmap, 2=ZPixmap
     let drawable = read_u32(conn, &data[4..8]);
-    let _gcid = read_u32(conn, &data[8..12]);
+    let gcid = read_u32(conn, &data[8..12]);
     let width = read_u16(conn, &data[12..14]);
     let height = read_u16(conn, &data[14..16]);
     let dst_x = read_i16(conn, &data[16..18]);
     let dst_y = read_i16(conn, &data[18..20]);
     let _left_pad = data[20];
     let depth = data[21];
+
+    let gc_function = if let Some(res) = server.resources.get(&gcid) {
+        if let super::resources::Resource::GContext(gc) = res.value() {
+            gc.read().function as u8
+        } else { 3 }
+    } else { 3 };
 
     debug!("PutImage: drawable=0x{:08X} {}x{} at ({},{}) depth={} format={}", drawable, width, height, dst_x, dst_y, depth, format);
     let image_data = data[24..].to_vec();
@@ -2677,6 +2820,7 @@ async fn handle_put_image<S: AsyncRead + AsyncWrite + Unpin>(
         depth,
         format,
         data: image_data,
+        gc_function,
     };
 
     dispatch_render_commands(server, drawable, vec![command]);
@@ -2698,12 +2842,12 @@ async fn handle_poly_text8<S: AsyncRead + AsyncWrite + Unpin>(
     let x = read_i16(conn, &data[12..14]);
     let y = read_i16(conn, &data[14..16]);
 
-    let (fg_color, font_id) = if let Some(res) = server.resources.get(&gcid) {
+    let (fg_color, font_id, gc_function) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
             let gc = gc.read();
-            (gc.foreground, gc.font)
-        } else { (0xFFFFFF, 0) }
-    } else { (0xFFFFFF, 0) };
+            (gc.foreground, gc.font, gc.function as u8)
+        } else { (0xFFFFFF, 0, 3) }
+    } else { (0xFFFFFF, 0, 3) };
 
     // Parse text items from offset 16
     let mut text_bytes = Vec::new();
@@ -2721,7 +2865,7 @@ async fn handle_poly_text8<S: AsyncRead + AsyncWrite + Unpin>(
 
     if !text_bytes.is_empty() {
         let command = crate::display::RenderCommand::DrawText {
-            x, y, text: text_bytes, font_id, color: fg_color, bg_color: None,
+            x, y, text: text_bytes, font_id, color: fg_color, bg_color: None, gc_function,
         };
         dispatch_render_commands(server, drawable, vec![command]);
     }
@@ -2760,7 +2904,7 @@ async fn handle_image_text8<S: AsyncRead + AsyncWrite + Unpin>(
         update_ime_spot(server, drawable, cursor_x, y);
 
         let command = crate::display::RenderCommand::DrawText {
-            x, y, text, font_id, color: fg_color, bg_color,
+            x, y, text, font_id, color: fg_color, bg_color, gc_function: 3, // ImageText always GXcopy
         };
         dispatch_render_commands(server, drawable, vec![command]);
     }
@@ -2784,12 +2928,12 @@ async fn handle_poly_text16<S: AsyncRead + AsyncWrite + Unpin>(
     let x = read_i16(conn, &data[12..14]);
     let y = read_i16(conn, &data[14..16]);
 
-    let (fg_color, font_id) = if let Some(res) = server.resources.get(&gcid) {
+    let (fg_color, font_id, gc_function) = if let Some(res) = server.resources.get(&gcid) {
         if let super::resources::Resource::GContext(gc) = res.value() {
             let gc = gc.read();
-            (gc.foreground, gc.font)
-        } else { (0xFFFFFF, 0) }
-    } else { (0xFFFFFF, 0) };
+            (gc.foreground, gc.font, gc.function as u8)
+        } else { (0xFFFFFF, 0, 3) }
+    } else { (0xFFFFFF, 0, 3) };
 
     // Parse text items: each item has len (in 2-byte chars), delta, then len*2 bytes
     let mut text_bytes = Vec::new();
@@ -2818,7 +2962,7 @@ async fn handle_poly_text16<S: AsyncRead + AsyncWrite + Unpin>(
 
     if !text_bytes.is_empty() {
         let command = crate::display::RenderCommand::DrawText {
-            x, y, text: text_bytes, font_id, color: fg_color, bg_color: None,
+            x, y, text: text_bytes, font_id, color: fg_color, bg_color: None, gc_function,
         };
         dispatch_render_commands(server, drawable, vec![command]);
     }
@@ -2876,7 +3020,7 @@ async fn handle_image_text16<S: AsyncRead + AsyncWrite + Unpin>(
         update_ime_spot(server, drawable, cursor_x, y);
 
         let command = crate::display::RenderCommand::DrawText {
-            x, y, text: text_bytes, font_id, color: fg_color, bg_color,
+            x, y, text: text_bytes, font_id, color: fg_color, bg_color, gc_function: 3, // ImageText always GXcopy
         };
         dispatch_render_commands(server, drawable, vec![command]);
     }
@@ -4256,15 +4400,20 @@ async fn handle_alloc_color<S: AsyncRead + AsyncWrite + Unpin>(
     let b8 = (blue >> 8) as u32;
     let pixel = (r8 << 16) | (g8 << 8) | b8;
 
+    // Return exact colors: scale 8-bit back to 16-bit (e.g. 0xFF -> 0xFFFF)
+    let exact_r = (r8 as u16) << 8 | r8 as u16;
+    let exact_g = (g8 as u16) << 8 | g8 as u16;
+    let exact_b = (b8 as u16) << 8 | b8 as u16;
+
     let seq = conn.current_request_sequence();
     let mut reply = Vec::with_capacity(32);
     reply.push(1); // reply
     reply.push(0); // unused
     write_u16_to(conn, &mut reply, seq);
     write_u32_to(conn, &mut reply, 0); // additional data length
-    write_u16_to(conn, &mut reply, red & 0xFF00); // exact red
-    write_u16_to(conn, &mut reply, green & 0xFF00); // exact green
-    write_u16_to(conn, &mut reply, blue & 0xFF00); // exact blue
+    write_u16_to(conn, &mut reply, exact_r); // exact red
+    write_u16_to(conn, &mut reply, exact_g); // exact green
+    write_u16_to(conn, &mut reply, exact_b); // exact blue
     reply.extend_from_slice(&[0; 2]); // padding
     write_u32_to(conn, &mut reply, pixel);
     reply.extend(std::iter::repeat(0).take(12)); // padding to 32 bytes
@@ -4608,14 +4757,14 @@ fn lookup_x11_color(name: &str) -> Option<(u16, u16, u16)> {
                     if line.is_empty() || line.starts_with('!') || line.starts_with('#') {
                         continue;
                     }
-                    let parts: Vec<&str> = line.splitn(4, |c: char| c.is_whitespace()).collect();
+                    let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 4 {
                         if let (Ok(r), Ok(g), Ok(b)) = (
-                            parts[0].trim().parse::<u8>(),
-                            parts[1].trim().parse::<u8>(),
-                            parts[2].trim().parse::<u8>(),
+                            parts[0].parse::<u8>(),
+                            parts[1].parse::<u8>(),
+                            parts[2].parse::<u8>(),
                         ) {
-                            let color_name = parts[3..].join(" ").trim().to_lowercase();
+                            let color_name = parts[3..].join(" ").to_lowercase();
                             // X11 colors are 16-bit: scale 8-bit to 16-bit
                             let r16 = (r as u16) << 8 | r as u16;
                             let g16 = (g as u16) << 8 | g as u16;
