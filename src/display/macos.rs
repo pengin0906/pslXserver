@@ -130,6 +130,8 @@ thread_local! {
     static NEXT_ID: RefCell<u64> = RefCell::new(1);
     static SCALE_FACTOR: std::cell::Cell<f64> = const { std::cell::Cell::new(2.0) };
     static LAST_POINTER: std::cell::Cell<(i16, i16)> = const { std::cell::Cell::new((0, 0)) };
+    /// Last polled button state (bitmask from pressedMouseButtons) for edge detection
+    static LAST_BUTTONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Cached screen height in points — avoids [NSScreen mainScreen] per event.
     static SCREEN_HEIGHT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     /// Accumulated trackpad scroll delta (pixels). Emit X11 event when threshold exceeded.
@@ -236,6 +238,12 @@ fn get_input_view_class() -> &'static AnyClass {
             // setFrameSize: override — immediate IOSurface resize when macOS window is resized
             class_addMethod(raw_cls, objc2::sel!(setFrameSize:),
                 set_frame_size as *const std::ffi::c_void, c"v@:{CGSize=dd}".as_ptr() as _);
+            // wantsUpdateLayer -> YES: tells AppKit we manage layer contents ourselves
+            class_addMethod(raw_cls, objc2::sel!(wantsUpdateLayer),
+                wants_update_layer as *const std::ffi::c_void, c"B@:".as_ptr() as _);
+            // updateLayer: no-op — we set layer.contents directly from flush_window
+            class_addMethod(raw_cls, objc2::sel!(updateLayer),
+                update_layer_noop as *const std::ffi::c_void, c"v@:".as_ptr() as _);
 
             CLASS = raw_cls as *const AnyClass;
         }
@@ -248,6 +256,15 @@ fn get_input_view_class() -> &'static AnyClass {
 
 unsafe extern "C" fn accepts_first_responder(_this: *mut AnyObject, _sel: Sel) -> Bool {
     Bool::YES
+}
+
+/// Tell AppKit we manage layer contents ourselves — prevents drawRect from clearing layer.
+unsafe extern "C" fn wants_update_layer(_this: *mut AnyObject, _sel: Sel) -> Bool {
+    Bool::YES
+}
+
+/// No-op updateLayer — layer contents set directly by flush_window via IOSurface.
+unsafe extern "C" fn update_layer_noop(_this: *mut AnyObject, _sel: Sel) {
 }
 
 unsafe extern "C" fn view_key_down(this: *mut AnyObject, _sel: Sel, event: *mut AnyObject) {
@@ -847,11 +864,70 @@ fn process_commands() {
         handle_command(cmd);
     }
 
-    // 1.5. Send global pointer + per-window MotionNotify when cursor moves
+    // 1.5. Detect button press/release edges + send MotionNotify when cursor moves
     {
         let (rx, ry) = get_screen_mouse_location();
+        let cur_buttons: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
+        let prev_buttons = LAST_BUTTONS.with(|lb| lb.get());
+
+        // Detect button edges and send ButtonPress/ButtonRelease
+        if cur_buttons != prev_buttons {
+            LAST_BUTTONS.with(|lb| lb.set(cur_buttons));
+            let mouse_loc: NSPoint = unsafe { msg_send![objc2::class!(NSEvent), mouseLocation] };
+            let time = unsafe {
+                let pi: *mut AnyObject = msg_send![objc2::class!(NSProcessInfo), processInfo];
+                let uptime: f64 = msg_send![pi, systemUptime];
+                (uptime * 1000.0) as u32
+            };
+            // Check each of the first 3 buttons (left, right, middle)
+            for btn_idx in 0u64..3 {
+                let was = (prev_buttons >> btn_idx) & 1;
+                let now = (cur_buttons >> btn_idx) & 1;
+                if was == now { continue; }
+                let x11_button: u8 = match btn_idx { 0 => 1, 1 => 3, 2 => 2, _ => 0 };
+                WINDOWS.with(|w| {
+                    let ws = w.borrow();
+                    for (_id, info) in ws.iter() {
+                        let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
+                        let content_h = if let Some(view) = info.window.contentView() {
+                            let bounds: NSRect = unsafe { msg_send![&*view, bounds] };
+                            bounds.size.height
+                        } else {
+                            frame.size.height
+                        };
+                        let win_x = (mouse_loc.x - frame.origin.x) as i16;
+                        let win_y = (frame.origin.y + content_h - mouse_loc.y) as i16;
+                        let in_window = win_x >= 0 && win_y >= 0
+                            && (win_x as f64) < frame.size.width
+                            && (win_y as f64) < content_h;
+                        let state = get_mouse_button_state();
+                        if now == 1 {
+                            // ButtonPress: only for window under cursor
+                            if !in_window { continue; }
+                            let btn_mask: u16 = match x11_button { 1=>0x100, 2=>0x200, 3=>0x400, _=>0 };
+                            log::debug!("Polling ButtonPress: btn={} win=0x{:08x} ({},{}) state=0x{:04x}", x11_button, info.x11_id, win_x, win_y, state & !btn_mask);
+                            send_display_event(DisplayEvent::ButtonPress {
+                                window: info.x11_id, button: x11_button,
+                                x: win_x, y: win_y, root_x: rx, root_y: ry,
+                                state: state & !btn_mask, time,
+                            });
+                        } else {
+                            // ButtonRelease: send even when outside window (drag may end outside)
+                            log::debug!("Polling ButtonRelease: btn={} win=0x{:08x} ({},{}) state=0x{:04x}", x11_button, info.x11_id, win_x, win_y, state);
+                            send_display_event(DisplayEvent::ButtonRelease {
+                                window: info.x11_id, button: x11_button,
+                                x: win_x, y: win_y, root_x: rx, root_y: ry,
+                                state, time,
+                            });
+                        }
+                    }
+                });
+            }
+        }
+
         let last = LAST_POINTER.with(|lp| lp.get());
         if rx != last.0 || ry != last.1 {
+            let btn_state = get_mouse_button_state();
             LAST_POINTER.with(|lp| lp.set((rx, ry)));
             send_display_event(DisplayEvent::GlobalPointerUpdate { root_x: rx, root_y: ry });
 
@@ -885,7 +961,7 @@ fn process_commands() {
                         y: win_y,
                         root_x: rx,
                         root_y: ry,
-                        state: 0,
+                        state: get_mouse_button_state(),
                         time,
                     });
                 }
@@ -1061,6 +1137,8 @@ fn handle_command(cmd: DisplayCommand) {
                         let _: () = msg_send![layer, setContentsScale: 1.0_f64];
                         // Clip layer contents to view bounds
                         let _: () = msg_send![layer, setMasksToBounds: true];
+                        // Set IOSurface directly as initial layer contents (zero-copy)
+                        let _: () = msg_send![layer, setContents: surface as *mut AnyObject];
                     }
                     // Prevent AppKit from overwriting layer contents during redraw.
                     // NSViewLayerContentsRedrawNever = 0
@@ -1147,6 +1225,7 @@ fn handle_command(cmd: DisplayCommand) {
                         NSPoint::new(x as f64, mac_y),
                         NSSize::new(pt_w, pt_h + title_bar_h),
                     );
+                    info!("MoveResizeWindow: content {}x{} frame {}x{} title_h={}", pt_w, pt_h, frame.size.width, frame.size.height, title_bar_h);
                     Some((info.window.clone(), frame))
                 } else {
                     None
@@ -1184,84 +1263,20 @@ fn ca_transaction_flush() {
     }
 }
 
-// CGImage-based flush removed — IOSurface is used directly as layer.contents.
-// Eliminates per-frame buffer copy (previously ~3.2MB memcpy + CGImage alloc per window).
-
-/// Create a CGImage from the IOSurface buffer and set it as the layer's contents.
-/// IOSurface direct as layer.contents is unreliable (AppKit overwrites it),
-/// so we create a CGImage snapshot each frame instead.
+/// Set IOSurface directly as CALayer contents — zero-copy, no color space conversion.
+/// With wantsUpdateLayer=YES + layerContentsRedrawPolicy=Never, AppKit won't overwrite.
+/// nil→surface transition forces CALayer to re-read even for the same IOSurface pointer.
 fn flush_window(info: &WindowInfo) {
     unsafe {
-        let w = info.width as usize;
-        let h = info.height as usize;
-        if w == 0 || h == 0 { return; }
-
-        // Lock IOSurface to read pixels
-        IOSurfaceLock(info.surface, 1, std::ptr::null_mut()); // read-only lock
-        let base = IOSurfaceGetBaseAddress(info.surface);
-        let bpr = IOSurfaceGetBytesPerRow(info.surface);
-
-        // Create CGImage from IOSurface pixel data
-        extern "C" {
-            fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
-            fn CGColorSpaceRelease(cs: *mut c_void);
-            fn CGDataProviderCreateWithData(
-                info: *mut c_void,
-                data: *const c_void,
-                size: usize,
-                releaseData: *const c_void,
-            ) -> *mut c_void;
-            fn CGDataProviderRelease(provider: *mut c_void);
-            fn CGImageCreate(
-                width: usize, height: usize,
-                bitsPerComponent: usize, bitsPerPixel: usize,
-                bytesPerRow: usize,
-                space: *mut c_void,
-                bitmapInfo: u32,
-                provider: *mut c_void,
-                decode: *const f64,
-                shouldInterpolate: bool,
-                intent: i32,
-            ) -> *mut c_void;
-            fn CGImageRelease(image: *mut c_void);
-        }
-
-        let cs = CGColorSpaceCreateDeviceRGB();
-        let data_len = bpr * h;
-        let provider = CGDataProviderCreateWithData(
-            std::ptr::null_mut(),
-            base,
-            data_len,
-            std::ptr::null(),
-        );
-
-        // kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst = 0x2002
-        // This matches BGRA with premultiplied alpha (our pixel format)
-        let bitmap_info: u32 = (2 << 12) | 2; // kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst
-        let image = CGImageCreate(
-            w, h, 8, 32, bpr,
-            cs,
-            bitmap_info,
-            provider,
-            std::ptr::null(),
-            false,
-            0, // kCGRenderingIntentDefault
-        );
-
-        IOSurfaceUnlock(info.surface, 1, std::ptr::null_mut());
-
-        if !image.is_null() {
-            if let Some(view) = info.window.contentView() {
-                let layer: *mut AnyObject = msg_send![&*view, layer];
-                if !layer.is_null() {
-                    let _: () = msg_send![layer, setContents: image as *mut AnyObject];
-                }
+        if info.width == 0 || info.height == 0 || info.surface.is_null() { return; }
+        if let Some(view) = info.window.contentView() {
+            let layer: *mut AnyObject = msg_send![&*view, layer];
+            if !layer.is_null() {
+                let null_obj: *mut AnyObject = std::ptr::null_mut();
+                let _: () = msg_send![layer, setContents: null_obj];
+                let _: () = msg_send![layer, setContents: info.surface as *mut AnyObject];
             }
         }
-
-        CGImageRelease(image);
-        CGDataProviderRelease(provider);
-        CGColorSpaceRelease(cs);
     }
 }
 
@@ -1375,6 +1390,10 @@ pub fn run_cocoa_app(
 
 /// Convert NSEvent to DisplayEvent and send to the X11 server thread.
 fn handle_ns_event(event: &AnyObject, event_type: usize) {
+    // Log mouse events at INFO level for debugging
+    if event_type >= 1 && event_type <= 7 || event_type == 25 || event_type == 26 || event_type == 27 {
+        log::debug!("handle_ns_event: type={} (mouse)", event_type);
+    }
     // Try to get the event's window first
     let ns_window: *mut AnyObject = unsafe { msg_send![event, window] };
 
@@ -1431,11 +1450,20 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
                 NS_RIGHT_MOUSE_DOWN => 3,
                 _ => 2,
             };
-            let state = get_modifier_state(event);
+            // For ButtonPress, state should reflect state BEFORE this press.
+            // macOS pressedMouseButtons already includes the button being pressed,
+            // so we subtract it.
+            let button_mask: u16 = match button {
+                1 => 0x100, 2 => 0x200, 3 => 0x400, _ => 0,
+            };
+            let state = get_modifier_state(event) & !button_mask;
             debug!("ButtonPress: window=0x{:08x} button={} x={} y={} root=({},{})", x11_id, button, x, y, root_x, root_y);
             send_display_event(DisplayEvent::ButtonPress {
                 window: x11_id, button, x, y, root_x, root_y, state, time,
             });
+            // Sync LAST_BUTTONS so the polling path doesn't re-fire this press
+            let cur: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
+            LAST_BUTTONS.with(|lb| lb.set(cur));
         }
         NS_LEFT_MOUSE_UP | NS_RIGHT_MOUSE_UP | NS_OTHER_MOUSE_UP => {
             let (x, y) = get_event_location(event, x11_id, win_width, win_height);
@@ -1449,6 +1477,9 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
             send_display_event(DisplayEvent::ButtonRelease {
                 window: x11_id, button, x, y, root_x, root_y, state, time,
             });
+            // Sync LAST_BUTTONS so the polling path doesn't re-fire this release
+            let cur: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
+            LAST_BUTTONS.with(|lb| lb.set(cur));
         }
         NS_MOUSE_MOVED | NS_LEFT_MOUSE_DRAGGED | NS_RIGHT_MOUSE_DRAGGED | NS_OTHER_MOUSE_DRAGGED => {
             let (x, y) = get_event_location(event, x11_id, win_width, win_height);
@@ -1595,6 +1626,21 @@ fn get_modifier_state(event: &AnyObject) -> u16 {
     if flags & (1 << 18) != 0 { state |= 4; }     // Control → ControlMask
     if flags & (1 << 19) != 0 { state |= 8; }     // Option → Mod1Mask
     if flags & (1 << 20) != 0 { state |= 64; }    // Command → Mod4Mask
+    // Add mouse button masks from macOS pressed buttons
+    let pressed: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
+    if pressed & (1 << 0) != 0 { state |= 0x100; }  // Button1Mask (left)
+    if pressed & (1 << 1) != 0 { state |= 0x400; }  // Button3Mask (right, macOS bit 1 = X11 button 3)
+    if pressed & (1 << 2) != 0 { state |= 0x200; }  // Button2Mask (middle, macOS bit 2 = X11 button 2)
+    state
+}
+
+/// Get current mouse button state without an event (for polling path).
+fn get_mouse_button_state() -> u16 {
+    let pressed: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
+    let mut state = 0u16;
+    if pressed & (1 << 0) != 0 { state |= 0x100; }  // Button1Mask
+    if pressed & (1 << 1) != 0 { state |= 0x400; }  // Button3Mask
+    if pressed & (1 << 2) != 0 { state |= 0x200; }  // Button2Mask
     state
 }
 

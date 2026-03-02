@@ -460,6 +460,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         37 => handle_ungrab_server(server, conn, data, stream).await,
         38 => handle_query_pointer(server, conn, data, stream).await,
         40 => handle_translate_coordinates(server, conn, data, stream).await,
+        41 => handle_warp_pointer(server, conn, data, stream).await,
         42 => handle_set_input_focus(server, conn, data, stream).await,
         43 => handle_get_input_focus(server, conn, data, stream).await,
         45 => handle_open_font(server, conn, data, stream).await,
@@ -4091,6 +4092,115 @@ async fn handle_translate_coordinates<S: AsyncRead + AsyncWrite + Unpin>(
     write_i16_to(conn, &mut reply, dst_y);
     reply.extend(std::iter::repeat(0).take(16));
     stream.write_all(&reply).await?;
+    Ok(())
+}
+
+// --- WarpPointer (opcode 41) ---
+
+async fn handle_warp_pointer<S: AsyncRead + AsyncWrite + Unpin>(
+    server: &Arc<XServer>,
+    _conn: &Arc<ClientConnection>,
+    data: &[u8],
+    _stream: &mut S,
+) -> Result<(), ServerError> {
+    if data.len() < 24 {
+        return Err(ServerError::Protocol);
+    }
+    let _src_window = read_u32(_conn, &data[4..8]);
+    let dst_window = read_u32(_conn, &data[8..12]);
+    let _src_x = read_i16(_conn, &data[12..14]);
+    let _src_y = read_i16(_conn, &data[14..16]);
+    let _src_width = read_u16(_conn, &data[16..18]);
+    let _src_height = read_u16(_conn, &data[18..20]);
+    let dst_x = read_i16(_conn, &data[20..22]);
+    let dst_y = read_i16(_conn, &data[22..24]);
+
+    // Convert destination coords to root coords
+    let (abs_x, abs_y) = if dst_window != 0 {
+        let (wx, wy) = window_to_root_coords(server, dst_window);
+        (wx + dst_x as i32, wy + dst_y as i32)
+    } else {
+        (dst_x as i32, dst_y as i32)
+    };
+
+    info!("WarpPointer: dst_win=0x{:08x} dst=({},{}) abs=({},{})", dst_window, dst_x, dst_y, abs_x, abs_y);
+
+    // Update stored pointer position
+    server.pointer_x.store(abs_x, std::sync::atomic::Ordering::Relaxed);
+    server.pointer_y.store(abs_y, std::sync::atomic::Ordering::Relaxed);
+
+    // Generate MotionNotify directly to clients registered on child windows
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32;
+    let root = server.screens[0].root_window;
+
+    // Walk top-level windows and their children to find matching event registrations
+    fn send_warp_motion(server: &XServer, wid: u32, wx: i16, wy: i16, root_x: i16, root_y: i16, time: u32, depth: u8) {
+        if depth > 8 { return; }
+        if let Some(res) = server.resources.get(&wid) {
+            if let super::resources::Resource::Window(win) = res.value() {
+                let w = win.read();
+                if !w.mapped { return; }
+                // Deliver to clients registered on this window
+                for &(conn_id, emask) in &w.event_selections {
+                    if (emask & super::protocol::event_mask::POINTER_MOTION) != 0 {
+                        if let Some(conn_ref) = server.connections.get(&conn_id) {
+                            let conn = conn_ref.value();
+                            let mut evt = super::events::EventBuilder::new(conn, super::protocol::event_type::MOTION_NOTIFY);
+                            evt.set_u8(1, 0)
+                               .set_u32(4, time)
+                               .set_u32(8, server.screens[0].root_window)
+                               .set_u32(12, wid)
+                               .set_u32(16, 0)
+                               .set_i16(20, root_x)
+                               .set_i16(22, root_y)
+                               .set_i16(24, wx)
+                               .set_i16(26, wy)
+                               .set_u16(28, 0)
+                               .set_u8(30, 1);
+                            let _ = conn.event_tx.send(evt.build());
+                        }
+                    }
+                }
+                // Recurse into children
+                for &child_id in &w.children {
+                    if let Some(cres) = server.resources.get(&child_id) {
+                        if let super::resources::Resource::Window(cwin) = cres.value() {
+                            let cw = cwin.read();
+                            let cx = wx - cw.x as i16;
+                            let cy = wy - cw.y as i16;
+                            drop(cw);
+                            drop(cres);
+                            send_warp_motion(server, child_id, cx, cy, root_x, root_y, time, depth + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(res) = server.resources.get(&root) {
+        if let super::resources::Resource::Window(win) = res.value() {
+            let w = win.read();
+            for &child_id in &w.children {
+                if let Some(cres) = server.resources.get(&child_id) {
+                    if let super::resources::Resource::Window(cwin) = cres.value() {
+                        let cw = cwin.read();
+                        if cw.mapped {
+                            let wx = abs_x as i16 - cw.x as i16;
+                            let wy = abs_y as i16 - cw.y as i16;
+                            drop(cw);
+                            drop(cres);
+                            send_warp_motion(server, child_id, wx, wy, abs_x as i16, abs_y as i16, time, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

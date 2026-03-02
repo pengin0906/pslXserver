@@ -403,6 +403,13 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
     let mut focused_window: Xid = 0;
     let mut entered_window: Xid = 0;
     let mut preedit_char_count: usize = 0;
+    // Implicit pointer grab: when a button is pressed, the target window
+    // receives all subsequent MotionNotify/ButtonRelease until all buttons are released.
+    // This is essential for xterm text selection + scroll-back.
+    let mut grab_window: Xid = 0;       // 0 = no grab
+    let mut grab_offset_x: i16 = 0;     // top-level coord - grab window coord
+    let mut grab_offset_y: i16 = 0;
+    let mut buttons_pressed: u8 = 0;    // count of currently pressed buttons
     loop {
         // Use spawn_blocking to avoid blocking the tokio runtime
         let evt = {
@@ -418,6 +425,14 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
             DisplayEvent::ButtonPress { window, button, x, y, root_x, root_y, state, time } => {
                 // Find deepest child window at the click point
                 let (target, cx, cy) = find_child_at_point(&server, window, x, y);
+                // Establish implicit pointer grab on first button press
+                if buttons_pressed == 0 {
+                    grab_window = target;
+                    grab_offset_x = x - cx;
+                    grab_offset_y = y - cy;
+                    log::debug!("Implicit grab: window=0x{:08x} offset=({},{})", target, grab_offset_x, grab_offset_y);
+                }
+                buttons_pressed = buttons_pressed.saturating_add(1);
                 // Send EnterNotify if we haven't entered this window yet
                 if entered_window != target {
                     send_enter_leave_event(&server, protocol::event_type::ENTER_NOTIFY,
@@ -429,20 +444,41 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     send_focus_event(&server, protocol::event_type::FOCUS_IN, target);
                     focused_window = target;
                 }
+                log::debug!("ButtonPress: target=0x{:08x} btn={} ({},{}) state=0x{:04x} grab_on={}", target, button, cx, cy, state, grab_window != 0);
                 send_button_event(&server, protocol::event_type::BUTTON_PRESS,
                     target, button, cx, cy, root_x, root_y, state, time);
             }
             DisplayEvent::ButtonRelease { window, button, x, y, root_x, root_y, state, time } => {
-                let (target, cx, cy) = find_child_at_point(&server, window, x, y);
+                // During implicit grab, send to grab window with adjusted coords
+                let (target, cx, cy) = if grab_window != 0 {
+                    (grab_window, x - grab_offset_x, y - grab_offset_y)
+                } else {
+                    find_child_at_point(&server, window, x, y)
+                };
                 send_button_event(&server, protocol::event_type::BUTTON_RELEASE,
                     target, button, cx, cy, root_x, root_y, state, time);
+                // Release implicit grab when all buttons are released
+                buttons_pressed = buttons_pressed.saturating_sub(1);
+                if buttons_pressed == 0 {
+                    log::debug!("Implicit grab released (was 0x{:08x})", grab_window);
+                    grab_window = 0;
+                }
             }
             DisplayEvent::MotionNotify { window, x, y, root_x, root_y, state, time } => {
                 // Update stored pointer position for QueryPointer
                 server.pointer_x.store(root_x as i32, Ordering::Relaxed);
                 server.pointer_y.store(root_y as i32, Ordering::Relaxed);
-                // Find deepest child at pointer position
-                let (target, cx, cy) = find_child_at_point(&server, window, x, y);
+                // During implicit grab, send directly to grab window
+                let (target, cx, cy) = if grab_window != 0 {
+                    let cx = x - grab_offset_x;
+                    let cy = y - grab_offset_y;
+                    if cy < 0 || cx < 0 {
+                        log::debug!("Grab motion OOB: win=0x{:08x} cx={} cy={} state=0x{:04x}", grab_window, cx, cy, state);
+                    }
+                    (grab_window, cx, cy)
+                } else {
+                    find_child_at_point(&server, window, x, y)
+                };
                 server.window_pointer.insert(target, (cx, cy));
                 if entered_window != target {
                     send_enter_leave_event(&server, protocol::event_type::ENTER_NOTIFY,
@@ -586,8 +622,8 @@ fn send_button_event(
         _ => protocol::event_mask::BUTTON_RELEASE,
     };
 
-    log::debug!("send_button_event: window=0x{:08x} button={} resource_exists={}",
-        window, button, server.resources.contains_key(&window));
+    log::debug!("send_button_event: window=0x{:08x} button={} type={} mask_bit=0x{:08x}",
+        window, button, event_type, mask_bit);
 
     if let Some(res) = server.resources.get(&window) {
         if let Resource::Window(win) = res.value() {
@@ -630,9 +666,22 @@ fn send_motion_event(
         if let Resource::Window(win) = res.value() {
             let w = win.read();
             for &(conn_id, emask) in &w.event_selections {
-                if (emask & protocol::event_mask::POINTER_MOTION) != 0
-                    || (emask & protocol::event_mask::BUTTON_MOTION) != 0
+                // PointerMotion: always deliver motion events
+                // ButtonMotion: deliver when any button is pressed
+                // Button{1..5}Motion: deliver when that specific button is pressed
+                let deliver = (emask & protocol::event_mask::POINTER_MOTION) != 0
+                    || ((emask & protocol::event_mask::BUTTON_MOTION) != 0 && (state & 0x1f00) != 0)
+                    || ((emask & protocol::event_mask::BUTTON1_MOTION) != 0 && (state & 0x100) != 0)
+                    || ((emask & protocol::event_mask::BUTTON2_MOTION) != 0 && (state & 0x200) != 0)
+                    || ((emask & protocol::event_mask::BUTTON3_MOTION) != 0 && (state & 0x400) != 0)
+                    || ((emask & protocol::event_mask::BUTTON4_MOTION) != 0 && (state & 0x800) != 0)
+                    || ((emask & protocol::event_mask::BUTTON5_MOTION) != 0 && (state & 0x1000) != 0);
+                if deliver
                 {
+                    if (state & 0x1f00) != 0 {
+                        log::debug!("MotionNotify delivered: win=0x{:08x} ({},{}) state=0x{:04x} conn={} emask=0x{:08x}",
+                            window, x, y, state, conn_id, emask);
+                    }
                     if let Some(conn_ref) = server.connections.get(&conn_id) {
                         let conn = conn_ref.value();
                         let mut evt = events::EventBuilder::new(conn, protocol::event_type::MOTION_NOTIFY);
