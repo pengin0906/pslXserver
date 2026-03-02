@@ -352,12 +352,10 @@ unsafe extern "C" fn insert_text_replacement(this: *mut AnyObject, _sel: Sel, te
     // Set flag so view_key_down knows text was inserted
     let flag_ivar = (*this).class().instance_variable(c"textInserted").unwrap();
     *flag_ivar.load_mut::<u8>(&mut *this) = 1;
-    // If we were composing (IME active), suppress the keyUp for the confirmation key
-    let was_composing = crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed);
+    // Always suppress the next keyUp — ImeCommit already sends KeyPress+KeyRelease
+    // via send_ime_text, so the NS_KEY_UP handler's KeyRelease would be a duplicate.
     crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
-    if was_composing {
-        crate::display::SUPPRESS_NEXT_KEYUP.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
+    crate::display::SUPPRESS_NEXT_KEYUP.store(true, std::sync::atomic::Ordering::Relaxed);
 
     if text.is_null() { return; }
 
@@ -425,7 +423,9 @@ unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut
     *flag_ivar.load_mut::<u8>(&mut *this) = 1;
     crate::display::IME_COMPOSING.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    // Send preedit text to xterm for inline display
+    // Don't send preedit to xterm — macOS candidate window handles display.
+    // Only committed text (via insertText:) is sent to X11.
+    // Sending preedit as KeyPress+BS causes chaos in vi command mode.
     if !text.is_null() {
         let is_attr_str: bool = msg_send![&*text, isKindOfClass: objc2::class!(NSAttributedString)];
         let ns_string: *mut AnyObject = if is_attr_str {
@@ -437,33 +437,16 @@ unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut
             let utf8: *const std::os::raw::c_char = msg_send![&*ns_string, UTF8String];
             if !utf8.is_null() {
                 if let Ok(s) = std::ffi::CStr::from_ptr(utf8).to_str() {
-                    let preedit = s.to_string();
-                    let ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
-                    let x11_id = *ivar.load::<u32>(&*this) as crate::display::Xid;
-                    debug!("IME setMarkedText: preedit='{}' window=0x{:08x}", preedit, x11_id);
-                    send_display_event(DisplayEvent::ImePreeditDraw {
-                        window: x11_id,
-                        text: preedit,
-                        cursor_pos: 0,
-                    });
+                    debug!("IME setMarkedText: preedit='{}' (not sent to X11)", s);
                 }
             }
         }
     }
 }
 
-unsafe extern "C" fn unmark_text(this: *mut AnyObject, _sel: Sel) {
+unsafe extern "C" fn unmark_text(_this: *mut AnyObject, _sel: Sel) {
     crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
-    // Clear preedit display by sending empty preedit
-    if !this.is_null() {
-        let ivar = unsafe { (*this).class().instance_variable(c"x11WindowId").unwrap() };
-        let x11_id = unsafe { *ivar.load::<u32>(&*this) } as crate::display::Xid;
-        send_display_event(DisplayEvent::ImePreeditDraw {
-            window: x11_id,
-            text: String::new(),
-            cursor_pos: 0,
-        });
-    }
+    // No X11 events needed — preedit is displayed only in macOS candidate window.
 }
 
 unsafe extern "C" fn valid_attributes(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
