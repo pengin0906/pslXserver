@@ -3162,14 +3162,17 @@ async fn handle_open_font<S: AsyncRead + AsyncWrite + Unpin>(
     };
     debug!("OpenFont: 0x{:08X} '{}'", fid, name);
 
+    let is_2byte = name.contains("iso10646");
+    let (ascent, descent, char_width) = parse_xlfd_metrics(&name);
     let font = super::resources::FontState {
         id: fid,
         name,
-        ascent: 10,
-        descent: 3,
+        ascent,
+        descent,
         default_char: 0,
-        min_char_width: 6,
-        max_char_width: 6,
+        min_char_width: char_width,
+        max_char_width: char_width,
+        is_2byte,
     };
     server.resources.insert(fid, super::resources::Resource::Font(
         Arc::new(parking_lot::RwLock::new(font)),
@@ -3198,26 +3201,36 @@ async fn handle_query_font<S: AsyncRead + AsyncWrite + Unpin>(
     let seq = conn.current_request_sequence();
 
     // Build reply with font metrics
-    let (ascent, descent, min_char, max_char, max_width, default_char) = {
+    let (ascent, descent, max_width, default_char, is_2byte) = {
         if let Some(res) = server.resources.get(&fid) {
             if let super::resources::Resource::Font(font) = res.value() {
                 let f = font.read();
-                (f.ascent, f.descent, 32u16, 126u16, f.max_char_width, f.default_char)
+                (f.ascent, f.descent, f.max_char_width, f.default_char, f.is_2byte)
             } else {
-                (12, 3, 32u16, 126u16, 8, 0)
+                (12, 3, 8, 0, false)
             }
         } else {
-            (12, 3, 32u16, 126u16, 8, 0)
+            (12, 3, 8, 0, false)
         }
     };
 
-    let num_chars = (max_char - min_char + 1) as u32;
-    let num_properties = 0u16;
-    // Each CharInfo is 12 bytes
-    let char_info_size = num_chars * 12;
-    let _additional_len = (8 + char_info_size) / 4;
+    // 2-byte fonts (iso10646): report full BMP coverage
+    let (min_byte2, max_byte2, min_byte1, max_byte1) = if is_2byte {
+        (0u16, 255u16, 0u8, 255u8)
+    } else {
+        (32u16, 126u16, 0u8, 0u8)
+    };
 
-    let mut reply = Vec::with_capacity(60 + char_info_size as usize);
+    let num_chars = if is_2byte {
+        // 256 * 256 = 65536
+        65536u32
+    } else {
+        (max_byte2 - min_byte2 + 1) as u32
+    };
+
+    let num_properties = 0u16;
+
+    let mut reply = Vec::with_capacity(60 + (num_chars as usize) * 12);
     reply.push(1); // reply
     reply.push(0); // unused
     write_u16_to(conn, &mut reply, seq);
@@ -3245,13 +3258,13 @@ async fn handle_query_font<S: AsyncRead + AsyncWrite + Unpin>(
     // 4 bytes unused
     write_u32_to(conn, &mut reply, 0);
 
-    write_u16_to(conn, &mut reply, min_char); // min-char-or-byte2
-    write_u16_to(conn, &mut reply, max_char); // max-char-or-byte2
+    write_u16_to(conn, &mut reply, min_byte2); // min-char-or-byte2
+    write_u16_to(conn, &mut reply, max_byte2); // max-char-or-byte2
     write_u16_to(conn, &mut reply, default_char); // default-char
     write_u16_to(conn, &mut reply, num_properties);
     reply.push(0); // draw-direction (LeftToRight)
-    reply.push(0); // min-byte1
-    reply.push(0); // max-byte1
+    reply.push(min_byte1); // min-byte1
+    reply.push(max_byte1); // max-byte1
     reply.push(1); // all-chars-exist (true)
     write_i16_to(conn, &mut reply, ascent as i16);  // font-ascent
     write_i16_to(conn, &mut reply, descent as i16); // font-descent
@@ -4832,5 +4845,22 @@ fn lookup_x11_color(name: &str) -> Option<(u16, u16, u16)> {
     });
 
     db.get(name).copied()
+}
+
+fn parse_xlfd_metrics(name: &str) -> (i16, i16, i16) {
+    let default = (10i16, 3i16, 6i16);
+    if !name.starts_with('-') {
+        return default;
+    }
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() < 14 {
+        return default;
+    }
+    let pixel_size: i16 = parts[7].parse().unwrap_or(13);
+    let avg_width: i16 = parts[12].parse().unwrap_or(60);
+    let char_width = (avg_width + 5) / 10;
+    let ascent = (pixel_size * 3 + 2) / 4;
+    let descent = pixel_size - ascent;
+    (ascent, descent, char_width)
 }
 

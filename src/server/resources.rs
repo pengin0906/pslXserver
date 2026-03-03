@@ -288,6 +288,7 @@ pub struct FontState {
     pub max_char_width: i16,
     pub min_char_width: i16,
     pub default_char: u16,
+    pub is_2byte: bool,
 }
 
 /// Cursor state.

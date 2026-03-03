@@ -17,6 +17,8 @@ pub static IME_SPOT_LINE_H: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 pub static IME_COMPOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Flag: suppress the very next KeyRelease after IME commit (the confirmation key like Enter/Space).
 pub static SUPPRESS_NEXT_KEYUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Flag: true after space is pressed during IME composition (conversion started). Show preedit inline.
+pub static IME_CONVERTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Flag: suppress ConfigureNotify/Expose from setFrameSize when resize is initiated by X11 ConfigureWindow.
 /// Set by MoveResizeWindow handler before calling setFrame:display, cleared by setFrameSize or after.
 pub static SUPPRESS_RESIZE_EVENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
