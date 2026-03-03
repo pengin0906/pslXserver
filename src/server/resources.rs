@@ -46,6 +46,9 @@ pub struct WindowState {
     // Client event selections: (connection_id, event_mask)
     pub event_selections: Vec<(u32, u32)>,
 
+    // XI2 event selections: (connection_id, device_id, xi2_mask_bits)
+    pub xi2_event_selections: Vec<(u32, u16, u32)>,
+
     // State
     pub mapped: bool,
     pub viewable: bool,
@@ -100,6 +103,7 @@ impl WindowState {
             bit_gravity: 0,  // ForgetGravity
             win_gravity: 1,  // NorthWestGravity
             event_selections: Vec::new(),
+            xi2_event_selections: Vec::new(),
             mapped: false,
             viewable: false,
             properties: Vec::new(),

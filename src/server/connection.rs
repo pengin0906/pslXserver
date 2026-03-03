@@ -165,7 +165,7 @@ where
 
                 // Process all complete requests in the buffer
                 while pending.len() >= 4 {
-                    let request_len = {
+                    let (request_len, is_big_request) = {
                         let len = match byte_order {
                             ByteOrder::BigEndian => u16::from_be_bytes([pending[2], pending[3]]),
                             ByteOrder::LittleEndian => u16::from_le_bytes([pending[2], pending[3]]),
@@ -180,9 +180,9 @@ where
                                     pending[4], pending[5], pending[6], pending[7],
                                 ]),
                             };
-                            ext_len as usize * 4
+                            (ext_len as usize * 4, true)
                         } else {
-                            len as usize * 4
+                            (len as usize * 4, false)
                         }
                     };
 
@@ -193,7 +193,18 @@ where
                     info!("Request seq={} opcode={} len={} bytes", conn.current_request_sequence(), opcode, request_len);
                     let seq = conn.current_request_sequence();
 
-                    let request_data = pending.split_to(request_len);
+                    let raw_data = pending.split_to(request_len);
+                    // BIG-REQUESTS: bytes 4-7 are extended length, shift data
+                    // so handlers see the same layout as normal requests.
+                    // Reconstruct: header (bytes 0-3) + body (bytes 8+)
+                    let request_data: bytes::Bytes = if is_big_request {
+                        let mut normalized = bytes::BytesMut::with_capacity(4 + raw_data.len() - 8);
+                        normalized.extend_from_slice(&raw_data[..4]);
+                        normalized.extend_from_slice(&raw_data[8..]);
+                        normalized.freeze()
+                    } else {
+                        raw_data.freeze()
+                    };
 
                     match handle_request(&server, &conn, opcode, &request_data, &mut stream).await {
                         Ok(()) => {}
@@ -710,12 +721,29 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
             stream.write_all(&reply).await?;
             Ok(())
         }
+        133 => { // BIG-REQUESTS: BigReqEnable
+            let seq = conn.current_request_sequence();
+            let mut reply = Vec::with_capacity(32);
+            reply.push(1); // reply
+            reply.push(0); // unused
+            write_u16_to(conn, &mut reply, seq);
+            write_u32_to(conn, &mut reply, 0); // additional data length
+            // maximum-request-length in 4-byte units: 16MB worth
+            write_u32_to(conn, &mut reply, 4194304); // 4194304 * 4 = 16MB
+            reply.extend(std::iter::repeat(0).take(20)); // padding to 32
+            stream.write_all(&reply).await?;
+            info!("BIG-REQUESTS enabled: max request length = 16MB");
+            Ok(())
+        }
         // No-op for common requests that don't need replies
         5 | 6 | 11 | 13 | 28 | 29 | 30 | 33 | 34 | 51 | 57 | 58 | 59 |
         63 | 83 | 88 | 89 | 90 | 100 | 104 | 105 | 107 | 109 | 111 | 112 | 113 | 114 => {
             debug!("Stubbed opcode: {} (no-op)", opcode);
             Ok(())
         }
+        // Extension opcodes
+        131 => super::extensions::xinput2::handle_xinput2_request(server, conn, data, stream).await,
+        135 => super::extensions::xkb::handle_xkb_request(server, conn, data, stream).await,
         _ => {
             debug!("Unimplemented opcode: {}", opcode);
             Err(ServerError::NotImplemented)
@@ -1258,17 +1286,16 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
 
         if let Ok(handle) = rx.await {
             // Re-acquire lock to store handle and check for deferred WM_NAME
-            let (deferred_title, bg_pixel) = if let Some(res) = server.resources.get(&wid) {
+            let (deferred_title, bg_pixel_opt) = if let Some(res) = server.resources.get(&wid) {
                 if let super::resources::Resource::Window(win) = res.value() {
                     let mut w = win.write();
                     w.native_window = Some(handle.clone());
                     // If WM_NAME was already set before MapWindow, apply it now
                     let title = w.get_property(crate::server::atoms::predefined::WM_NAME)
                         .and_then(|p| std::str::from_utf8(&p.data).ok().map(|s| s.to_string()));
-                    let bg = w.background_pixel.unwrap_or(0xFFFFFF);
-                    (title, bg)
-                } else { (None, 0xFFFFFF) }
-            } else { (None, 0xFFFFFF) };
+                    (title, w.background_pixel)
+                } else { (None, None) }
+            } else { (None, None) };
             if let Some(title) = deferred_title {
                 let _ = server.display_cmd_tx.send(
                     crate::display::DisplayCommand::SetWindowTitle {
@@ -1277,20 +1304,21 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
                     },
                 );
             }
-            // Set background pixel for resize fill color
-            let _ = server.display_cmd_tx.send(
-                crate::display::DisplayCommand::SetWindowBackgroundPixel {
-                    handle: handle.clone(),
-                    pixel: bg_pixel,
-                },
-            );
+            // Only set background pixel for resize fill if explicitly defined
+            if let Some(bg_pixel) = bg_pixel_opt {
+                let _ = server.display_cmd_tx.send(
+                    crate::display::DisplayCommand::SetWindowBackgroundPixel {
+                        handle: handle.clone(),
+                        pixel: bg_pixel,
+                    },
+                );
+            }
             let _ = server.display_cmd_tx.send(
                 crate::display::DisplayCommand::ShowWindow { handle },
             );
-
-            // Clear the window and all mapped children with their background_pixel.
-            // This ensures the IOSurface has correct background before client draws.
-            clear_window_tree(server, wid);
+            // No server-side background clear here — the IOSurface is already
+            // initialized (black) and the window show is deferred until the first
+            // client render frame. The client fills its own background via Expose.
         }
     }
 
@@ -1327,18 +1355,11 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
         let child_info = if let Some(res) = server.resources.get(&child_id) {
             if let super::resources::Resource::Window(win) = res.value() {
                 let w = win.read();
-                if w.mapped { Some((w.width, w.height, w.background_pixel.unwrap_or(0))) } else { None }
+                if w.mapped { Some((w.width, w.height)) } else { None }
             } else { None }
         } else { None };
-        if let Some((cw, ch, _bg)) = child_info {
+        if let Some((cw, ch)) = child_info {
             if cw > 0 && ch > 0 {
-                // Clear child window too (deferred from before MapWindow)
-                dispatch_render_commands(server, child_id, vec![
-                    crate::display::RenderCommand::ClearArea {
-                        x: 0, y: 0, width: cw, height: ch,
-                        bg_color: _bg,
-                    }
-                ]);
                 let mut child_expose = super::events::build_expose_event(conn, child_id, 0, 0, cw, ch, 0);
                 set_event_sequence(conn, &mut child_expose, seq);
                 let _ = conn.event_tx.send(child_expose);
@@ -1889,36 +1910,42 @@ async fn handle_free_gc<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Clear a window and all its mapped children with their background_pixel.
 /// Called after MapWindow creates the native surface, so deferred ClearAreas work.
+/// X11 spec: Only clear windows that have a defined background (background_pixel set).
+/// Windows with background=None have undefined contents — server must NOT fill them.
 fn clear_window_tree(server: &Arc<XServer>, wid: u32) {
     let info = if let Some(res) = server.resources.get(&wid) {
         if let super::resources::Resource::Window(win) = res.value() {
             let w = win.read();
-            Some((w.width, w.height, w.background_pixel.unwrap_or(0), w.children.clone()))
+            Some((w.width, w.height, w.background_pixel, w.children.clone()))
         } else { None }
     } else { None };
 
-    if let Some((width, height, bg, children)) = info {
-        dispatch_render_commands(server, wid, vec![
-            crate::display::RenderCommand::ClearArea {
-                x: 0, y: 0, width, height, bg_color: bg,
-            }
-        ]);
-        // Clear mapped children too
+    if let Some((width, height, bg_opt, children)) = info {
+        // Only clear if background_pixel is explicitly set
+        if let Some(bg) = bg_opt {
+            dispatch_render_commands(server, wid, vec![
+                crate::display::RenderCommand::ClearArea {
+                    x: 0, y: 0, width, height, bg_color: bg,
+                }
+            ]);
+        }
+        // Clear mapped children that have a defined background
         for child_id in children {
             if let Some(res) = server.resources.get(&child_id) {
                 if let super::resources::Resource::Window(win) = res.value() {
                     let w = win.read();
                     if w.mapped {
-                        let bg = w.background_pixel.unwrap_or(0);
-                        let cw = w.width;
-                        let ch = w.height;
-                        drop(w);
-                        drop(res);
-                        dispatch_render_commands(server, child_id, vec![
-                            crate::display::RenderCommand::ClearArea {
-                                x: 0, y: 0, width: cw, height: ch, bg_color: bg,
-                            }
-                        ]);
+                        if let Some(bg) = w.background_pixel {
+                            let cw = w.width;
+                            let ch = w.height;
+                            drop(w);
+                            drop(res);
+                            dispatch_render_commands(server, child_id, vec![
+                                crate::display::RenderCommand::ClearArea {
+                                    x: 0, y: 0, width: cw, height: ch, bg_color: bg,
+                                }
+                            ]);
+                        }
                     }
                 }
             }
@@ -2335,13 +2362,14 @@ async fn handle_clear_area<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     };
 
-    // ClearArea: use background_pixel if set, otherwise default to black (0).
-    // X11 spec says None = do nothing, but many apps (xterm) rely on ClearArea always working.
-    let bg_color = bg_color_opt.unwrap_or(0);
-    let command = crate::display::RenderCommand::ClearArea {
-        x, y, width, height, bg_color,
-    };
-    dispatch_render_commands(server, wid, vec![command]);
+    // X11 spec: If background is None, ClearArea has no effect on window contents.
+    // If background is defined, fill with it. Either way, Expose events still fire below.
+    if let Some(bg_color) = bg_color_opt {
+        let command = crate::display::RenderCommand::ClearArea {
+            x, y, width, height, bg_color,
+        };
+        dispatch_render_commands(server, wid, vec![command]);
+    }
 
     // X11 spec: ClearArea with exposures=true generates Expose events.
     // This tells the client to redraw the cleared region.
@@ -2378,8 +2406,8 @@ async fn handle_copy_area<S: AsyncRead + AsyncWrite + Unpin>(
     let width = read_u16(conn, &data[24..26]);
     let height = read_u16(conn, &data[26..28]);
 
-    debug!("CopyArea: src=0x{:08X} dst=0x{:08X} gc=0x{:08X} ({},{}) -> ({},{}) {}x{}",
-           src_drawable, dst_drawable, gcid, src_x, src_y, dst_x, dst_y, width, height);
+    // debug!("CopyArea: src=0x{:08X} dst=0x{:08X} gc=0x{:08X} ({},{}) -> ({},{}) {}x{}",
+    //        src_drawable, dst_drawable, gcid, src_x, src_y, dst_x, dst_y, width, height);
 
     // Read GC properties
     let (graphics_exposures, gc_function) = if let Some(res) = server.resources.get(&gcid) {
@@ -2764,8 +2792,8 @@ async fn handle_poly_fill_arc<S: AsyncRead + AsyncWrite + Unpin>(
         let angle2 = read_i16(conn, &data[offset+10..offset+12]);
         offset += 12;
 
-        debug!("PolyFillArc: drawable=0x{:08X} gc=0x{:08X} ({},{} {}x{}) a1={} a2={} color=0x{:06X}",
-              drawable, gcid, x, y, width, height, angle1, angle2, fg_color);
+        // debug!("PolyFillArc: drawable=0x{:08X} gc=0x{:08X} ({},{} {}x{}) a1={} a2={} color=0x{:06X}",
+        //       drawable, gcid, x, y, width, height, angle1, angle2, fg_color);
 
         commands.push(crate::display::RenderCommand::FillArc {
             x, y, width, height, angle1, angle2,
@@ -2803,7 +2831,7 @@ async fn handle_put_image<S: AsyncRead + AsyncWrite + Unpin>(
         } else { 3 }
     } else { 3 };
 
-    debug!("PutImage: drawable=0x{:08X} {}x{} at ({},{}) depth={} format={}", drawable, width, height, dst_x, dst_y, depth, format);
+    // debug!("PutImage: drawable=0x{:08X} {}x{} at ({},{}) depth={} format={}", drawable, width, height, dst_x, dst_y, depth, format);
     let image_data = data[24..].to_vec();
 
     // Track PutImage position as IME cursor hint (xterm Xft renders glyphs via PutImage)
@@ -3047,17 +3075,26 @@ async fn handle_query_extension<S: AsyncRead + AsyncWrite + Unpin>(
 
     let seq = conn.current_request_sequence();
 
-    // For now, report no extensions present
-    // TODO: implement BIG-REQUESTS, RENDER, etc.
+    let extensions = super::extensions::supported_extensions();
+    let found = extensions.iter().find(|e| e.name == name);
+
     let mut reply = Vec::with_capacity(32);
     reply.push(1); // reply
     reply.push(0);
     write_u16_to(conn, &mut reply, seq);
     write_u32_to(conn, &mut reply, 0); // additional data
-    reply.push(0); // present (false)
-    reply.push(0); // major opcode
-    reply.push(0); // first event
-    reply.push(0); // first error
+    if let Some(ext) = found {
+        debug!("QueryExtension: '{}' -> present, opcode={}", name, ext.major_opcode);
+        reply.push(1); // present (true)
+        reply.push(ext.major_opcode);
+        reply.push(ext.first_event);
+        reply.push(ext.first_error);
+    } else {
+        reply.push(0); // present (false)
+        reply.push(0); // major opcode
+        reply.push(0); // first event
+        reply.push(0); // first error
+    }
     reply.extend(std::iter::repeat(0).take(20)); // padding
 
     stream.write_all(&reply).await?;
@@ -3381,13 +3418,26 @@ async fn handle_list_extensions<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
 ) -> Result<(), ServerError> {
     let seq = conn.current_request_sequence();
-    // Return empty extension list for now
-    let mut reply = Vec::with_capacity(32);
+    let extensions = super::extensions::supported_extensions();
+
+    // Build names body: each name is 1-byte length + name bytes
+    let mut names_body = Vec::new();
+    for ext in &extensions {
+        names_body.push(ext.name.len() as u8);
+        names_body.extend_from_slice(ext.name.as_bytes());
+    }
+    // Pad to 4-byte boundary
+    while names_body.len() % 4 != 0 {
+        names_body.push(0);
+    }
+
+    let mut reply = Vec::with_capacity(32 + names_body.len());
     reply.push(1); // reply
-    reply.push(0); // number of extensions
+    reply.push(extensions.len() as u8); // number of STRs
     write_u16_to(conn, &mut reply, seq);
-    write_u32_to(conn, &mut reply, 0); // additional data length
+    write_u32_to(conn, &mut reply, (names_body.len() / 4) as u32);
     reply.extend(std::iter::repeat(0).take(24)); // padding
+    reply.extend_from_slice(&names_body);
     stream.write_all(&reply).await?;
     Ok(())
 }
@@ -3461,7 +3511,7 @@ async fn handle_change_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Map macOS virtual keycode to X11 keysym (normal, shifted).
 /// macOS keycodes: https://developer.apple.com/documentation/carbon/1543661-summary_of_virtual_key_codes
-fn macos_keycode_to_keysym(mac_key: u32) -> (u32, u32) {
+pub(crate) fn macos_keycode_to_keysym(mac_key: u32) -> (u32, u32) {
     match mac_key {
         // Letters (macOS layout: ANSI US)
         0  => (0x0061, 0x0041), // a A
@@ -4566,7 +4616,7 @@ fn set_event_sequence(conn: &ClientConnection, event: &mut [u8], seq: u16) {
 
 // --- Byte order aware read/write helpers ---
 
-fn read_u16(conn: &ClientConnection, data: &[u8]) -> u16 {
+pub(crate) fn read_u16(conn: &ClientConnection, data: &[u8]) -> u16 {
     match conn.byte_order {
         ByteOrder::BigEndian => u16::from_be_bytes([data[0], data[1]]),
         ByteOrder::LittleEndian => u16::from_le_bytes([data[0], data[1]]),
@@ -4580,14 +4630,14 @@ fn read_i16(conn: &ClientConnection, data: &[u8]) -> i16 {
     }
 }
 
-fn read_u32(conn: &ClientConnection, data: &[u8]) -> u32 {
+pub(crate) fn read_u32(conn: &ClientConnection, data: &[u8]) -> u32 {
     match conn.byte_order {
         ByteOrder::BigEndian => u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
         ByteOrder::LittleEndian => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
     }
 }
 
-fn write_u16_to(conn: &ClientConnection, buf: &mut Vec<u8>, val: u16) {
+pub(crate) fn write_u16_to(conn: &ClientConnection, buf: &mut Vec<u8>, val: u16) {
     match conn.byte_order {
         ByteOrder::BigEndian => buf.extend_from_slice(&val.to_be_bytes()),
         ByteOrder::LittleEndian => buf.extend_from_slice(&val.to_le_bytes()),
@@ -4712,7 +4762,7 @@ fn write_i16_to(conn: &ClientConnection, buf: &mut Vec<u8>, val: i16) {
     }
 }
 
-fn write_u32_to(conn: &ClientConnection, buf: &mut Vec<u8>, val: u32) {
+pub(crate) fn write_u32_to(conn: &ClientConnection, buf: &mut Vec<u8>, val: u32) {
     match conn.byte_order {
         ByteOrder::BigEndian => buf.extend_from_slice(&val.to_be_bytes()),
         ByteOrder::LittleEndian => buf.extend_from_slice(&val.to_le_bytes()),
@@ -4783,3 +4833,4 @@ fn lookup_x11_color(name: &str) -> Option<(u16, u16, u16)> {
 
     db.get(name).copied()
 }
+

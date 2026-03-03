@@ -235,7 +235,7 @@ pub fn render_to_buffer(
         }
         RenderCommand::DrawText { x, y, text, font_id: _, color, bg_color, gc_function } => {
             if *gc_function == 5 { return; } // GXnoop
-            log::debug!("DrawText at ({},{}) len={} fg=0x{:06X} bg={:?}", x, y, text.len(), color, bg_color);
+            // log::debug!("DrawText at ({},{}) len={} fg=0x{:06X} bg={:?}", x, y, text.len(), color, bg_color);
             draw_text_bitmap(buffer, width, height, stride,
                               *x, *y, text, *color, *bg_color);
         }

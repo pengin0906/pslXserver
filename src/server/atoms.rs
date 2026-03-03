@@ -200,6 +200,11 @@ impl AtomTable {
         Some(id)
     }
 
+    /// Intern an atom, always creating it if it doesn't exist. Returns the atom ID.
+    pub fn intern_or_create(&self, name: &str) -> u32 {
+        self.intern(name, false).unwrap()
+    }
+
     /// Get the name of an atom by its ID.
     pub fn get_name(&self, id: u32) -> Option<String> {
         self.id_to_name.get(&id).map(|v| v.clone())

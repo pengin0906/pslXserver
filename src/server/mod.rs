@@ -5,7 +5,7 @@ pub mod extensions;
 pub mod protocol;
 pub mod resources;
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -117,6 +117,8 @@ pub struct XServer {
     pub virtual_keysyms: parking_lot::RwLock<Vec<u32>>,
     /// Flag: server is waiting for X11 selection data to copy to macOS clipboard.
     pub pending_clipboard_copy: AtomicBool,
+    /// Current keyboard modifier state (updated on each key event).
+    pub modifier_state: AtomicU16,
     /// Available font names (XLFD) loaded from fonts.dir/fonts.alias files.
     pub font_names: Vec<String>,
 }
@@ -198,6 +200,7 @@ impl XServer {
             children: Vec::new(),
             properties: Vec::new(),
             event_selections: Vec::new(),
+            xi2_event_selections: Vec::new(),
             native_window: None,
             backing_buffer: None,
             ime_spot: None,
@@ -227,6 +230,7 @@ impl XServer {
             focus_revert_to: AtomicU32::new(1), // PointerRoot
             virtual_keysyms: parking_lot::RwLock::new(Vec::new()),
             pending_clipboard_copy: AtomicBool::new(false),
+            modifier_state: AtomicU16::new(0),
             font_names: Self::load_font_names(),
         }
     }
@@ -508,9 +512,11 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 send_motion_event(&server, target, cx, cy, root_x, root_y, state, time);
             }
             DisplayEvent::KeyPress { window, keycode, state, time } => {
+                server.modifier_state.store(state, Ordering::Relaxed);
                 send_key_event(&server, protocol::event_type::KEY_PRESS, window, keycode, state, time);
             }
             DisplayEvent::KeyRelease { window, keycode, state, time } => {
+                server.modifier_state.store(state, Ordering::Relaxed);
                 send_key_event(&server, protocol::event_type::KEY_RELEASE, window, keycode, state, time);
             }
             DisplayEvent::ImeCommit { window, text } => {
@@ -764,7 +770,7 @@ fn send_key_event(
     let mut current = target;
     for _ in 0..32 {
         if current == 0 { break; }
-        let (found_conn, parent) = if let Some(res) = server.resources.get(&current) {
+        let (found_conn, parent, xi2_sels) = if let Some(res) = server.resources.get(&current) {
             if let Resource::Window(win) = res.value() {
                 let w = win.read();
                 let mut found = None;
@@ -774,9 +780,29 @@ fn send_key_event(
                         break;
                     }
                 }
-                (found, w.parent)
-            } else { (None, 0) }
-        } else { (None, 0) };
+                (found, w.parent, w.xi2_event_selections.clone())
+            } else { (None, 0, Vec::new()) }
+        } else { (None, 0, Vec::new()) };
+
+        // Send XI2 GenericEvent to connections that selected XI2 key events on this window
+        let xi2_evtype = match event_type {
+            protocol::event_type::KEY_PRESS => extensions::xinput2::XI_KEY_PRESS,
+            _ => extensions::xinput2::XI_KEY_RELEASE,
+        };
+        let xi2_mask_bit = 1u32 << xi2_evtype;
+        for &(conn_id, _deviceid, mask) in &xi2_sels {
+            if (mask & xi2_mask_bit) != 0 {
+                if let Some(conn_ref) = server.connections.get(&conn_id) {
+                    let conn = conn_ref.value();
+                    let xi2_evt = extensions::xinput2::build_xi2_key_event(
+                        conn, xi2_evtype, keycode, time,
+                        server.screens[0].root_window, current, 0,
+                        0, 0, 0, 0, state,
+                    );
+                    let _ = conn.event_tx.send(xi2_evt);
+                }
+            }
+        }
 
         if let Some(conn_id) = found_conn {
             if let Some(conn_ref) = server.connections.get(&conn_id) {

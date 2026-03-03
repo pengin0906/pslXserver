@@ -117,6 +117,10 @@ struct WindowInfo {
     /// X11 background pixel color (BGRA). Used to fill new areas during resize
     /// instead of white, matching XQuartz's behavior of preserving content with gravity.
     background_pixel: u32,
+    /// Deferred show: window is made visible on the first render frame,
+    /// so the client's initial drawing is already in the IOSurface before
+    /// the window appears. Prevents the background-color flash on startup.
+    pending_show: bool,
 }
 
 impl Drop for WindowInfo {
@@ -948,6 +952,45 @@ fn check_window_resizes() {
     }
 }
 
+/// Drop redundant full-window PutImage commands. When Electron sends many
+/// full-screen frames in a single batch, only the last full-screen PutImage
+/// matters since it overwrites the entire surface. Non-PutImage commands and
+/// partial PutImage commands are preserved.
+fn coalesce_putimage(commands: Vec<crate::display::RenderCommand>, win_w: u32, win_h: u32) -> Vec<crate::display::RenderCommand> {
+    if commands.len() < 2 { return commands; }
+
+    // Find the index of the last full-window PutImage
+    let mut last_full_idx: Option<usize> = None;
+    for (i, cmd) in commands.iter().enumerate() {
+        if let crate::display::RenderCommand::PutImage { x, y, width, height, .. } = cmd {
+            if *x == 0 && *y == 0 && *width as u32 >= win_w && *height as u32 >= win_h {
+                last_full_idx = Some(i);
+            }
+        }
+    }
+
+    if let Some(last_idx) = last_full_idx {
+        // Count how many full PutImages we're dropping
+        let mut dropped = 0usize;
+        let result: Vec<_> = commands.into_iter().enumerate().filter(|(i, cmd)| {
+            if *i == last_idx { return true; } // keep the last one
+            if let crate::display::RenderCommand::PutImage { x, y, width, height, .. } = cmd {
+                if *x == 0 && *y == 0 && *width as u32 >= win_w && *height as u32 >= win_h {
+                    dropped += 1;
+                    return false; // drop earlier full-screen PutImage
+                }
+            }
+            true // keep everything else
+        }).map(|(_, cmd)| cmd).collect();
+        if dropped > 0 {
+            log::debug!("coalesce_putimage: dropped {} redundant full-screen frames", dropped);
+        }
+        result
+    } else {
+        commands
+    }
+}
+
 fn process_commands() {
     // 1. Process non-render commands from channel (CreateWindow, ShowWindow, etc.)
     let cmds: Vec<DisplayCommand> = CMD_RX.with(|rx| {
@@ -1086,19 +1129,9 @@ fn process_commands() {
     // 3. Render merged batches — one lock/render/flush per window
     if !render_batches.is_empty() {
         WINDOWS.with(|w| {
-            let ws = w.borrow();
+            let mut ws = w.borrow_mut();
             for (win_id, commands) in render_batches {
-                if let Some(info) = ws.get(&win_id) {
-                    debug!("Render: win={} cmds={} surface={}x{}", win_id, commands.len(), info.width, info.height);
-                    // Process all commands — no frame coalescing.
-                    // Each command is a simple buffer operation (memcpy/fill),
-                    // fast enough even for thousands of commands per frame.
-
-                    #[cfg(debug_assertions)]
-                    if commands.len() > 5000 {
-                        debug!("win={} coalesce to {}", win_id, commands.len());
-                    }
-
+                if let Some(info) = ws.get_mut(&win_id) {
                     let lock_result = unsafe { IOSurfaceLock(info.surface, 0, std::ptr::null_mut()) };
                     if lock_result != 0 { continue; }
 
@@ -1111,15 +1144,31 @@ fn process_commands() {
                     let width = info.width as u32;
                     let height = info.height as u32;
                     let stride = bytes_per_row as u32;
+
+                    // Drop redundant full-window PutImage frames — keep only the last one.
+                    // Electron/Chromium sends many full-screen PutImage per frame; only the
+                    // final one matters since each overwrites the entire surface.
+                    let commands = coalesce_putimage(commands, width, height);
+
                     for c in &commands {
                         render_to_buffer(buffer, width, height, stride, c);
                     }
 
                     unsafe { IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut()); }
                     flush_window(info);
+
+                    // Deferred show: make window visible after the first render
+                    // so the client's drawing is already in the surface.
+                    if info.pending_show {
+                        info.pending_show = false;
+                        let mtm = MainThreadMarker::new().unwrap();
+                        let app = NSApplication::sharedApplication(mtm);
+                        unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
+                        info.window.makeKeyAndOrderFront(None);
+                    }
                 }
             }
-            // Force immediate compositing so resize updates are visible in real-time
+            // Force immediate compositing
             ca_transaction_flush();
         });
     }
@@ -1198,6 +1247,24 @@ fn handle_command(cmd: DisplayCommand) {
                 return;
             }
 
+            // Fill IOSurface with opaque black (0xFF000000 BGRA) before attaching to CALayer.
+            // Without this, the IOSurface is transparent and the NSWindow's white background
+            // shows through until the client draws, causing a visible white flash on startup.
+            unsafe {
+                IOSurfaceLock(surface, 0, std::ptr::null_mut());
+                let base = IOSurfaceGetBaseAddress(surface) as *mut u8;
+                let stride = IOSurfaceGetBytesPerRow(surface);
+                let h = height as usize;
+                let w = width as usize;
+                for row in 0..h {
+                    let row_ptr = base.add(row * stride) as *mut u32;
+                    for col in 0..w {
+                        *row_ptr.add(col) = 0xFF000000; // opaque black (BGRA)
+                    }
+                }
+                IOSurfaceUnlock(surface, 0, std::ptr::null_mut());
+            }
+
             // Calculate initial X11 screen position from actual macOS window position
             let (x11_x, x11_y) = macos_frame_to_x11_pos(&window);
 
@@ -1247,7 +1314,7 @@ fn handle_command(cmd: DisplayCommand) {
             }
 
             WINDOWS.with(|w| {
-                w.borrow_mut().insert(id, WindowInfo { window, surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF });
+                w.borrow_mut().insert(id, WindowInfo { window, surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF, pending_show: false });
             });
 
             info!("Created window {} for X11 0x{:08X} ({}x{}) [IOSurface]", id, x11_id, width, height);
@@ -1256,12 +1323,11 @@ fn handle_command(cmd: DisplayCommand) {
 
         DisplayCommand::ShowWindow { handle } => {
             WINDOWS.with(|w| {
-                if let Some(info) = w.borrow().get(&handle.id) {
-                    // Activate app and bring window to front
-                    let mtm = MainThreadMarker::new().unwrap();
-                    let app = NSApplication::sharedApplication(mtm);
-                    unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
-                    info.window.makeKeyAndOrderFront(None);
+                if let Some(info) = w.borrow_mut().get_mut(&handle.id) {
+                    // Defer actual show until first render frame so the client's
+                    // initial drawing is already in the IOSurface before the window
+                    // becomes visible. This eliminates the background flash on startup.
+                    info.pending_show = true;
                 }
             });
         }
@@ -1413,11 +1479,9 @@ fn get_ns_cursor(cursor_type: u8) -> *mut AnyObject {
     }
 }
 
+/// Inner flush: update CALayer contents without managing CATransaction.
 /// Set IOSurface directly as CALayer contents — zero-copy, no color space conversion.
-/// With wantsUpdateLayer=YES + layerContentsRedrawPolicy=Never, AppKit won't overwrite.
-/// nil→surface transition forces CALayer to re-read even for the same IOSurface pointer.
-/// Wrapped in explicit CATransaction to prevent momentary white flash between nil and set
-/// (NSWindow background shows through transparent CALayer when contents=nil).
+/// nil→surface cycle forces CALayer to re-read the IOSurface backing store.
 fn flush_window(info: &WindowInfo) {
     unsafe {
         if info.width == 0 || info.height == 0 || info.surface.is_null() { return; }
