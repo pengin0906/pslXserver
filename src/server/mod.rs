@@ -406,7 +406,8 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
     info!("Event dispatch task started");
     let mut focused_window: Xid = 0;
     let mut entered_window: Xid = 0;
-    let mut preedit_char_count: usize = 0;
+    let mut preedit_char_count: usize = 0; // char count for ImeCommit/Done BS
+    let mut preedit_col_count: usize = 0;  // col count for ImePreeditDraw BS
     // Implicit pointer grab: when a button is pressed, the target window
     // receives all subsequent MotionNotify/ButtonRelease until all buttons are released.
     // This is essential for xterm text selection + scroll-back.
@@ -525,8 +526,9 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     info!("ImeCommit: erasing {} preedit chars first", preedit_char_count);
                     send_backspaces(&server, window, preedit_char_count);
                     preedit_char_count = 0;
+                    preedit_col_count = 0;
                 }
-                send_ime_text(&server, window, &text);
+                send_ime_text(&server, window, &text).await;
             }
             DisplayEvent::ImePreeditDraw { window, text, .. } => {
                 // Erase old preedit, then send new preedit as temporary characters
@@ -536,15 +538,17 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 let new_count = text.chars().count();
                 if !text.is_empty() {
                     info!("ImePreeditDraw: showing '{}' ({} chars, was {})", text, new_count, preedit_char_count);
-                    send_ime_text(&server, window, &text);
+                    send_ime_text(&server, window, &text).await;
                 }
                 preedit_char_count = new_count;
+                preedit_col_count = preedit_display_cols(&text);
             }
             DisplayEvent::ImePreeditDone { window } => {
                 if preedit_char_count > 0 {
                     info!("ImePreeditDone: erasing {} preedit chars", preedit_char_count);
                     send_backspaces(&server, window, preedit_char_count);
                     preedit_char_count = 0;
+                    preedit_col_count = 0;
                 }
             }
             DisplayEvent::Expose { window, x, y, width, height, count } => {
@@ -830,7 +834,7 @@ fn send_key_event(
 ///   and converts the Unicode keysym directly to UTF-8
 ///
 /// Requires xterm to be launched with UTF-8 locale (LANG=ja_JP.UTF-8).
-fn send_ime_text(server: &XServer, window: Xid, text: &str) {
+async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     const VIRTUAL_BASE: u8 = 200;
     info!("send_ime_text: window=0x{:08x} text='{}'", window, text);
 
@@ -893,9 +897,10 @@ fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     let mut char_keys: Vec<(u8, u16)> = Vec::with_capacity(chars.len());
     const MAX_VIRTUAL: usize = 55;
 
+    let new_keysyms_added;
     {
         let mut vk = server.virtual_keysyms.write();
-        vk.clear();
+        let prev_len = vk.len();
         for &ch in &chars {
             let ch = if ch >= '\u{FF01}' && ch <= '\u{FF5E}' {
                 char::from_u32(ch as u32 - 0xFF01 + 0x0021).unwrap_or(ch)
@@ -911,29 +916,43 @@ fn send_ime_text(server: &XServer, window: Xid, text: &str) {
                 let keycode = ascii_to_x11_keycode(ch as u32);
                 let state = if needs_shift(ch) { 0x0001u16 } else { 0u16 };
                 char_keys.push((keycode, state));
-            } else if virtual_idx < MAX_VIRTUAL {
+            } else if vk.len() < MAX_VIRTUAL {
                 let keysym = 0x01000000 | (ch as u32);
+                // Reuse existing slot if this keysym was registered before
+                let slot = if let Some(pos) = vk.iter().position(|&k| k == keysym) {
+                    pos
+                } else {
+                    let pos = vk.len();
+                    vk.push(keysym);
+                    pos
+                };
                 info!("send_ime_text: char '{}' U+{:04X} → keysym 0x{:08X} on keycode {}",
-                    ch, ch as u32, keysym, VIRTUAL_BASE + virtual_idx as u8);
-                vk.push(keysym);
-                char_keys.push((VIRTUAL_BASE + virtual_idx as u8, 0));
+                    ch, ch as u32, keysym, VIRTUAL_BASE + slot as u8);
+                char_keys.push((VIRTUAL_BASE + slot as u8, 0));
                 virtual_idx += 1;
             }
         }
+        new_keysyms_added = vk.len() > prev_len;
     }
+    let total_virtual = server.virtual_keysyms.read().len();
 
-    // Send MappingNotify covering all virtual keycodes used
-    if virtual_idx > 0 {
-        info!("send_ime_text: {} Unicode keysyms on virtual keycodes (200..{})", virtual_idx, 200 + virtual_idx);
+    // Send MappingNotify only when new keysyms were added (avoids unnecessary round-trips)
+    if new_keysyms_added {
+        info!("send_ime_text: {} total keysyms on virtual keycodes (200..{})", total_virtual, 200 + total_virtual);
         for conn_entry in server.connections.iter() {
             let c = conn_entry.value();
             let mut mapping_notify = [0u8; 32];
-            mapping_notify[0] = 34; // MappingNotify
-            mapping_notify[4] = 1;  // request = Keyboard
-            mapping_notify[5] = VIRTUAL_BASE;
-            mapping_notify[6] = virtual_idx as u8;
+            mapping_notify[0] = 34; // MappingNotify type
+            // [1] = 0 (unused per X11 wire protocol)
+            // [2-3] = 0 (sequence number)
+            mapping_notify[4] = 1;  // request = MappingKeyboard (1)
+            mapping_notify[5] = VIRTUAL_BASE;        // first_keycode = 200
+            mapping_notify[6] = total_virtual as u8; // count
             let _ = c.event_tx.send(mapping_notify.to_vec());
         }
+        // Give clients time to process MappingNotify and refresh their keyboard map
+        // (XkbGetMap/GetKeyboardMapping round-trip must complete before we send KeyPress)
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     }
 
     // Send KeyPress + KeyRelease for each character
@@ -952,6 +971,26 @@ fn send_ime_text(server: &XServer, window: Xid, text: &str) {
         );
         let _ = conn.event_tx.send(release);
     }
+}
+
+/// Compute the display column width of a preedit string.
+/// Wide (CJK) characters occupy 2 columns; narrow chars occupy 1.
+#[allow(dead_code)]
+fn preedit_display_cols(text: &str) -> usize {
+    text.chars().map(|c| {
+        let cp = c as u32;
+        let wide = matches!(cp,
+            0x1100..=0x115F | 0x2329 | 0x232A |
+            0x2E80..=0x303E | 0x3040..=0x33FF |
+            0x3400..=0x4DBF | 0x4E00..=0xA4C6 |
+            0xA960..=0xA97C | 0xAC00..=0xD7A3 |
+            0xF900..=0xFAFF | 0xFE10..=0xFE19 |
+            0xFE30..=0xFE6B | 0xFF01..=0xFF60 |
+            0xFFE0..=0xFFE6 | 0x1B000..=0x1B001 |
+            0x20000..=0x2FFFD | 0x30000..=0x3FFFD
+        );
+        if wide { 2 } else { 1 }
+    }).sum()
 }
 
 /// Send `count` BackSpace key events to erase preedit text.

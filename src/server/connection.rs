@@ -3160,7 +3160,7 @@ async fn handle_open_font<S: AsyncRead + AsyncWrite + Unpin>(
     } else {
         "unknown".to_string()
     };
-    debug!("OpenFont: 0x{:08X} '{}'", fid, name);
+    info!("OpenFont: 0x{:08X} '{}' is_2byte={}", fid, name, name.contains("iso10646"));
 
     let is_2byte = name.contains("iso10646");
     let (ascent, descent, char_width) = parse_xlfd_metrics(&name);
@@ -3221,9 +3221,11 @@ async fn handle_query_font<S: AsyncRead + AsyncWrite + Unpin>(
         (32u16, 126u16, 0u8, 0u8)
     };
 
+    // For 2-byte fonts, set num_chars=0 when min-bounds == max-bounds
+    // (X11 spec: "If min-bounds equals max-bounds, zero char-infos are returned")
+    // This avoids sending 65536×12=786KB of identical CharInfo data.
     let num_chars = if is_2byte {
-        // 256 * 256 = 65536
-        65536u32
+        0u32
     } else {
         (max_byte2 - min_byte2 + 1) as u32
     };
@@ -3236,23 +3238,30 @@ async fn handle_query_font<S: AsyncRead + AsyncWrite + Unpin>(
     write_u16_to(conn, &mut reply, seq);
     write_u32_to(conn, &mut reply, 7 + num_properties as u32 + num_chars * 3); // additional data (in 4-byte units)
 
+    // min-bounds = max-bounds (same metrics for all characters)
+    let lsb: i16 = 0;
+    let rsb: i16 = max_width as i16;
+    let cw: i16 = max_width as i16;
+    let asc: i16 = ascent as i16;
+    let desc: i16 = -(descent as i16);
+
     // min-bounds (CharInfo: 12 bytes)
-    write_i16_to(conn, &mut reply, 0);  // left-side-bearing
-    write_i16_to(conn, &mut reply, 0);  // right-side-bearing
-    write_i16_to(conn, &mut reply, max_width as i16); // character-width
-    write_i16_to(conn, &mut reply, ascent as i16);    // ascent
-    write_i16_to(conn, &mut reply, -(descent as i16)); // descent
+    write_i16_to(conn, &mut reply, lsb);
+    write_i16_to(conn, &mut reply, rsb);
+    write_i16_to(conn, &mut reply, cw);
+    write_i16_to(conn, &mut reply, asc);
+    write_i16_to(conn, &mut reply, desc);
     write_u16_to(conn, &mut reply, 0);  // attributes
 
     // 4 bytes unused
     write_u32_to(conn, &mut reply, 0);
 
-    // max-bounds (CharInfo: 12 bytes)
-    write_i16_to(conn, &mut reply, 0);
-    write_i16_to(conn, &mut reply, max_width as i16);
-    write_i16_to(conn, &mut reply, max_width as i16);
-    write_i16_to(conn, &mut reply, ascent as i16);
-    write_i16_to(conn, &mut reply, -(descent as i16));
+    // max-bounds (CharInfo: 12 bytes) — same as min-bounds
+    write_i16_to(conn, &mut reply, lsb);
+    write_i16_to(conn, &mut reply, rsb);
+    write_i16_to(conn, &mut reply, cw);
+    write_i16_to(conn, &mut reply, asc);
+    write_i16_to(conn, &mut reply, desc);
     write_u16_to(conn, &mut reply, 0);
 
     // 4 bytes unused
@@ -3270,13 +3279,13 @@ async fn handle_query_font<S: AsyncRead + AsyncWrite + Unpin>(
     write_i16_to(conn, &mut reply, descent as i16); // font-descent
     write_u32_to(conn, &mut reply, num_chars); // number of CharInfos
 
-    // CharInfo for each character
+    // CharInfo for each character (0 for 2-byte fonts since min==max bounds)
     for _i in 0..num_chars {
-        write_i16_to(conn, &mut reply, 0);                // left-side-bearing
-        write_i16_to(conn, &mut reply, max_width as i16); // right-side-bearing
-        write_i16_to(conn, &mut reply, max_width as i16); // character-width
-        write_i16_to(conn, &mut reply, ascent as i16);    // ascent
-        write_i16_to(conn, &mut reply, -(descent as i16)); // descent
+        write_i16_to(conn, &mut reply, lsb);
+        write_i16_to(conn, &mut reply, rsb);
+        write_i16_to(conn, &mut reply, cw);
+        write_i16_to(conn, &mut reply, asc);
+        write_i16_to(conn, &mut reply, desc);
         write_u16_to(conn, &mut reply, 0);                // attributes
     }
 
@@ -3466,7 +3475,7 @@ async fn handle_get_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
     let count = data[5] as u32;
     let keysyms_per_keycode: u32 = 4;
     let seq = conn.current_request_sequence();
-    log::debug!("GetKeyboardMapping: first_keycode={} count={} seq={}", first_keycode, count, seq);
+    log::info!("GetKeyboardMapping: first_keycode={} count={} (range {}-{}) seq={}", first_keycode, count, first_keycode, first_keycode + count - 1, seq);
 
     // Generate basic keysym mapping
     let total_keysyms = count * keysyms_per_keycode;
@@ -3823,6 +3832,7 @@ async fn handle_list_fonts<S: AsyncRead + AsyncWrite + Unpin>(
         "*"
     };
     let pattern_lower = pattern.to_lowercase();
+    info!("ListFonts: pattern='{}' max_names={}", pattern, max_names);
 
     // Collect matching font names
     let mut matched: Vec<&str> = Vec::new();
@@ -3855,6 +3865,7 @@ async fn handle_list_fonts<S: AsyncRead + AsyncWrite + Unpin>(
     write_u16_to(conn, &mut reply, matched.len() as u16);
     reply.extend(std::iter::repeat(0).take(22)); // padding
     reply.extend_from_slice(&names_data);
+    info!("ListFonts: pattern='{}' matched {} fonts", pattern, matched.len());
     stream.write_all(&reply).await?;
     Ok(())
 }

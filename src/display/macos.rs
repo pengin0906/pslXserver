@@ -324,7 +324,9 @@ unsafe extern "C" fn view_key_down(this: *mut AnyObject, _sel: Sel, event: *mut 
     *flag_ivar.load_mut::<u8>(&mut *this) = 0;
 
     // Detect space press during IME composition → start showing preedit inline
-    if crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) && keycode == 49 {
+    let composing = crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed);
+    info!("view_key_down: keycode={} composing={}", keycode, composing);
+    if composing && keycode == 49 {
         crate::display::IME_CONVERTING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -448,7 +450,7 @@ unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut
                 if let Ok(s) = std::ffi::CStr::from_ptr(utf8).to_str() {
                     let x11_id_ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
                     let x11_id = *x11_id_ivar.load::<u32>(&*this) as crate::display::Xid;
-                    debug!("IME setMarkedText: preedit='{}' (sent to X11)", s);
+                    info!("IME setMarkedText: preedit='{}' (sent to X11)", s);
                     send_display_event(DisplayEvent::ImePreeditDraw {
                         window: x11_id,
                         text: s.to_string(),
