@@ -145,10 +145,10 @@
 ### 今後の課題 (実装✅ / 検証✅)
 - [ ][ ] Chrome/VS CodeのURL窓・検索窓でキーボード入力が効かない（FocusIn/Out送信追加済み、要検証）
 - [ ][ ] Chrome/VS Codeで日本語IMEインライン編集が動かない
-- [ ][ ] xtermでIME確定後バックスペースで1文字残るバグ
-- [ ][ ] ブラウザ音声出力: PulseAudio/PipeWireフォワーディングで再起動後も自動復旧
+- [x][ ] xtermでIME確定後バックスペースで1文字残るバグ — preedit_col_count(カラム数)でBS送信に修正
+- [x][ ] ブラウザ音声出力: PulseAudio TCP (port 4713, auth-anonymous) + start-with-audio.shスクリプト
 - [x][ ] SHAPE拡張実装 (xeyes/xlogo非矩形ウィンドウ対応) — shape.rs作成、全サブオペコード対応
-- [ ][ ] RENDER拡張実装 (アンチエイリアス描画)
+- [x][ ] RENDER拡張実装 (スタブ) — QueryVersion 0.11, QueryPictFormats(ARGB32/RGB24/A8), 描画op全no-op
 - [x][x] BIG-REQUESTS拡張実装 — 既存実装、opcode 133で16MB対応
 - [x][ ] XTest拡張実装 (xdotool対応) — xtest.rs作成、FakeInput/GetVersion対応
 - [x][ ] GetImage: IOSurfaceからの実ピクセルデータ読み取り — ReadPixelsコマンド追加

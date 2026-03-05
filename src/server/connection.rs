@@ -771,6 +771,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         132 => super::extensions::xtest::handle_xtest_request(server, conn, data, stream).await,
         134 => super::extensions::shape::handle_shape_request(server, conn, data, stream).await,
         135 => super::extensions::xkb::handle_xkb_request(server, conn, data, stream).await,
+        139 => super::extensions::render::handle_render_request(server, conn, data, stream).await,
         _ => {
             debug!("Unimplemented opcode: {}", opcode);
             Err(ServerError::NotImplemented)
