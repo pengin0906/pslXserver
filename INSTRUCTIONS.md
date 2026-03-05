@@ -145,7 +145,7 @@
 ### 今後の課題 (実装✅ / 検証✅)
 - [ ][ ] Chrome/VS CodeのURL窓・検索窓でキーボード入力が効かない（FocusIn/Out送信追加済み、要検証）
 - [ ][ ] Chrome/VS Codeで日本語IMEインライン編集が動かない
-- [x][ ] xtermでIME確定後バックスペースで1文字残るバグ — preedit_col_count(カラム数)でBS送信に修正
+- [x][x] xtermでIME日本語インライン表示+BSバグ修正 — (1) Homebrew libX11のXSupportsLocale()=0問題: locale module(.2.so)にLinux命名(.so.2)のsymlink作成で解決 (2) プリエディットフリッカー: 毎回全消去→全再描画をインクリメンタル更新に変更(starts_withで接頭辞一致なら差分のみ送信)
 - [x][ ] ブラウザ音声出力: PulseAudio TCP (port 4713, auth-anonymous) + start-with-audio.shスクリプト
 - [x][ ] SHAPE拡張実装 (xeyes/xlogo非矩形ウィンドウ対応) — shape.rs作成、全サブオペコード対応
 - [x][ ] RENDER拡張実装 (スタブ) — QueryVersion 0.11, QueryPictFormats(ARGB32/RGB24/A8), 描画op全no-op

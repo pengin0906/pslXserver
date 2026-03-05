@@ -572,7 +572,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     info!("ImeCommit via XIM: '{}' to window 0x{:08x}", text, target);
                 } else {
                     // Fallback: erase inline preedit, then send committed text
-                    // Use col count (not char count) because CJK chars are 2 columns wide in xterm
+                    // Use col count — xterm BS erases 1 display column, not 1 character
                     if preedit_col_count > 0 {
                         send_backspaces(&server, target, preedit_col_count);
                     }
@@ -601,12 +601,21 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     }
                 } else {
                     // Non-XIM clients (xterm, VS Code): inline preedit via BS + KeyPress
-                    // Use col count for BS because CJK chars are 2 columns wide in xterm
-                    if preedit_col_count > 0 {
-                        send_backspaces(&server, target, preedit_col_count);
-                    }
-                    if !text.is_empty() {
-                        send_ime_text(&server, target, &text).await;
+                    // Incremental update: if new text extends old, only send appended chars
+                    if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
+                        // Append only the new suffix (no BS needed)
+                        let suffix = &text[preedit_text.len()..];
+                        if !suffix.is_empty() {
+                            send_ime_text(&server, target, suffix).await;
+                        }
+                    } else {
+                        // Text changed (conversion, deletion, etc.) — full erase + redraw
+                        if preedit_col_count > 0 {
+                            send_backspaces(&server, target, preedit_col_count);
+                        }
+                        if !text.is_empty() {
+                            send_ime_text(&server, target, &text).await;
+                        }
                     }
                     preedit_char_count = new_count;
                 }
