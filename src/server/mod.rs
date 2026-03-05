@@ -668,36 +668,49 @@ fn send_button_event(
     log::debug!("send_button_event: window=0x{:08x} button={} type={} mask_bit=0x{:08x}",
         window, button, event_type, mask_bit);
 
-    if let Some(res) = server.resources.get(&window) {
-        if let Resource::Window(win) = res.value() {
-            let w = win.read();
-            log::debug!("  event_selections: {:?}", w.event_selections.iter()
-                .map(|(c, m)| format!("conn{}:0x{:08x}", c, m)).collect::<Vec<_>>());
-            for &(conn_id, emask) in &w.event_selections {
-                if (emask & mask_bit) != 0 {
-                    log::debug!("  -> Delivering to conn {} (mask match 0x{:08x} & 0x{:08x})", conn_id, emask, mask_bit);
-                    if let Some(conn_ref) = server.connections.get(&conn_id) {
-                        let conn = conn_ref.value();
-                        let mut evt = events::EventBuilder::new(conn, event_type);
-                        evt.set_u8(1, button)
-                           .set_u32(4, time)
-                           .set_u32(8, server.screens[0].root_window)
-                           .set_u32(12, window)
-                           .set_u32(16, 0) // child
-                           .set_i16(20, root_x)
-                           .set_i16(22, root_y)
-                           .set_i16(24, x)
-                           .set_i16(26, y)
-                           .set_u16(28, state)
-                           .set_u8(30, 1); // same-screen
-                        let _ = conn.event_tx.send(evt.build());
+    // X11 spec: button events propagate up the window hierarchy until a client
+    // has selected the event type on the window.
+    let mut current = window;
+    let mut event_x = x;
+    let mut event_y = y;
+    let mut child: Xid = 0; // child of event window that contains the source
+    for _ in 0..32 {
+        if current == 0 { break; }
+        if let Some(res) = server.resources.get(&current) {
+            if let Resource::Window(win) = res.value() {
+                let w = win.read();
+                for &(conn_id, emask) in &w.event_selections {
+                    if (emask & mask_bit) != 0 {
+                        log::debug!("  -> Delivering ButtonEvent to conn {} on window 0x{:08x} (propagated from 0x{:08x})",
+                            conn_id, current, window);
+                        if let Some(conn_ref) = server.connections.get(&conn_id) {
+                            let conn = conn_ref.value();
+                            let mut evt = events::EventBuilder::new(conn, event_type);
+                            evt.set_u8(1, button)
+                               .set_u32(4, time)
+                               .set_u32(8, server.screens[0].root_window)
+                               .set_u32(12, current)
+                               .set_u32(16, child)
+                               .set_i16(20, root_x)
+                               .set_i16(22, root_y)
+                               .set_i16(24, event_x)
+                               .set_i16(26, event_y)
+                               .set_u16(28, state)
+                               .set_u8(30, 1); // same-screen
+                            let _ = conn.event_tx.send(evt.build());
+                        }
+                        return;
                     }
                 }
-            }
-        }
-    } else {
-        log::debug!("  Window 0x{:08x} not found in resources", window);
+                // Not selected here — propagate to parent, adjusting coordinates
+                child = current;
+                event_x += w.x as i16;
+                event_y += w.y as i16;
+                current = w.parent;
+            } else { break; }
+        } else { break; }
     }
+    log::debug!("  Button event NOT delivered (no window selected mask 0x{:08x}) last_window=0x{:08x}", mask_bit, current);
 }
 
 fn send_motion_event(
@@ -705,45 +718,54 @@ fn send_motion_event(
     x: i16, y: i16, root_x: i16, root_y: i16,
     state: u16, time: u32,
 ) {
-    if let Some(res) = server.resources.get(&window) {
-        if let Resource::Window(win) = res.value() {
-            let w = win.read();
-            for &(conn_id, emask) in &w.event_selections {
-                // PointerMotion: always deliver motion events
-                // ButtonMotion: deliver when any button is pressed
-                // Button{1..5}Motion: deliver when that specific button is pressed
-                let deliver = (emask & protocol::event_mask::POINTER_MOTION) != 0
-                    || ((emask & protocol::event_mask::BUTTON_MOTION) != 0 && (state & 0x1f00) != 0)
-                    || ((emask & protocol::event_mask::BUTTON1_MOTION) != 0 && (state & 0x100) != 0)
-                    || ((emask & protocol::event_mask::BUTTON2_MOTION) != 0 && (state & 0x200) != 0)
-                    || ((emask & protocol::event_mask::BUTTON3_MOTION) != 0 && (state & 0x400) != 0)
-                    || ((emask & protocol::event_mask::BUTTON4_MOTION) != 0 && (state & 0x800) != 0)
-                    || ((emask & protocol::event_mask::BUTTON5_MOTION) != 0 && (state & 0x1000) != 0);
-                if deliver
-                {
-                    if (state & 0x1f00) != 0 {
-                        log::debug!("MotionNotify delivered: win=0x{:08x} ({},{}) state=0x{:04x} conn={} emask=0x{:08x}",
-                            window, x, y, state, conn_id, emask);
-                    }
-                    if let Some(conn_ref) = server.connections.get(&conn_id) {
-                        let conn = conn_ref.value();
-                        let mut evt = events::EventBuilder::new(conn, protocol::event_type::MOTION_NOTIFY);
-                        evt.set_u8(1, 0) // detail: Normal
-                           .set_u32(4, time)
-                           .set_u32(8, server.screens[0].root_window)
-                           .set_u32(12, window)
-                           .set_u32(16, 0) // child
-                           .set_i16(20, root_x)
-                           .set_i16(22, root_y)
-                           .set_i16(24, x)
-                           .set_i16(26, y)
-                           .set_u16(28, state)
-                           .set_u8(30, 1); // same-screen
-                        let _ = conn.event_tx.send(evt.build());
+    fn motion_mask_matches(emask: u32, state: u16) -> bool {
+        (emask & protocol::event_mask::POINTER_MOTION) != 0
+            || ((emask & protocol::event_mask::BUTTON_MOTION) != 0 && (state & 0x1f00) != 0)
+            || ((emask & protocol::event_mask::BUTTON1_MOTION) != 0 && (state & 0x100) != 0)
+            || ((emask & protocol::event_mask::BUTTON2_MOTION) != 0 && (state & 0x200) != 0)
+            || ((emask & protocol::event_mask::BUTTON3_MOTION) != 0 && (state & 0x400) != 0)
+            || ((emask & protocol::event_mask::BUTTON4_MOTION) != 0 && (state & 0x800) != 0)
+            || ((emask & protocol::event_mask::BUTTON5_MOTION) != 0 && (state & 0x1000) != 0)
+    }
+
+    // X11 spec: motion events propagate up the window hierarchy until selected.
+    let mut current = window;
+    let mut event_x = x;
+    let mut event_y = y;
+    let mut child: Xid = 0;
+    for _ in 0..32 {
+        if current == 0 { break; }
+        if let Some(res) = server.resources.get(&current) {
+            if let Resource::Window(win) = res.value() {
+                let w = win.read();
+                for &(conn_id, emask) in &w.event_selections {
+                    if motion_mask_matches(emask, state) {
+                        if let Some(conn_ref) = server.connections.get(&conn_id) {
+                            let conn = conn_ref.value();
+                            let mut evt = events::EventBuilder::new(conn, protocol::event_type::MOTION_NOTIFY);
+                            evt.set_u8(1, 0) // detail: Normal
+                               .set_u32(4, time)
+                               .set_u32(8, server.screens[0].root_window)
+                               .set_u32(12, current)
+                               .set_u32(16, child)
+                               .set_i16(20, root_x)
+                               .set_i16(22, root_y)
+                               .set_i16(24, event_x)
+                               .set_i16(26, event_y)
+                               .set_u16(28, state)
+                               .set_u8(30, 1); // same-screen
+                            let _ = conn.event_tx.send(evt.build());
+                        }
+                        return;
                     }
                 }
-            }
-        }
+                // Not selected here — propagate to parent
+                child = current;
+                event_x += w.x as i16;
+                event_y += w.y as i16;
+                current = w.parent;
+            } else { break; }
+        } else { break; }
     }
 }
 
@@ -809,6 +831,7 @@ fn send_key_event(
         }
 
         if let Some(conn_id) = found_conn {
+            log::debug!("  -> Key delivered to conn {} window 0x{:08x}", conn_id, current);
             if let Some(conn_ref) = server.connections.get(&conn_id) {
                 let conn = conn_ref.value();
                 let evt_data = events::build_key_event(
@@ -822,6 +845,7 @@ fn send_key_event(
         }
         current = parent;
     }
+    log::debug!("  -> Key NOT delivered (no KEY_PRESS mask found)");
 }
 
 /// Send IME committed text as X11 key events using Unicode keysyms.
