@@ -739,26 +739,8 @@ fn macos_frame_to_x11_pos(window: &NSWindow) -> (i16, i16) {
         } else {
             frame.size.height
         };
-        let screen: *mut AnyObject = msg_send![objc2::class!(NSScreen), mainScreen];
-        let screen_h = if !screen.is_null() {
-            let sf: NSRect = msg_send![screen, frame];
-            sf.size.height
-        } else {
-            956.0
-        };
-        // Top-left of content area in X11 coords:
-        // x = frame.origin.x
-        // y = screen_height - (frame.origin.y + frame.size.height - title_bar) - ...
-        // title_bar_h = frame.size.height - content_h
-        // content top in macOS Y = frame.origin.y + frame.size.height - title_bar_h
-        //                        = frame.origin.y + content_h
-        // In X11 Y (top-down) = screen_h - (frame.origin.y + content_h)
-        // BUT: frame.origin.y + content_h = bottom of frame + content height
-        //      = top of content area in macOS coords
-        // Wait: frame.origin.y is the bottom of the window.
-        // Bottom of content = frame.origin.y
-        // Top of content = frame.origin.y + content_h
-        // In X11 (top-down): y = screen_h - top_of_content = screen_h - (frame.origin.y + content_h)
+        // Use cached screen height — avoids [NSScreen mainScreen] ObjC call per frame
+        let screen_h = SCREEN_HEIGHT.with(|sh| sh.get());
         let x11_x = frame.origin.x as i16;
         let x11_y = (screen_h - frame.origin.y - content_h) as i16;
         (x11_x, x11_y)
@@ -1182,9 +1164,10 @@ fn process_commands() {
                     }
                 }
             }
-            // Force immediate compositing
-            ca_transaction_flush();
         });
+
+        // Force immediate compositing
+        ca_transaction_flush();
     }
 }
 
@@ -1493,9 +1476,10 @@ fn get_ns_cursor(cursor_type: u8) -> *mut AnyObject {
     }
 }
 
-/// Inner flush: update CALayer contents without managing CATransaction.
+/// Inner flush: update CALayer contents.
 /// Set IOSurface directly as CALayer contents — zero-copy, no color space conversion.
 /// nil→surface cycle forces CALayer to re-read the IOSurface backing store.
+/// Disables implicit animations to prevent visual glitches during resize.
 fn flush_window(info: &WindowInfo) {
     unsafe {
         if info.width == 0 || info.height == 0 || info.surface.is_null() { return; }

@@ -169,7 +169,7 @@ pub fn render_to_buffer(
             if *format == 2 && (*depth == 24 || *depth == 32) {
                 let src_stride = src_w * 4;
                 if *gc_function == 3 {
-                    // Fast path: GXcopy — direct memcpy (preserves IME/xterm perf)
+                    // Fast path: GXcopy — direct memcpy + alpha fix in single pass
                     for row in 0..src_h {
                         let dy = dst_y + row;
                         if dy >= height { break; }
@@ -179,10 +179,24 @@ pub fn render_to_buffer(
                         let src_end = src_off + copy_w * 4;
                         let dst_end = dst_off + copy_w * 4;
                         if src_end <= data.len() && dst_end <= buffer.len() {
-                            buffer[dst_off..dst_end].copy_from_slice(&data[src_off..src_end]);
-                            // Set alpha to 0xFF for every pixel
-                            for chunk in buffer[dst_off..dst_end].chunks_exact_mut(4) {
-                                chunk[3] = 0xFF;
+                            if *depth == 32 {
+                                // 32-bit: source may already have correct alpha, copy and fix in one pass
+                                buffer[dst_off..dst_end].copy_from_slice(&data[src_off..src_end]);
+                                // Force alpha to 0xFF using u32 OR (4 bytes at a time)
+                                for chunk in buffer[dst_off..dst_end].chunks_exact_mut(4) {
+                                    // OR with alpha mask — branchless, no separate loop
+                                    let p = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                                    let p_fixed = p | 0xFF000000;
+                                    chunk.copy_from_slice(&p_fixed.to_ne_bytes());
+                                }
+                            } else {
+                                // 24-bit depth: source alpha is 0, set to 0xFF directly via u32 writes
+                                let src_slice = &data[src_off..src_end];
+                                let dst_slice = &mut buffer[dst_off..dst_end];
+                                for (dst_chunk, src_chunk) in dst_slice.chunks_exact_mut(4).zip(src_slice.chunks_exact(4)) {
+                                    let p = u32::from_ne_bytes([src_chunk[0], src_chunk[1], src_chunk[2], 0xFF]);
+                                    dst_chunk.copy_from_slice(&p.to_ne_bytes());
+                                }
                             }
                         }
                     }
@@ -253,8 +267,8 @@ pub fn render_to_buffer(
 }
 
 /// Copy a rectangular region within the same buffer (for scrolling).
-/// Handles overlapping regions correctly by using a temporary buffer.
-/// Respects gc_function for raster operations during copy.
+/// Uses copy_within for non-overlapping GXcopy (zero allocation).
+/// Falls back to a thread-local temp buffer for overlapping regions.
 fn copy_area(
     buffer: &mut [u8],
     buf_w: u32,
@@ -282,40 +296,88 @@ fn copy_area(
     if actual_w == 0 || actual_h == 0 { return; }
 
     let row_bytes = actual_w as usize * 4;
-
-    // Copy source to temp buffer first to handle overlapping regions
-    let mut tmp = vec![0u8; row_bytes * actual_h as usize];
-    for row in 0..actual_h {
-        let src_off = ((sy0 + row) as usize) * (stride as usize) + (sx0 as usize) * 4;
-        let tmp_off = (row as usize) * row_bytes;
-        if src_off + row_bytes <= buffer.len() {
-            tmp[tmp_off..tmp_off + row_bytes].copy_from_slice(&buffer[src_off..src_off + row_bytes]);
-        }
-    }
+    let stride_usize = stride as usize;
 
     if gc_function == 3 {
-        // Fast path: GXcopy — direct memcpy (preserves scroll perf)
-        for row in 0..actual_h {
-            let dst_off = ((dy0 + row) as usize) * (stride as usize) + (dx0 as usize) * 4;
-            let tmp_off = (row as usize) * row_bytes;
-            if dst_off + row_bytes <= buffer.len() {
-                buffer[dst_off..dst_off + row_bytes].copy_from_slice(&tmp[tmp_off..tmp_off + row_bytes]);
-            }
-        }
-    } else {
-        // Per-pixel ROP
-        for row in 0..actual_h {
-            for col in 0..actual_w {
-                let tmp_off = (row as usize) * row_bytes + (col as usize) * 4;
-                let dst_off = ((dy0 + row) as usize) * (stride as usize) + ((dx0 + col) as usize) * 4;
-                if tmp_off + 4 <= tmp.len() && dst_off + 4 <= buffer.len() {
-                    let src_pixel = u32::from_ne_bytes([tmp[tmp_off], tmp[tmp_off+1], tmp[tmp_off+2], tmp[tmp_off+3]]);
-                    let dst_pixel = u32::from_ne_bytes([buffer[dst_off], buffer[dst_off+1], buffer[dst_off+2], buffer[dst_off+3]]);
-                    let result = apply_rop(gc_function, src_pixel, dst_pixel, 0x00FFFFFF);
-                    buffer[dst_off..dst_off + 4].copy_from_slice(&result.to_ne_bytes());
+        // Fast path: GXcopy — use copy_within (zero allocation)
+        // For same-column copies (common scroll), rows don't overlap across stride boundaries.
+        // Choose forward or reverse row order to handle vertical overlap.
+        if sx0 == dx0 {
+            // Same X: pure vertical scroll — copy_within per row, ordered to avoid overlap
+            if dy0 <= sy0 {
+                // Scrolling up (or same): copy top-to-bottom
+                for row in 0..actual_h {
+                    let src_off = ((sy0 + row) as usize) * stride_usize + (sx0 as usize) * 4;
+                    let dst_off = ((dy0 + row) as usize) * stride_usize + (dx0 as usize) * 4;
+                    if src_off + row_bytes <= buffer.len() && dst_off + row_bytes <= buffer.len() {
+                        buffer.copy_within(src_off..src_off + row_bytes, dst_off);
+                    }
+                }
+            } else {
+                // Scrolling down: copy bottom-to-top
+                for row in (0..actual_h).rev() {
+                    let src_off = ((sy0 + row) as usize) * stride_usize + (sx0 as usize) * 4;
+                    let dst_off = ((dy0 + row) as usize) * stride_usize + (dx0 as usize) * 4;
+                    if src_off + row_bytes <= buffer.len() && dst_off + row_bytes <= buffer.len() {
+                        buffer.copy_within(src_off..src_off + row_bytes, dst_off);
+                    }
                 }
             }
+        } else {
+            // Different X positions: rows might overlap within a row.
+            // Use thread-local temp buffer to avoid per-call allocation.
+            thread_local! {
+                static COPY_TMP: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            COPY_TMP.with(|tmp_cell| {
+                let mut tmp = tmp_cell.borrow_mut();
+                let needed = row_bytes * actual_h as usize;
+                if tmp.len() < needed { tmp.resize(needed, 0); }
+                for row in 0..actual_h {
+                    let src_off = ((sy0 + row) as usize) * stride_usize + (sx0 as usize) * 4;
+                    let tmp_off = (row as usize) * row_bytes;
+                    if src_off + row_bytes <= buffer.len() {
+                        tmp[tmp_off..tmp_off + row_bytes].copy_from_slice(&buffer[src_off..src_off + row_bytes]);
+                    }
+                }
+                for row in 0..actual_h {
+                    let dst_off = ((dy0 + row) as usize) * stride_usize + (dx0 as usize) * 4;
+                    let tmp_off = (row as usize) * row_bytes;
+                    if dst_off + row_bytes <= buffer.len() {
+                        buffer[dst_off..dst_off + row_bytes].copy_from_slice(&tmp[tmp_off..tmp_off + row_bytes]);
+                    }
+                }
+            });
         }
+    } else {
+        // Non-GXcopy: use thread-local temp buffer + per-pixel ROP
+        thread_local! {
+            static ROP_TMP: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        ROP_TMP.with(|tmp_cell| {
+            let mut tmp = tmp_cell.borrow_mut();
+            let needed = row_bytes * actual_h as usize;
+            if tmp.len() < needed { tmp.resize(needed, 0); }
+            for row in 0..actual_h {
+                let src_off = ((sy0 + row) as usize) * stride_usize + (sx0 as usize) * 4;
+                let tmp_off = (row as usize) * row_bytes;
+                if src_off + row_bytes <= buffer.len() {
+                    tmp[tmp_off..tmp_off + row_bytes].copy_from_slice(&buffer[src_off..src_off + row_bytes]);
+                }
+            }
+            for row in 0..actual_h {
+                for col in 0..actual_w {
+                    let tmp_off = (row as usize) * row_bytes + (col as usize) * 4;
+                    let dst_off = ((dy0 + row) as usize) * stride_usize + ((dx0 + col) as usize) * 4;
+                    if tmp_off + 4 <= needed && dst_off + 4 <= buffer.len() {
+                        let src_pixel = u32::from_ne_bytes([tmp[tmp_off], tmp[tmp_off+1], tmp[tmp_off+2], tmp[tmp_off+3]]);
+                        let dst_pixel = u32::from_ne_bytes([buffer[dst_off], buffer[dst_off+1], buffer[dst_off+2], buffer[dst_off+3]]);
+                        let result = apply_rop(gc_function, src_pixel, dst_pixel, 0x00FFFFFF);
+                        buffer[dst_off..dst_off + 4].copy_from_slice(&result.to_ne_bytes());
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -711,8 +773,177 @@ fn get_glyph_bitmap(ch: u8) -> [u8; 13] {
     }
 }
 
+/// Thread-local glyph cache for CoreText-rendered characters.
+/// Key: (char, cell_w, cell_h). Value: BGRA bitmap (white on transparent, alpha-masked).
+/// At blit time, foreground color is applied per-pixel using cached alpha.
+struct GlyphCache {
+    /// Cached glyph bitmaps: key=(char, cell_w, cell_h), value=alpha-only bitmap
+    entries: std::collections::HashMap<(char, u32, u32), Vec<u8>>,
+    /// Cached CTFont pointer (retained). Invalidated on cell_h change.
+    ct_font: *mut std::ffi::c_void,
+    ct_font_cell_h: u32,
+    /// Cached CGColorSpace (retained, never changes)
+    colorspace: *mut std::ffi::c_void,
+    /// Reusable temp bitmap buffer
+    tmp_buf: Vec<u8>,
+}
+
+impl GlyphCache {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            ct_font: std::ptr::null_mut(),
+            ct_font_cell_h: 0,
+            colorspace: std::ptr::null_mut(),
+            tmp_buf: Vec::new(),
+        }
+    }
+
+    /// Get or create the CGColorSpace (lifetime = process)
+    fn get_colorspace(&mut self) -> *mut std::ffi::c_void {
+        if self.colorspace.is_null() {
+            extern "C" { fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void; }
+            self.colorspace = unsafe { CGColorSpaceCreateDeviceRGB() };
+        }
+        self.colorspace
+    }
+
+    /// Get or create CTFont for the given cell_h
+    fn get_font(&mut self, cell_h: u32) -> *mut std::ffi::c_void {
+        if self.ct_font.is_null() || self.ct_font_cell_h != cell_h {
+            extern "C" {
+                fn CTFontCreateWithName(name: *const std::ffi::c_void, size: f64, matrix: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+                fn CFRelease(cf: *mut std::ffi::c_void);
+            }
+            if !self.ct_font.is_null() {
+                unsafe { CFRelease(self.ct_font); }
+            }
+            unsafe {
+                use objc2::msg_send;
+                use objc2::runtime::AnyObject;
+                let font_name: *mut AnyObject = msg_send![
+                    objc2::class!(NSString),
+                    stringWithUTF8String: c"HiraginoSans-W3".as_ptr()
+                ];
+                self.ct_font = CTFontCreateWithName(font_name as *const _, cell_h as f64 - 2.0, std::ptr::null());
+            }
+            self.ct_font_cell_h = cell_h;
+        }
+        self.ct_font
+    }
+
+    /// Render a glyph and return its alpha bitmap (cell_w * cell_h bytes, one byte per pixel).
+    fn get_alpha_bitmap(&mut self, ch: char, cell_w: u32, cell_h: u32) -> &[u8] {
+        let key = (ch, cell_w, cell_h);
+        if self.entries.contains_key(&key) {
+            return &self.entries[&key];
+        }
+
+        let w = cell_w as usize;
+        let h = cell_h as usize;
+        let tmp_stride = w * 4;
+        let tmp_size = tmp_stride * h;
+
+        // Reuse tmp_buf
+        self.tmp_buf.resize(tmp_size, 0);
+        self.tmp_buf.fill(0);
+
+        extern "C" {
+            fn CGBitmapContextCreate(
+                data: *mut std::ffi::c_void, width: usize, height: usize,
+                bits_per_component: usize, bytes_per_row: usize,
+                colorspace: *mut std::ffi::c_void, bitmap_info: u32,
+            ) -> *mut std::ffi::c_void;
+            fn CGContextSetRGBFillColor(ctx: *mut std::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
+            fn CGContextRelease(ctx: *mut std::ffi::c_void);
+            fn CTLineDraw(line: *const std::ffi::c_void, ctx: *mut std::ffi::c_void);
+            fn CGContextSetTextPosition(ctx: *mut std::ffi::c_void, x: f64, y: f64);
+            fn CTLineCreateWithAttributedString(attr_str: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CFRelease(cf: *mut std::ffi::c_void);
+        }
+
+        let cs = self.get_colorspace();
+        let ct_font = self.get_font(cell_h);
+
+        let alpha_bitmap = unsafe {
+            let ctx = CGBitmapContextCreate(
+                self.tmp_buf.as_mut_ptr() as *mut _, w, h, 8, tmp_stride, cs, 0x2002,
+            );
+            if ctx.is_null() || ct_font.is_null() {
+                if !ctx.is_null() { CGContextRelease(ctx); }
+                // Return empty alpha bitmap
+                vec![0u8; w * h]
+            } else {
+                // Render in white so we can extract alpha
+                CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+
+                use objc2::msg_send;
+                use objc2::runtime::AnyObject;
+
+                let mut char_buf = [0u8; 4];
+                let char_str = ch.encode_utf8(&mut char_buf);
+                let ns_string: *mut AnyObject = msg_send![
+                    objc2::class!(NSString),
+                    stringWithUTF8String: char_str.as_ptr() as *const std::ffi::c_char
+                ];
+
+                if !ns_string.is_null() {
+                    extern "C" {
+                        static kCTFontAttributeName: *const std::ffi::c_void;
+                        static kCTForegroundColorFromContextAttributeName: *const std::ffi::c_void;
+                    }
+                    let ct_font_key: *const AnyObject = kCTFontAttributeName as *const _;
+                    let ct_fg_key: *const AnyObject = kCTForegroundColorFromContextAttributeName as *const _;
+                    let yes: *mut AnyObject = msg_send![objc2::class!(NSNumber), numberWithBool: true];
+                    let keys = [ct_font_key, ct_fg_key];
+                    let vals = [ct_font as *const AnyObject, yes as *const AnyObject];
+                    let attrs: *mut AnyObject = msg_send![
+                        objc2::class!(NSDictionary),
+                        dictionaryWithObjects: vals.as_ptr()
+                        forKeys: keys.as_ptr()
+                        count: 2usize
+                    ];
+                    let attr_str: *mut AnyObject = msg_send![
+                        objc2::class!(NSAttributedString), alloc
+                    ];
+                    let attr_str: *mut AnyObject = msg_send![
+                        attr_str, initWithString: ns_string attributes: attrs
+                    ];
+                    if !attr_str.is_null() {
+                        let ct_line = CTLineCreateWithAttributedString(attr_str as *const _);
+                        if !ct_line.is_null() {
+                            CGContextSetTextPosition(ctx, 0.0, 2.0);
+                            CTLineDraw(ct_line as *const _, ctx);
+                            CFRelease(ct_line);
+                        }
+                        let _: () = msg_send![&*attr_str, release];
+                    }
+                }
+
+                CGContextRelease(ctx);
+
+                // Extract alpha channel into compact bitmap (1 byte per pixel)
+                let mut alpha = vec![0u8; w * h];
+                for row in 0..h {
+                    for col in 0..w {
+                        alpha[row * w + col] = self.tmp_buf[row * tmp_stride + col * 4 + 3];
+                    }
+                }
+                alpha
+            }
+        };
+
+        self.entries.insert(key, alpha_bitmap);
+        &self.entries[&key]
+    }
+}
+
+thread_local! {
+    static GLYPH_CACHE: std::cell::RefCell<GlyphCache> = std::cell::RefCell::new(GlyphCache::new());
+}
+
 /// Render a single non-ASCII character using CoreText into the pixel buffer.
-/// Falls back to a box glyph if CoreText is unavailable.
+/// Uses glyph cache to avoid redundant CoreText rendering.
 fn render_coretext_char(
     buffer: &mut [u8],
     buf_w: u32,
@@ -725,151 +956,40 @@ fn render_coretext_char(
     cell_w: u32,
     cell_h: u32,
 ) {
-    use std::ptr;
-
-    // Create a temporary BGRA bitmap to render the character
     let w = cell_w as usize;
     let h = cell_h as usize;
-    let tmp_stride = w * 4;
-    let mut tmp = vec![0u8; tmp_stride * h];
 
-    unsafe {
-        extern "C" {
-            fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
-            fn CGBitmapContextCreate(
-                data: *mut std::ffi::c_void, width: usize, height: usize,
-                bits_per_component: usize, bytes_per_row: usize,
-                colorspace: *mut std::ffi::c_void, bitmap_info: u32,
-            ) -> *mut std::ffi::c_void;
-            fn CGContextSetRGBFillColor(ctx: *mut std::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
-            fn CGContextRelease(ctx: *mut std::ffi::c_void);
-            fn CGColorSpaceRelease(cs: *mut std::ffi::c_void);
-            fn CFRelease(cf: *mut std::ffi::c_void);
-        }
+    GLYPH_CACHE.with(|cache_cell| {
+        let mut cache = cache_cell.borrow_mut();
+        let alpha_bitmap = cache.get_alpha_bitmap(ch, cell_w, cell_h);
 
-        let cs = CGColorSpaceCreateDeviceRGB();
-        if cs.is_null() {
-            render_box_glyph(buffer, buf_w, buf_h, stride, cx, top_y, pixel, cell_w, cell_h);
-            return;
-        }
-
-        // kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little = 0x2002
-        let ctx = CGBitmapContextCreate(
-            tmp.as_mut_ptr() as *mut _,
-            w, h, 8, tmp_stride,
-            cs, 0x2002,
-        );
-        if ctx.is_null() {
-            CGColorSpaceRelease(cs);
-            render_box_glyph(buffer, buf_w, buf_h, stride, cx, top_y, pixel, cell_w, cell_h);
-            return;
-        }
-
-        // Set text color (pixel is BGRA)
-        let r = pixel[2] as f64 / 255.0;
-        let g = pixel[1] as f64 / 255.0;
-        let b = pixel[0] as f64 / 255.0;
-        CGContextSetRGBFillColor(ctx, r, g, b, 1.0);
-
-        // Create CTFont and draw the character
-        extern "C" {
-            fn CTFontCreateWithName(name: *const std::ffi::c_void, size: f64, matrix: *const std::ffi::c_void) -> *mut std::ffi::c_void;
-            fn CTLineDraw(line: *const std::ffi::c_void, ctx: *mut std::ffi::c_void);
-            fn CGContextSetTextPosition(ctx: *mut std::ffi::c_void, x: f64, y: f64);
-        }
-
-        // Use objc to create the attributed string and CTLine
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
-
-        // Create NSString from the character
-        let mut char_buf = [0u8; 4];
-        let char_str = ch.encode_utf8(&mut char_buf);
-        let ns_string: *mut AnyObject = msg_send![
-            objc2::class!(NSString),
-            stringWithUTF8String: char_str.as_ptr() as *const std::ffi::c_char
-        ];
-
-        if !ns_string.is_null() {
-            // Create font: use Hiragino Sans or system font for CJK
-            let font_name: *mut AnyObject = msg_send![
-                objc2::class!(NSString),
-                stringWithUTF8String: c"HiraginoSans-W3".as_ptr()
-            ];
-            let ct_font = CTFontCreateWithName(font_name as *const _, cell_h as f64 - 2.0, ptr::null());
-
-            if !ct_font.is_null() {
-                // Create attributes dictionary
-                extern "C" {
-                    static kCTFontAttributeName: *const std::ffi::c_void;
-                    static kCTForegroundColorFromContextAttributeName: *const std::ffi::c_void;
-                }
-                // Use CoreText key constants
-                let ct_font_key: *const AnyObject = kCTFontAttributeName as *const _;
-                let ct_fg_key: *const AnyObject = kCTForegroundColorFromContextAttributeName as *const _;
-                let yes: *mut AnyObject = msg_send![objc2::class!(NSNumber), numberWithBool: true];
-
-                let keys = [ct_font_key, ct_fg_key];
-                let vals = [ct_font as *const AnyObject, yes as *const AnyObject];
-                let attrs: *mut AnyObject = msg_send![
-                    objc2::class!(NSDictionary),
-                    dictionaryWithObjects: vals.as_ptr()
-                    forKeys: keys.as_ptr()
-                    count: 2usize
-                ];
-
-                // Create attributed string
-                let attr_str: *mut AnyObject = msg_send![
-                    objc2::class!(NSAttributedString),
-                    alloc
-                ];
-                let attr_str: *mut AnyObject = msg_send![
-                    attr_str,
-                    initWithString: ns_string
-                    attributes: attrs
-                ];
-
-                if !attr_str.is_null() {
-                    // Create CTLine
-                    extern "C" {
-                        fn CTLineCreateWithAttributedString(attr_str: *const std::ffi::c_void) -> *mut std::ffi::c_void;
-                    }
-                    let ct_line = CTLineCreateWithAttributedString(attr_str as *const _);
-                    if !ct_line.is_null() {
-                        // Draw at baseline position (CoreGraphics Y is flipped: 0 at bottom)
-                        let baseline_y = 2.0; // small offset from bottom
-                        CGContextSetTextPosition(ctx, 0.0, baseline_y);
-                        CTLineDraw(ct_line as *const _, ctx);
-                        CFRelease(ct_line);
-                    }
-                    let _: () = msg_send![&*attr_str, release];
-                }
-
-                CFRelease(ct_font);
-            }
-        }
-
-        CGContextRelease(ctx);
-        CGColorSpaceRelease(cs);
-    }
-
-    // Copy rendered pixels to the main buffer (non-zero alpha only)
-    for row in 0..h {
-        let py = top_y + row as i32;
-        if py < 0 || py >= buf_h as i32 { continue; }
-        for col in 0..w {
-            let px = cx + col as i32;
-            if px < 0 || px >= buf_w as i32 { continue; }
-            let src_off = row * tmp_stride + col * 4;
-            let alpha = tmp[src_off + 3];
-            if alpha > 0 {
-                let dst_off = (py as usize) * (stride as usize) + (px as usize) * 4;
-                if dst_off + 4 <= buffer.len() {
-                    buffer[dst_off..dst_off + 4].copy_from_slice(&tmp[src_off..src_off + 4]);
+        // Blit cached alpha bitmap with the requested foreground color
+        for row in 0..h {
+            let py = top_y + row as i32;
+            if py < 0 || py >= buf_h as i32 { continue; }
+            let dst_row_off = (py as usize) * (stride as usize);
+            for col in 0..w {
+                let a = alpha_bitmap[row * w + col];
+                if a == 0 { continue; }
+                let px = cx + col as i32;
+                if px < 0 || px >= buf_w as i32 { continue; }
+                let dst_off = dst_row_off + (px as usize) * 4;
+                if dst_off + 4 > buffer.len() { continue; }
+                if a >= 250 {
+                    // Fully opaque — direct copy
+                    buffer[dst_off..dst_off + 4].copy_from_slice(pixel);
+                } else {
+                    // Alpha blend with background
+                    let inv_a = 255 - a as u32;
+                    let a32 = a as u32;
+                    buffer[dst_off]     = ((pixel[0] as u32 * a32 + buffer[dst_off] as u32 * inv_a) / 255) as u8;
+                    buffer[dst_off + 1] = ((pixel[1] as u32 * a32 + buffer[dst_off + 1] as u32 * inv_a) / 255) as u8;
+                    buffer[dst_off + 2] = ((pixel[2] as u32 * a32 + buffer[dst_off + 2] as u32 * inv_a) / 255) as u8;
+                    buffer[dst_off + 3] = 0xFF;
                 }
             }
         }
-    }
+    });
 }
 
 /// Fallback box glyph for when CoreText rendering fails.
