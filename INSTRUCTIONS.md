@@ -142,14 +142,14 @@
 - [x] ドラッグ引きずり: ポーリング/NSEvent二重ButtonPress防止(LAST_BUTTONS)、MotionNotify watchdog
 - [x] IME変換中キーイベント漏れ: IME_COMPOSINGチェック追加
 
-### 今後の課題
-- [ ] Chrome/VS CodeのURL窓・検索窓でキーボード入力が効かない（FocusIn/Out送信追加済み、要検証）
-- [ ] Chrome/VS Codeで日本語IMEインライン編集が動かない
-- [ ] xtermでIME確定後バックスペースで1文字残るバグ
-- [ ] ブラウザ音声出力: PulseAudio/PipeWireフォワーディングで再起動後も自動復旧
-- [ ] SHAPE拡張実装 (xeyes/xlogo非矩形ウィンドウ対応)
-- [ ] RENDER拡張実装 (アンチエイリアス描画)
-- [ ] BIG-REQUESTS拡張実装
-- [ ] XTest拡張実装 (xdotool対応)
-- [ ] GetImage: IOSurfaceからの実ピクセルデータ読み取り
-- [ ] bit_gravity対応（リサイズ時のコンテンツ移動制御）
+### 今後の課題 (実装✅ / 検証✅)
+- [ ][ ] Chrome/VS CodeのURL窓・検索窓でキーボード入力が効かない（FocusIn/Out送信追加済み、要検証）
+- [ ][ ] Chrome/VS Codeで日本語IMEインライン編集が動かない
+- [ ][ ] xtermでIME確定後バックスペースで1文字残るバグ
+- [ ][ ] ブラウザ音声出力: PulseAudio/PipeWireフォワーディングで再起動後も自動復旧
+- [x][ ] SHAPE拡張実装 (xeyes/xlogo非矩形ウィンドウ対応) — shape.rs作成、全サブオペコード対応
+- [ ][ ] RENDER拡張実装 (アンチエイリアス描画)
+- [x][x] BIG-REQUESTS拡張実装 — 既存実装、opcode 133で16MB対応
+- [x][ ] XTest拡張実装 (xdotool対応) — xtest.rs作成、FakeInput/GetVersion対応
+- [x][ ] GetImage: IOSurfaceからの実ピクセルデータ読み取り — ReadPixelsコマンド追加
+- [x][x] bit_gravity対応（リサイズ時のコンテンツ移動制御）— 既にフィールド+setFrameSizeで動作

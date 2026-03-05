@@ -119,6 +119,15 @@ pub enum DisplayCommand {
         handle: NativeWindowHandle,
         pixel: u32,
     },
+    /// Read pixel data from a window's IOSurface (for GetImage).
+    ReadPixels {
+        handle: NativeWindowHandle,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+    },
     /// Shut down the display.
     Shutdown,
 }

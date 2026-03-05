@@ -569,41 +569,39 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
             let _plane_mask = read_u32(conn, &data[16..20]);
             let seq = conn.current_request_sequence();
 
-            // Determine depth, visual, and pixel data from the drawable
-            let (depth, visual, img_data) = if let Some(res) = server.resources.get(&drawable) {
+            // Phase 1: gather info from resources (no await while holding locks)
+            enum GetImageSource {
+                Window { depth: u8, visual: u32, bg: u32, native: Option<crate::display::NativeWindowHandle> },
+                Pixmap { depth: u8, pixels: Vec<u8> },
+                Error,
+            }
+            let source = if let Some(res) = server.resources.get(&drawable) {
                 match res.value() {
                     super::resources::Resource::Window(win) => {
                         let w = win.read();
-                        let bg = w.background_pixel.unwrap_or(0x00000000);
                         let depth = w.depth;
                         let visual = w.visual;
-                        // Fill with background pixel
-                        let pixel_count = width as usize * height as usize;
-                        let mut pixels = Vec::with_capacity(pixel_count * 4);
-                        let bg_bytes = match conn.byte_order {
-                            ByteOrder::BigEndian => bg.to_be_bytes(),
-                            ByteOrder::LittleEndian => bg.to_le_bytes(),
-                        };
-                        for _ in 0..pixel_count {
-                            pixels.extend_from_slice(&bg_bytes);
-                        }
-                        (depth, visual, pixels)
+                        let bg = w.background_pixel.unwrap_or(0);
+                        drop(w);
+                        let native = find_native_handle(server, drawable);
+                        drop(res);
+                        GetImageSource::Window { depth, visual, bg, native }
                     }
                     super::resources::Resource::Pixmap(pix) => {
                         let pix = pix.read();
                         let depth = pix.depth;
                         let src_w = pix.width as usize;
                         let src_h = pix.height as usize;
-                        let x = x.max(0) as usize;
-                        let y = y.max(0) as usize;
+                        let px = x.max(0) as usize;
+                        let py = y.max(0) as usize;
                         let w = width as usize;
                         let h = height as usize;
                         let mut pixels = vec![0u8; w * h * 4];
                         for row in 0..h {
-                            let sy = y + row;
+                            let sy = py + row;
                             if sy >= src_h { break; }
                             for col in 0..w {
-                                let sx = x + col;
+                                let sx = px + col;
                                 if sx >= src_w { continue; }
                                 let src_off = (sy * src_w + sx) * 4;
                                 let dst_off = (row * w + col) * 4;
@@ -612,29 +610,56 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                             }
                         }
-                        (depth, 0, pixels) // pixmaps have no visual
+                        GetImageSource::Pixmap { depth, pixels }
                     }
-                    _ => {
-                        // Return error for non-drawable
-                        let mut err = [0u8; 32];
-                        err[0] = 0;
-                        err[1] = 9; // BadDrawable
-                        err[2] = (seq & 0xFF) as u8;
-                        err[3] = ((seq >> 8) & 0xFF) as u8;
-                        err[8] = opcode;
-                        stream.write_all(&err).await?;
-                        return Ok(());
-                    }
+                    _ => GetImageSource::Error,
                 }
             } else {
-                let mut err = [0u8; 32];
-                err[0] = 0;
-                err[1] = 9; // BadDrawable
-                err[2] = (seq & 0xFF) as u8;
-                err[3] = ((seq >> 8) & 0xFF) as u8;
-                err[8] = opcode;
-                stream.write_all(&err).await?;
-                return Ok(());
+                GetImageSource::Error
+            };
+
+            // Phase 2: resolve (may await for IOSurface read)
+            let (depth, visual, img_data) = match source {
+                GetImageSource::Window { depth, visual, bg, native } => {
+                    if let Some(handle) = native {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let _ = server.display_cmd_tx.send(
+                            crate::display::DisplayCommand::ReadPixels {
+                                handle, x, y, width, height, reply: tx,
+                            });
+                        match rx.await {
+                            Ok(Some(pixels)) => (depth, visual, pixels),
+                            _ => {
+                                let pixel_count = width as usize * height as usize;
+                                let bg_bytes = bg.to_le_bytes();
+                                let mut pixels = vec![0u8; pixel_count * 4];
+                                for i in 0..pixel_count {
+                                    pixels[i*4..i*4+4].copy_from_slice(&bg_bytes);
+                                }
+                                (depth, visual, pixels)
+                            }
+                        }
+                    } else {
+                        let pixel_count = width as usize * height as usize;
+                        let bg_bytes = bg.to_le_bytes();
+                        let mut pixels = vec![0u8; pixel_count * 4];
+                        for i in 0..pixel_count {
+                            pixels[i*4..i*4+4].copy_from_slice(&bg_bytes);
+                        }
+                        (depth, visual, pixels)
+                    }
+                }
+                GetImageSource::Pixmap { depth, pixels } => (depth, 0, pixels),
+                GetImageSource::Error => {
+                    let mut err = [0u8; 32];
+                    err[0] = 0;
+                    err[1] = 9; // BadDrawable
+                    err[2] = (seq & 0xFF) as u8;
+                    err[3] = ((seq >> 8) & 0xFF) as u8;
+                    err[8] = opcode;
+                    stream.write_all(&err).await?;
+                    return Ok(());
+                }
             };
 
             // Build reply: 32-byte header + image data
@@ -743,6 +768,8 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         }
         // Extension opcodes
         131 => super::extensions::xinput2::handle_xinput2_request(server, conn, data, stream).await,
+        132 => super::extensions::xtest::handle_xtest_request(server, conn, data, stream).await,
+        134 => super::extensions::shape::handle_shape_request(server, conn, data, stream).await,
         135 => super::extensions::xkb::handle_xkb_request(server, conn, data, stream).await,
         _ => {
             debug!("Unimplemented opcode: {}", opcode);

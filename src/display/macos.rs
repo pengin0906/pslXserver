@@ -1574,6 +1574,44 @@ fn handle_command(cmd: DisplayCommand) {
             });
         }
 
+        DisplayCommand::ReadPixels { handle, x, y, width, height, reply } => {
+            let result = WINDOWS.with(|w| {
+                let ws = w.borrow();
+                if let Some(info) = ws.get(&handle.id) {
+                    unsafe {
+                        let lock_result = IOSurfaceLock(info.surface, 1, std::ptr::null_mut()); // 1=read-only
+                        if lock_result != 0 {
+                            return None;
+                        }
+                        let base = IOSurfaceGetBaseAddress(info.surface) as *const u8;
+                        let stride = IOSurfaceGetBytesPerRow(info.surface);
+                        let surf_h = info.height as usize;
+                        let w = width as usize;
+                        let h = height as usize;
+                        let mut pixels = vec![0u8; w * h * 4];
+                        for row in 0..h {
+                            let sy = y as usize + row;
+                            if sy >= surf_h { break; }
+                            let src_row = base.add(sy * stride);
+                            let sx_start = (x.max(0) as usize) * 4;
+                            let dst_off = row * w * 4;
+                            let copy_bytes = (w * 4).min(stride - sx_start);
+                            std::ptr::copy_nonoverlapping(
+                                src_row.add(sx_start),
+                                pixels.as_mut_ptr().add(dst_off),
+                                copy_bytes,
+                            );
+                        }
+                        IOSurfaceUnlock(info.surface, 1, std::ptr::null_mut());
+                        Some(pixels)
+                    }
+                } else {
+                    None
+                }
+            });
+            let _ = reply.send(result);
+        }
+
         DisplayCommand::Shutdown => {
             let mtm = MainThreadMarker::new().unwrap();
             NSApplication::sharedApplication(mtm).terminate(None);
