@@ -1063,8 +1063,12 @@ fn process_commands() {
                 let now = (cur_buttons >> btn_idx) & 1;
                 if was == now { continue; }
                 let x11_button: u8 = match btn_idx { 0 => 1, 1 => 3, 2 => 2, _ => 0 };
+                // Find the SINGLE best (frontmost/largest) window under cursor
+                // and send only ONE event. Sending to multiple windows causes
+                // duplicate ButtonPress/Release which breaks implicit grab.
                 WINDOWS.with(|w| {
                     let ws = w.borrow();
+                    let mut best: Option<(crate::display::Xid, i16, i16, f64)> = None;
                     for (_id, info) in ws.iter() {
                         let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
                         let content_h = if let Some(view) = info.window.contentView() {
@@ -1078,21 +1082,25 @@ fn process_commands() {
                         let in_window = win_x >= 0 && win_y >= 0
                             && (win_x as f64) < frame.size.width
                             && (win_y as f64) < content_h;
+                        if in_window {
+                            let area = frame.size.width * content_h;
+                            // Pick largest visible window (main content window)
+                            if best.is_none() || area > best.unwrap().3 {
+                                best = Some((info.x11_id, win_x, win_y, area));
+                            }
+                        }
+                    }
+                    if let Some((x11_id, win_x, win_y, _)) = best {
                         if now == 1 {
-                            // ButtonPress: only for window under cursor
-                            if !in_window { continue; }
                             let btn_mask: u16 = match x11_button { 1=>0x100, 2=>0x200, 3=>0x400, _=>0 };
-                            log::debug!("Polling ButtonPress: btn={} win=0x{:08x} ({},{}) state=0x{:04x}", x11_button, info.x11_id, win_x, win_y, btn_state & !btn_mask);
                             send_display_event(DisplayEvent::ButtonPress {
-                                window: info.x11_id, button: x11_button,
+                                window: x11_id, button: x11_button,
                                 x: win_x, y: win_y, root_x: rx, root_y: ry,
                                 state: btn_state & !btn_mask, time,
                             });
                         } else {
-                            // ButtonRelease: send even when outside window (drag may end outside)
-                            log::debug!("Polling ButtonRelease: btn={} win=0x{:08x} ({},{}) state=0x{:04x}", x11_button, info.x11_id, win_x, win_y, btn_state);
                             send_display_event(DisplayEvent::ButtonRelease {
-                                window: info.x11_id, button: x11_button,
+                                window: x11_id, button: x11_button,
                                 x: win_x, y: win_y, root_x: rx, root_y: ry,
                                 state: btn_state, time,
                             });

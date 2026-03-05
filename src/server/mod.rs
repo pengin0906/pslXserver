@@ -499,7 +499,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     // Update global focus so send_key_event routes to clicked window
                     server.focus_window.store(target, Ordering::Relaxed);
                 }
-                log::debug!("ButtonPress: target=0x{:08x} btn={} ({},{}) state=0x{:04x} grab_on={}", target, button, cx, cy, state, grab_window != 0);
+                eprintln!("BTN_PRESS: src=0x{:08x} target=0x{:08x} btn={} ({},{}) root=({},{}) state=0x{:04x} grab=0x{:08x}", window, target, button, cx, cy, root_x, root_y, state, grab_window);
                 send_button_event(&server, protocol::event_type::BUTTON_PRESS,
                     target, button, cx, cy, root_x, root_y, state, time);
             }
@@ -510,6 +510,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 } else {
                     find_child_at_point(&server, window, x, y)
                 };
+                eprintln!("BTN_RELEASE: src=0x{:08x} target=0x{:08x} btn={} ({},{}) root=({},{}) state=0x{:04x}", window, target, button, cx, cy, root_x, root_y, state);
                 send_button_event(&server, protocol::event_type::BUTTON_RELEASE,
                     target, button, cx, cy, root_x, root_y, state, time);
                 // Release implicit grab when all buttons are released
@@ -781,7 +782,7 @@ fn send_button_event(
             } else { break; }
         } else { break; }
     }
-    log::debug!("  Button event NOT delivered (no window selected mask 0x{:08x}) last_window=0x{:08x}", mask_bit, current);
+    eprintln!("  BTN_NOT_DELIVERED: mask=0x{:08x} last_win=0x{:08x} orig_win=0x{:08x}", mask_bit, current, window);
 }
 
 fn send_motion_event(
