@@ -145,6 +145,10 @@ thread_local! {
     static SCREEN_HEIGHT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     /// Accumulated trackpad scroll delta (pixels). Emit X11 event when threshold exceeded.
     static SCROLL_ACCUM: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// Accumulated horizontal scroll delta (pixels).
+    static SCROLL_ACCUM_X: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// Accumulated pinch-to-zoom magnification delta.
+    static MAGNIFY_ACCUM: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 fn get_scale_factor() -> f64 {
@@ -1512,6 +1516,7 @@ const NS_SCROLL_WHEEL: usize = 22;
 const NS_OTHER_MOUSE_DOWN: usize = 25;
 const NS_OTHER_MOUSE_UP: usize = 26;
 const NS_OTHER_MOUSE_DRAGGED: usize = 27;
+const NS_MAGNIFY: usize = 30;
 
 /// Run the Cocoa application on the main thread.
 /// This function blocks — it IS the main run loop.
@@ -1749,32 +1754,57 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
             if has_precise {
                 // Trackpad: accumulate pixel deltas, emit X11 scroll when threshold hit.
                 // macOS sends many small deltas (2-5px each); X11 button 4/5 = ~3 lines.
-                let delta_y: f64 = unsafe { msg_send![event, scrollingDeltaY] };
-                let accum = SCROLL_ACCUM.with(|a| {
-                    let mut v = a.get() + delta_y;
-                    // Reset accumulator if direction changed
-                    if (v > 0.0) != (delta_y > 0.0) && delta_y != 0.0 {
-                        v = delta_y;
-                    }
-                    a.set(v);
-                    v
-                });
                 let threshold = 80.0; // pixels per X11 scroll click
-                let clicks = (accum.abs() / threshold) as u32;
-                if clicks > 0 {
-                    let button = if accum > 0.0 { 4u8 } else { 5u8 };
-                    // Subtract consumed delta from accumulator
-                    SCROLL_ACCUM.with(|a| {
-                        let remaining = accum - accum.signum() * (clicks as f64 * threshold);
-                        a.set(remaining);
+
+                // Vertical scroll (Button 4=up, 5=down)
+                let delta_y: f64 = unsafe { msg_send![event, scrollingDeltaY] };
+                if delta_y.abs() > 0.1 {
+                    let accum = SCROLL_ACCUM.with(|a| {
+                        let mut v = a.get() + delta_y;
+                        if (v > 0.0) != (delta_y > 0.0) && delta_y != 0.0 { v = delta_y; }
+                        a.set(v);
+                        v
                     });
-                    for _ in 0..clicks.min(3) {
-                        send_display_event(DisplayEvent::ButtonPress {
-                            window: x11_id, button, x, y, root_x, root_y, state, time,
+                    let clicks = (accum.abs() / threshold) as u32;
+                    if clicks > 0 {
+                        let button = if accum > 0.0 { 4u8 } else { 5u8 };
+                        SCROLL_ACCUM.with(|a| {
+                            a.set(accum - accum.signum() * (clicks as f64 * threshold));
                         });
-                        send_display_event(DisplayEvent::ButtonRelease {
-                            window: x11_id, button, x, y, root_x, root_y, state, time,
+                        for _ in 0..clicks.min(3) {
+                            send_display_event(DisplayEvent::ButtonPress {
+                                window: x11_id, button, x, y, root_x, root_y, state, time,
+                            });
+                            send_display_event(DisplayEvent::ButtonRelease {
+                                window: x11_id, button, x, y, root_x, root_y, state, time,
+                            });
+                        }
+                    }
+                }
+
+                // Horizontal scroll (Button 6=left, 7=right)
+                let delta_x: f64 = unsafe { msg_send![event, scrollingDeltaX] };
+                if delta_x.abs() > 0.1 {
+                    let accum_x = SCROLL_ACCUM_X.with(|a| {
+                        let mut v = a.get() + delta_x;
+                        if (v > 0.0) != (delta_x > 0.0) && delta_x != 0.0 { v = delta_x; }
+                        a.set(v);
+                        v
+                    });
+                    let clicks_x = (accum_x.abs() / threshold) as u32;
+                    if clicks_x > 0 {
+                        let button = if accum_x > 0.0 { 6u8 } else { 7u8 };
+                        SCROLL_ACCUM_X.with(|a| {
+                            a.set(accum_x - accum_x.signum() * (clicks_x as f64 * threshold));
                         });
+                        for _ in 0..clicks_x.min(3) {
+                            send_display_event(DisplayEvent::ButtonPress {
+                                window: x11_id, button, x, y, root_x, root_y, state, time,
+                            });
+                            send_display_event(DisplayEvent::ButtonRelease {
+                                window: x11_id, button, x, y, root_x, root_y, state, time,
+                            });
+                        }
                     }
                 }
             } else {
@@ -1782,6 +1812,35 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
                 let delta_y: f64 = unsafe { msg_send![event, scrollingDeltaY] };
                 if delta_y.abs() > 0.1 {
                     let button = if delta_y > 0.0 { 4u8 } else { 5u8 };
+                    send_display_event(DisplayEvent::ButtonPress {
+                        window: x11_id, button, x, y, root_x, root_y, state, time,
+                    });
+                    send_display_event(DisplayEvent::ButtonRelease {
+                        window: x11_id, button, x, y, root_x, root_y, state, time,
+                    });
+                }
+            }
+        }
+        NS_MAGNIFY => {
+            // Pinch-to-zoom → Ctrl + scroll (Button 4/5).
+            // Chrome/Firefox interpret Ctrl+scroll as page zoom.
+            let (x, y) = get_event_location(event, x11_id, win_width, win_height);
+            let (root_x, root_y) = get_screen_mouse_location();
+            let state = get_modifier_state(event) | 0x0004; // Add ControlMask
+            let magnification: f64 = unsafe { msg_send![event, magnification] };
+            let accum = MAGNIFY_ACCUM.with(|a| {
+                let v = a.get() + magnification;
+                a.set(v);
+                v
+            });
+            let threshold = 0.1; // magnification units per scroll click
+            let clicks = (accum.abs() / threshold) as u32;
+            if clicks > 0 {
+                let button = if accum > 0.0 { 4u8 } else { 5u8 }; // zoom in = scroll up
+                MAGNIFY_ACCUM.with(|a| {
+                    a.set(accum - accum.signum() * (clicks as f64 * threshold));
+                });
+                for _ in 0..clicks.min(5) {
                     send_display_event(DisplayEvent::ButtonPress {
                         window: x11_id, button, x, y, root_x, root_y, state, time,
                     });
