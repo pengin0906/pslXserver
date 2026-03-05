@@ -107,6 +107,13 @@ pub enum DisplayCommand {
         handle: NativeWindowHandle,
         cursor_type: u8, // MacOSCursorType as u8
     },
+    /// Set the window icon (ARGB data from _NET_WM_ICON).
+    SetWindowIcon {
+        handle: NativeWindowHandle,
+        width: u32,
+        height: u32,
+        argb_data: Vec<u32>,
+    },
     /// Update the background pixel color for a window (used by setFrameSize during resize).
     SetWindowBackgroundPixel {
         handle: NativeWindowHandle,

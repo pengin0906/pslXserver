@@ -1293,6 +1293,13 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
                     // If WM_NAME was already set before MapWindow, apply it now
                     let title = w.get_property(crate::server::atoms::predefined::WM_NAME)
                         .and_then(|p| std::str::from_utf8(&p.data).ok().map(|s| s.to_string()));
+                    // If _NET_WM_ICON was already set before MapWindow, apply it now
+                    let icon_atom = server.atoms.get_id("_NET_WM_ICON");
+                    if let Some(atom) = icon_atom {
+                        if w.get_property(atom).is_some() {
+                            send_icon_from_property(server, conn, &w, atom, &handle);
+                        }
+                    }
                     (title, w.background_pixel)
                 } else { (None, None) }
             } else { (None, None) };
@@ -1559,6 +1566,7 @@ async fn handle_change_property<S: AsyncRead + AsyncWrite + Unpin>(
     // Resolve property and type atom names for logging
     let prop_name = server.atoms.get_name(property).unwrap_or_default();
     let _type_name = server.atoms.get_name(type_atom).unwrap_or_default();
+    info!("ChangeProperty: wid=0x{:08X} prop={} ({}) type={} fmt={} len={}", wid, prop_name, property, _type_name, format, num_elements);
 
     // Check if this is a clipboard copy response (property = _PSLX_CLIP on root window)
     if server.pending_clipboard_copy.load(std::sync::atomic::Ordering::Relaxed)
@@ -1608,9 +1616,65 @@ async fn handle_change_property<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             }
+
+            // Check for _NET_WM_ICON to update native window icon
+            if prop_name == "_NET_WM_ICON" && format == 32 {
+                if let Some(ref handle) = w.native_window {
+                    send_icon_from_property(server, conn, &w, property, handle);
+                }
+                // If native_window not yet set, icon will be applied in handle_map_window
+            }
         }
     }
     Ok(())
+}
+
+/// Extract _NET_WM_ICON data from a window property and send SetWindowIcon command.
+fn send_icon_from_property(
+    server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
+    w: &super::resources::WindowState,
+    property: u32,
+    handle: &crate::display::NativeWindowHandle,
+) {
+    if let Some(prop) = w.get_property(property) {
+        let icon_data: Vec<u32> = prop.data.chunks_exact(4)
+            .map(|c| read_u32(conn, c))
+            .collect();
+        let mut best_w = 0u32;
+        let mut best_h = 0u32;
+        let mut best_offset = 0usize;
+        let mut best_score = u32::MAX;
+        let mut offset = 0usize;
+        while offset + 2 < icon_data.len() {
+            let iw = icon_data[offset];
+            let ih = icon_data[offset + 1];
+            let pixel_count = (iw as usize) * (ih as usize);
+            if offset + 2 + pixel_count > icon_data.len() { break; }
+            let score = ((iw as i32 - 48).unsigned_abs())
+                .saturating_add((ih as i32 - 48).unsigned_abs());
+            if score < best_score {
+                best_score = score;
+                best_w = iw;
+                best_h = ih;
+                best_offset = offset + 2;
+            }
+            offset += 2 + pixel_count;
+        }
+        if best_w > 0 && best_h > 0 {
+            let pixel_count = (best_w as usize) * (best_h as usize);
+            let argb_data = icon_data[best_offset..best_offset + pixel_count].to_vec();
+            info!("SetWindowIcon: {}x{} for handle {}", best_w, best_h, handle.id);
+            let _ = server.display_cmd_tx.send(
+                crate::display::DisplayCommand::SetWindowIcon {
+                    handle: handle.clone(),
+                    width: best_w,
+                    height: best_h,
+                    argb_data,
+                },
+            );
+        }
+    }
 }
 
 async fn handle_get_property<S: AsyncRead + AsyncWrite + Unpin>(

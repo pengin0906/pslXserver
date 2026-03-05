@@ -1362,6 +1362,96 @@ fn handle_command(cmd: DisplayCommand) {
             });
         }
 
+        DisplayCommand::SetWindowIcon { handle, width, height, argb_data } => {
+            WINDOWS.with(|w| {
+                if let Some(info) = w.borrow().get(&handle.id) {
+                    // Convert ARGB (network byte order) to RGBA for NSBitmapImageRep
+                    let pixel_count = (width * height) as usize;
+                    let mut rgba = vec![0u8; pixel_count * 4];
+                    for i in 0..pixel_count {
+                        let argb = argb_data[i];
+                        let a = ((argb >> 24) & 0xFF) as u8;
+                        let r = ((argb >> 16) & 0xFF) as u8;
+                        let g = ((argb >> 8) & 0xFF) as u8;
+                        let b = (argb & 0xFF) as u8;
+                        rgba[i * 4]     = r;
+                        rgba[i * 4 + 1] = g;
+                        rgba[i * 4 + 2] = b;
+                        rgba[i * 4 + 3] = a;
+                    }
+                    unsafe {
+                        use objc2::msg_send;
+                        use objc2::runtime::AnyObject;
+                        // Create NSBitmapImageRep from RGBA data
+                        let rep: *mut AnyObject = msg_send![objc2::class!(NSBitmapImageRep), alloc];
+                        let rep: *mut AnyObject = msg_send![rep,
+                            initWithBitmapDataPlanes: &rgba.as_ptr() as *const *const u8
+                            pixelsWide: width as isize
+                            pixelsHigh: height as isize
+                            bitsPerSample: 8isize
+                            samplesPerPixel: 4isize
+                            hasAlpha: true
+                            isPlanar: false
+                            colorSpaceName: &*NSString::from_str("NSDeviceRGBColorSpace")
+                            bytesPerRow: (width * 4) as isize
+                            bitsPerPixel: 32isize
+                        ];
+                        if !rep.is_null() {
+                            let size = NSSize { width: width as f64, height: height as f64 };
+                            let image: *mut AnyObject = msg_send![objc2::class!(NSImage), alloc];
+                            let image: *mut AnyObject = msg_send![image, initWithSize: size];
+                            if !image.is_null() {
+                                let _: () = msg_send![image, addRepresentation: rep];
+
+                                // Set title bar proxy icon via representedURL
+                                // This makes the icon appear in the window title bar
+                                let url: *mut AnyObject = msg_send![
+                                    objc2::class!(NSURL),
+                                    fileURLWithPath: &*NSString::from_str("/tmp/.pslx_icon")
+                                ];
+                                if !url.is_null() {
+                                    let _: () = msg_send![&*info.window, setRepresentedURL: url];
+                                }
+                                // Override the proxy icon with our custom image
+                                let icon_button: *mut AnyObject = msg_send![
+                                    &*info.window,
+                                    standardWindowButton: 4isize  // NSWindowDocumentIconButton = 4
+                                ];
+                                if !icon_button.is_null() {
+                                    let icon_size = NSSize { width: 16.0, height: 16.0 };
+                                    let _: () = msg_send![image, setSize: icon_size];
+                                    let _: () = msg_send![icon_button, setImage: image];
+                                }
+
+                                // Set as Dock icon
+                                let dock_tile: *mut AnyObject = msg_send![&*info.window, dockTile];
+                                if !dock_tile.is_null() {
+                                    // Reset image to original size for Dock
+                                    let _: () = msg_send![image, setSize: size];
+                                    let image_view: *mut AnyObject = msg_send![objc2::class!(NSImageView), alloc];
+                                    let frame = NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size };
+                                    let image_view: *mut AnyObject = msg_send![image_view, initWithFrame: frame];
+                                    let _: () = msg_send![image_view, setImage: image];
+                                    let _: () = msg_send![dock_tile, setContentView: image_view];
+                                    let _: () = msg_send![dock_tile, display];
+                                    let _: () = msg_send![image_view, release];
+                                }
+                                // Set as miniwindow + app Dock icon
+                                let _: () = msg_send![image, setSize: size];
+                                let _: () = msg_send![&*info.window, setMiniwindowImage: image];
+                                let mtm = MainThreadMarker::new().unwrap();
+                                let app = NSApplication::sharedApplication(mtm);
+                                let _: () = msg_send![&*app, setApplicationIconImage: image];
+                                let _: () = msg_send![image, release];
+                            }
+                            let _: () = msg_send![rep, release];
+                        }
+                    }
+                    log::info!("SetWindowIcon: {}x{} icon applied to window {}", width, height, handle.id);
+                }
+            });
+        }
+
         DisplayCommand::MoveResizeWindow { handle, x, y, width, height } => {
             // Extract window ref and computed frame BEFORE dropping the WINDOWS borrow.
             // setFrame_display triggers setFrameSize: override which needs borrow_mut.
@@ -1560,6 +1650,98 @@ pub fn run_cocoa_app(
             SCREEN_HEIGHT.with(|sh| sh.set(frame.size.height));
             info!("Backing scale factor: {}, screen height: {}", scale, frame.size.height);
         }
+    }
+
+    // Set "X" application icon for Dock
+    unsafe {
+        extern "C" {
+            fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
+            fn CGBitmapContextCreate(
+                data: *mut std::ffi::c_void, width: usize, height: usize,
+                bits_per_component: usize, bytes_per_row: usize,
+                colorspace: *mut std::ffi::c_void, bitmap_info: u32,
+            ) -> *mut std::ffi::c_void;
+            fn CGContextSetRGBFillColor(ctx: *mut std::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
+            fn CGContextFillRect(ctx: *mut std::ffi::c_void, rect: CGRect);
+            fn CGContextRelease(ctx: *mut std::ffi::c_void);
+            fn CGColorSpaceRelease(cs: *mut std::ffi::c_void);
+            fn CTFontCreateWithName(name: *const std::ffi::c_void, size: f64, matrix: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CTLineCreateWithAttributedString(attr_str: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn CTLineDraw(line: *const std::ffi::c_void, ctx: *mut std::ffi::c_void);
+            fn CGContextSetTextPosition(ctx: *mut std::ffi::c_void, x: f64, y: f64);
+            fn CFRelease(cf: *mut std::ffi::c_void);
+        }
+        #[repr(C)]
+        struct CGRect { x: f64, y: f64, w: f64, h: f64 }
+        let icon_size: usize = 128;
+        let stride = icon_size * 4;
+        let mut buf = vec![0u8; stride * icon_size];
+        let cs = CGColorSpaceCreateDeviceRGB();
+        let ctx = CGBitmapContextCreate(
+            buf.as_mut_ptr() as *mut _, icon_size, icon_size, 8, stride, cs, 0x2002,
+        );
+        if !ctx.is_null() {
+            // Black background with rounded feel
+            CGContextSetRGBFillColor(ctx, 0.1, 0.1, 0.1, 1.0);
+            CGContextFillRect(ctx, CGRect { x: 0.0, y: 0.0, w: 128.0, h: 128.0 });
+            // White "X" text
+            CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+            let font_name: *mut AnyObject = msg_send![
+                objc2::class!(NSString), stringWithUTF8String: c"Helvetica-Bold".as_ptr()
+            ];
+            let ct_font = CTFontCreateWithName(font_name as *const _, 100.0, std::ptr::null());
+            if !ct_font.is_null() {
+                extern "C" {
+                    static kCTFontAttributeName: *const std::ffi::c_void;
+                    static kCTForegroundColorFromContextAttributeName: *const std::ffi::c_void;
+                }
+                let yes: *mut AnyObject = msg_send![objc2::class!(NSNumber), numberWithBool: true];
+                let keys = [kCTFontAttributeName as *const AnyObject, kCTForegroundColorFromContextAttributeName as *const AnyObject];
+                let vals = [ct_font as *const AnyObject, yes as *const AnyObject];
+                let attrs: *mut AnyObject = msg_send![
+                    objc2::class!(NSDictionary), dictionaryWithObjects: vals.as_ptr() forKeys: keys.as_ptr() count: 2usize
+                ];
+                let x_str: *mut AnyObject = msg_send![
+                    objc2::class!(NSString), stringWithUTF8String: c"X".as_ptr()
+                ];
+                let attr_str: *mut AnyObject = msg_send![objc2::class!(NSAttributedString), alloc];
+                let attr_str: *mut AnyObject = msg_send![attr_str, initWithString: x_str attributes: attrs];
+                if !attr_str.is_null() {
+                    let ct_line = CTLineCreateWithAttributedString(attr_str as *const _);
+                    if !ct_line.is_null() {
+                        CGContextSetTextPosition(ctx, 28.0, 18.0);
+                        CTLineDraw(ct_line as *const _, ctx);
+                        CFRelease(ct_line);
+                    }
+                    let _: () = msg_send![&*attr_str, release];
+                }
+                CFRelease(ct_font);
+            }
+            CGContextRelease(ctx);
+
+            // Create NSImage from bitmap
+            let rep: *mut AnyObject = msg_send![objc2::class!(NSBitmapImageRep), alloc];
+            let rep: *mut AnyObject = msg_send![rep,
+                initWithBitmapDataPlanes: &buf.as_ptr() as *const *const u8
+                pixelsWide: 128isize pixelsHigh: 128isize
+                bitsPerSample: 8isize samplesPerPixel: 4isize
+                hasAlpha: true isPlanar: false
+                colorSpaceName: &*NSString::from_str("NSDeviceRGBColorSpace")
+                bytesPerRow: stride as isize bitsPerPixel: 32isize
+            ];
+            if !rep.is_null() {
+                let sz = NSSize { width: 128.0, height: 128.0 };
+                let image: *mut AnyObject = msg_send![objc2::class!(NSImage), alloc];
+                let image: *mut AnyObject = msg_send![image, initWithSize: sz];
+                if !image.is_null() {
+                    let _: () = msg_send![image, addRepresentation: rep];
+                    let _: () = msg_send![&*app, setApplicationIconImage: image];
+                    let _: () = msg_send![image, release];
+                }
+                let _: () = msg_send![rep, release];
+            }
+        }
+        CGColorSpaceRelease(cs);
     }
 
     info!("Cocoa application initialized with display command polling");
