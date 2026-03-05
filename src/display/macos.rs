@@ -1152,56 +1152,36 @@ fn process_commands() {
             let mut ws = w.borrow_mut();
             for (win_id, commands) in render_batches {
                 if let Some(info) = ws.get_mut(&win_id) {
-                    // Copy current display content → render surface (for incremental updates).
-                    // After last frame's swap, render surface has stale data from 2 frames ago.
-                    unsafe {
-                        IOSurfaceLock(info.display_surface, 1, std::ptr::null_mut()); // read-only
-                        IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
-                        let src = IOSurfaceGetBaseAddress(info.display_surface) as *const u8;
-                        let dst = IOSurfaceGetBaseAddress(info.surface) as *mut u8;
-                        let src_stride = IOSurfaceGetBytesPerRow(info.display_surface);
-                        let dst_stride = IOSurfaceGetBytesPerRow(info.surface);
-                        let h = info.height as usize;
-                        if src_stride == dst_stride {
-                            std::ptr::copy_nonoverlapping(src, dst, src_stride * h);
-                        } else {
-                            let row_bytes = (info.width as usize) * 4;
-                            for row in 0..h {
-                                std::ptr::copy_nonoverlapping(
-                                    src.add(row * src_stride),
-                                    dst.add(row * dst_stride),
-                                    row_bytes,
-                                );
-                            }
-                        }
-                        IOSurfaceUnlock(info.display_surface, 1, std::ptr::null_mut());
-                        // surface remains locked for rendering below
-                    }
-
-                    let base = unsafe { IOSurfaceGetBaseAddress(info.surface) };
-                    let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.surface) };
-                    let buf_len = bytes_per_row * info.height as usize;
-                    let buffer = unsafe {
-                        std::slice::from_raw_parts_mut(base as *mut u8, buf_len)
-                    };
+                    info!("Render batch: win_id={} x11=0x{:08X} cmds={} pending_show={} surface_null={}",
+                          win_id, info.x11_id, commands.len(), info.pending_show, info.surface.is_null());
                     let width = info.width as u32;
                     let height = info.height as u32;
-                    let stride = bytes_per_row as u32;
 
                     // Drop redundant full-window PutImage frames — keep only the last one.
                     // Electron/Chromium sends many full-screen PutImage per frame; only the
                     // final one matters since each overwrites the entire surface.
                     let commands = coalesce_putimage(commands, width, height);
 
+                    // Single-buffer: render directly on display_surface.
+                    // No swap, no copy. Use setContentsChanged to notify CA.
+                    unsafe {
+                        IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
+                    }
+
+                    let base = unsafe { IOSurfaceGetBaseAddress(info.display_surface) };
+                    let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.display_surface) };
+                    let buf_len = bytes_per_row * info.height as usize;
+                    let buffer = unsafe {
+                        std::slice::from_raw_parts_mut(base as *mut u8, buf_len)
+                    };
+                    let stride = bytes_per_row as u32;
+
                     for c in &commands {
                         render_to_buffer(buffer, width, height, stride, c);
                     }
 
-                    unsafe { IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut()); }
+                    unsafe { IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut()); }
 
-                    // Double-buffer swap: rendered surface becomes display surface.
-                    // CA sees a different IOSurface pointer each frame → forces re-read.
-                    std::mem::swap(&mut info.surface, &mut info.display_surface);
                     flush_window(info);
 
                     // Deferred show: make window visible after the first render
@@ -1601,9 +1581,8 @@ fn get_ns_cursor(cursor_type: u8) -> *mut AnyObject {
     }
 }
 
-/// Inner flush: set display_surface as CALayer contents.
-/// Double-buffering ensures the pointer alternates each frame, forcing CALayer
-/// to re-read pixel data. No CGImage creation needed — zero color-space conversion overhead.
+///// Notify CA that display_surface contents changed. Single-buffer: same
+/// IOSurface pointer, no swap. setContentsChanged tells CA to re-read.
 fn flush_window(info: &WindowInfo) {
     unsafe {
         if info.width == 0 || info.height == 0 || info.display_surface.is_null() { return; }
@@ -1613,6 +1592,7 @@ fn flush_window(info: &WindowInfo) {
                 let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
                 let _: () = msg_send![ca_cls, begin];
                 let _: () = msg_send![ca_cls, setDisableActions: true];
+                let _: () = msg_send![layer, setContentsChanged];
                 let _: () = msg_send![layer, setContents: info.display_surface as *mut AnyObject];
                 let _: () = msg_send![ca_cls, commit];
             }
