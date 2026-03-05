@@ -179,24 +179,13 @@ pub fn render_to_buffer(
                         let src_end = src_off + copy_w * 4;
                         let dst_end = dst_off + copy_w * 4;
                         if src_end <= data.len() && dst_end <= buffer.len() {
-                            if *depth == 32 {
-                                // 32-bit: source may already have correct alpha, copy and fix in one pass
-                                buffer[dst_off..dst_end].copy_from_slice(&data[src_off..src_end]);
-                                // Force alpha to 0xFF using u32 OR (4 bytes at a time)
-                                for chunk in buffer[dst_off..dst_end].chunks_exact_mut(4) {
-                                    // OR with alpha mask — branchless, no separate loop
-                                    let p = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                                    let p_fixed = p | 0xFF000000;
-                                    chunk.copy_from_slice(&p_fixed.to_ne_bytes());
-                                }
-                            } else {
-                                // 24-bit depth: source alpha is 0, set to 0xFF directly via u32 writes
-                                let src_slice = &data[src_off..src_end];
-                                let dst_slice = &mut buffer[dst_off..dst_end];
-                                for (dst_chunk, src_chunk) in dst_slice.chunks_exact_mut(4).zip(src_slice.chunks_exact(4)) {
-                                    let p = u32::from_ne_bytes([src_chunk[0], src_chunk[1], src_chunk[2], 0xFF]);
-                                    dst_chunk.copy_from_slice(&p.to_ne_bytes());
-                                }
+                            // Single-pass copy + alpha fix for both 24-bit and 32-bit depth.
+                            // Avoids double-touching cache lines (no separate copy then fix).
+                            let src_slice = &data[src_off..src_end];
+                            let dst_slice = &mut buffer[dst_off..dst_end];
+                            for (dst_chunk, src_chunk) in dst_slice.chunks_exact_mut(4).zip(src_slice.chunks_exact(4)) {
+                                let p = u32::from_ne_bytes([src_chunk[0], src_chunk[1], src_chunk[2], src_chunk[3]]) | 0xFF000000;
+                                dst_chunk.copy_from_slice(&p.to_ne_bytes());
                             }
                         }
                     }

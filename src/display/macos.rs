@@ -426,9 +426,14 @@ unsafe extern "C" fn do_command_by_selector(_this: *mut AnyObject, _sel: Sel, _a
 }
 
 unsafe extern "C" fn has_marked_text(_this: *mut AnyObject, _sel: Sel) -> Bool {
-    // Always return NO — we don't render marked text ourselves.
-    // macOS IME still shows the candidate window and calls insertText on commit.
-    Bool::NO
+    // Return YES during IME composition so macOS properly shows the candidate window.
+    // Preedit is not sent to X11 (ibus on remote Linux re-processes it), so macOS
+    // candidate window is the only preedit display.
+    if crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) {
+        Bool::YES
+    } else {
+        Bool::NO
+    }
 }
 
 unsafe extern "C" fn marked_range(_this: *mut AnyObject, _sel: Sel) -> NSRange {
@@ -914,10 +919,22 @@ fn check_window_resizes() {
                         IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
                     }
 
-                    // Replace both surfaces and update dimensions
+                    // Replace both surfaces and update dimensions.
+                    // Both must use the same alloc size to ensure matching stride.
                     let old_surface = info.surface;
                     let old_display = info.display_surface;
-                    let new_display = create_iosurface(change.new_w, change.new_h);
+                    let new_display = create_iosurface(alloc_w, alloc_h);
+                    // Copy new_surface → new_display so both have identical content.
+                    unsafe {
+                        IOSurfaceLock(new_surface, 1, std::ptr::null_mut());
+                        IOSurfaceLock(new_display, 0, std::ptr::null_mut());
+                        let src = IOSurfaceGetBaseAddress(new_surface) as *const u8;
+                        let dst = IOSurfaceGetBaseAddress(new_display) as *mut u8;
+                        let stride = IOSurfaceGetBytesPerRow(new_surface);
+                        std::ptr::copy_nonoverlapping(src, dst, stride * change.new_h as usize);
+                        IOSurfaceUnlock(new_display, 0, std::ptr::null_mut());
+                        IOSurfaceUnlock(new_surface, 1, std::ptr::null_mut());
+                    }
                     info.surface = new_surface;
                     info.display_surface = new_display;
                     info.width = change.new_w;
@@ -1022,19 +1039,24 @@ fn process_commands() {
 
     // 1.5. Detect button press/release edges + send MotionNotify when cursor moves
     {
-        let (rx, ry) = get_screen_mouse_location();
+        // Cache mouse location and button state once per tick (avoid repeated ObjC calls)
+        let mouse_loc: NSPoint = unsafe { msg_send![objc2::class!(NSEvent), mouseLocation] };
+        let sh = SCREEN_HEIGHT.with(|sh| sh.get());
+        let rx = mouse_loc.x as i16;
+        let ry = (sh - mouse_loc.y) as i16;
         let cur_buttons: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
         let prev_buttons = LAST_BUTTONS.with(|lb| lb.get());
 
         // Detect button edges and send ButtonPress/ButtonRelease
         if cur_buttons != prev_buttons {
             LAST_BUTTONS.with(|lb| lb.set(cur_buttons));
-            let mouse_loc: NSPoint = unsafe { msg_send![objc2::class!(NSEvent), mouseLocation] };
             let time = unsafe {
                 let pi: *mut AnyObject = msg_send![objc2::class!(NSProcessInfo), processInfo];
                 let uptime: f64 = msg_send![pi, systemUptime];
                 (uptime * 1000.0) as u32
             };
+            // Compute button state once from cur_buttons
+            let btn_state = buttons_to_x11_state(cur_buttons);
             // Check each of the first 3 buttons (left, right, middle)
             for btn_idx in 0u64..3 {
                 let was = (prev_buttons >> btn_idx) & 1;
@@ -1056,24 +1078,23 @@ fn process_commands() {
                         let in_window = win_x >= 0 && win_y >= 0
                             && (win_x as f64) < frame.size.width
                             && (win_y as f64) < content_h;
-                        let state = get_mouse_button_state();
                         if now == 1 {
                             // ButtonPress: only for window under cursor
                             if !in_window { continue; }
                             let btn_mask: u16 = match x11_button { 1=>0x100, 2=>0x200, 3=>0x400, _=>0 };
-                            log::debug!("Polling ButtonPress: btn={} win=0x{:08x} ({},{}) state=0x{:04x}", x11_button, info.x11_id, win_x, win_y, state & !btn_mask);
+                            log::debug!("Polling ButtonPress: btn={} win=0x{:08x} ({},{}) state=0x{:04x}", x11_button, info.x11_id, win_x, win_y, btn_state & !btn_mask);
                             send_display_event(DisplayEvent::ButtonPress {
                                 window: info.x11_id, button: x11_button,
                                 x: win_x, y: win_y, root_x: rx, root_y: ry,
-                                state: state & !btn_mask, time,
+                                state: btn_state & !btn_mask, time,
                             });
                         } else {
                             // ButtonRelease: send even when outside window (drag may end outside)
-                            log::debug!("Polling ButtonRelease: btn={} win=0x{:08x} ({},{}) state=0x{:04x}", x11_button, info.x11_id, win_x, win_y, state);
+                            log::debug!("Polling ButtonRelease: btn={} win=0x{:08x} ({},{}) state=0x{:04x}", x11_button, info.x11_id, win_x, win_y, btn_state);
                             send_display_event(DisplayEvent::ButtonRelease {
                                 window: info.x11_id, button: x11_button,
                                 x: win_x, y: win_y, root_x: rx, root_y: ry,
-                                state, time,
+                                state: btn_state, time,
                             });
                         }
                     }
@@ -1083,14 +1104,11 @@ fn process_commands() {
 
         let last = LAST_POINTER.with(|lp| lp.get());
         if rx != last.0 || ry != last.1 {
-            let btn_state = get_mouse_button_state();
+            let btn_state = buttons_to_x11_state(cur_buttons);
             LAST_POINTER.with(|lp| lp.set((rx, ry)));
             send_display_event(DisplayEvent::GlobalPointerUpdate { root_x: rx, root_y: ry });
 
-            // Send MotionNotify to each window with correct window-relative coords.
-            // macOS knows each window's actual screen position, so coords are accurate.
-            let mouse_loc: NSPoint = unsafe { msg_send![objc2::class!(NSEvent), mouseLocation] };
-            // Get timestamp once (not per-window)
+            // Get timestamp once
             let time = unsafe {
                 let pi: *mut AnyObject = msg_send![objc2::class!(NSProcessInfo), processInfo];
                 let uptime: f64 = msg_send![pi, systemUptime];
@@ -1106,10 +1124,8 @@ fn process_commands() {
                     } else {
                         frame.size.height
                     };
-                    let content_origin_x = frame.origin.x;
-                    let content_origin_y = frame.origin.y;
-                    let win_x = (mouse_loc.x - content_origin_x) as i16;
-                    let win_y = (content_origin_y + content_h - mouse_loc.y) as i16;
+                    let win_x = (mouse_loc.x - frame.origin.x) as i16;
+                    let win_y = (frame.origin.y + content_h - mouse_loc.y) as i16;
 
                     send_display_event(DisplayEvent::MotionNotify {
                         window: info.x11_id,
@@ -1117,7 +1133,7 @@ fn process_commands() {
                         y: win_y,
                         root_x: rx,
                         root_y: ry,
-                        state: get_mouse_button_state(),
+                        state: btn_state,
                         time,
                     });
                 }
@@ -1128,78 +1144,96 @@ fn process_commands() {
     // 1.6. Detect window resizes — compare content view size to stored IOSurface size
     check_window_resizes();
 
-    // 2. Drain render mailbox — atomically take all pending commands per window
-    let render_batches: Vec<(u64, Vec<crate::display::RenderCommand>)> = RENDER_MAILBOX.with(|mb| {
+    // 2. Drain render mailbox + render — targeted get_mut per window (avoids iter_mut's 16-shard scan)
+    RENDER_MAILBOX.with(|mb| {
         let mb = mb.borrow();
         if let Some(ref mailbox) = *mb {
-            // Take all entries, leaving empty vecs
-            let mut batches = Vec::new();
-            for mut entry in mailbox.iter_mut() {
-                if !entry.value().is_empty() {
-                    let commands = std::mem::take(entry.value_mut());
-                    batches.push((*entry.key(), commands));
+            if mailbox.is_empty() { return; }
+            WINDOWS.with(|w| {
+                let mut ws = w.borrow_mut();
+                let win_ids: Vec<u64> = ws.keys().copied().collect();
+                for win_id in win_ids {
+                    // get_mut locks only 1 shard (not all 16)
+                    let commands = if let Some(mut entry) = mailbox.get_mut(&win_id) {
+                        if entry.is_empty() { continue; }
+                        std::mem::take(entry.value_mut())
+                    } else {
+                        continue;
+                    };
+                    // entry guard dropped here — shard unlocked before rendering
+
+                    if let Some(info) = ws.get_mut(&win_id) {
+                        let width = info.width as u32;
+                        let height = info.height as u32;
+
+                        // Drop redundant full-window PutImage frames — keep only the last one.
+                        let commands = coalesce_putimage(commands, width, height);
+
+                        // Skip expensive display→render surface copy when first command covers all.
+                        let first_covers_all = matches!(commands.first(),
+                            Some(crate::display::RenderCommand::PutImage { x, y, width: w, height: h, .. })
+                            if *x == 0 && *y == 0 && *w as u32 >= width && *h as u32 >= height
+                        );
+
+                        unsafe {
+                            IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
+                            if !first_covers_all {
+                                IOSurfaceLock(info.display_surface, 1, std::ptr::null_mut());
+                                let src = IOSurfaceGetBaseAddress(info.display_surface) as *const u8;
+                                let dst = IOSurfaceGetBaseAddress(info.surface) as *mut u8;
+                                let src_stride = IOSurfaceGetBytesPerRow(info.display_surface);
+                                let dst_stride = IOSurfaceGetBytesPerRow(info.surface);
+                                let h = info.height as usize;
+                                if src_stride == dst_stride {
+                                    std::ptr::copy_nonoverlapping(src, dst, src_stride * h);
+                                } else {
+                                    let row_bytes = (info.width as usize) * 4;
+                                    for row in 0..h {
+                                        std::ptr::copy_nonoverlapping(
+                                            src.add(row * src_stride),
+                                            dst.add(row * dst_stride),
+                                            row_bytes,
+                                        );
+                                    }
+                                }
+                                IOSurfaceUnlock(info.display_surface, 1, std::ptr::null_mut());
+                            }
+                        }
+
+                        let base = unsafe { IOSurfaceGetBaseAddress(info.surface) };
+                        let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.surface) };
+                        let buf_len = bytes_per_row * info.height as usize;
+                        let buffer = unsafe {
+                            std::slice::from_raw_parts_mut(base as *mut u8, buf_len)
+                        };
+                        let stride = bytes_per_row as u32;
+
+                        for c in &commands {
+                            render_to_buffer(buffer, width, height, stride, c);
+                        }
+
+                        unsafe { IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut()); }
+
+                        std::mem::swap(&mut info.surface, &mut info.display_surface);
+                        flush_window(info);
+
+                        log::debug!("Rendering {} cmds to window {} (pending_show={})", commands.len(), win_id, info.pending_show);
+                        if info.pending_show {
+                            info.pending_show = false;
+                            let mtm = MainThreadMarker::new().unwrap();
+                            let app = NSApplication::sharedApplication(mtm);
+                            unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
+                            info.window.makeKeyAndOrderFront(None);
+                        }
+                    }
                 }
-            }
-            batches
-        } else {
-            Vec::new()
+            });
         }
     });
 
-    // 3. Render merged batches — one lock/render/flush per window
-    if !render_batches.is_empty() {
-        WINDOWS.with(|w| {
-            let mut ws = w.borrow_mut();
-            for (win_id, commands) in render_batches {
-                if let Some(info) = ws.get_mut(&win_id) {
-                    info!("Render batch: win_id={} x11=0x{:08X} cmds={} pending_show={} surface_null={}",
-                          win_id, info.x11_id, commands.len(), info.pending_show, info.surface.is_null());
-                    let width = info.width as u32;
-                    let height = info.height as u32;
-
-                    // Drop redundant full-window PutImage frames — keep only the last one.
-                    // Electron/Chromium sends many full-screen PutImage per frame; only the
-                    // final one matters since each overwrites the entire surface.
-                    let commands = coalesce_putimage(commands, width, height);
-
-                    // Single-buffer: render directly on display_surface.
-                    // No swap, no copy. Use setContentsChanged to notify CA.
-                    unsafe {
-                        IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
-                    }
-
-                    let base = unsafe { IOSurfaceGetBaseAddress(info.display_surface) };
-                    let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.display_surface) };
-                    let buf_len = bytes_per_row * info.height as usize;
-                    let buffer = unsafe {
-                        std::slice::from_raw_parts_mut(base as *mut u8, buf_len)
-                    };
-                    let stride = bytes_per_row as u32;
-
-                    for c in &commands {
-                        render_to_buffer(buffer, width, height, stride, c);
-                    }
-
-                    unsafe { IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut()); }
-
-                    flush_window(info);
-
-                    // Deferred show: make window visible after the first render
-                    // so the client's drawing is already in the surface.
-                    if info.pending_show {
-                        info.pending_show = false;
-                        let mtm = MainThreadMarker::new().unwrap();
-                        let app = NSApplication::sharedApplication(mtm);
-                        unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
-                        info.window.makeKeyAndOrderFront(None);
-                    }
-                }
-            }
-        });
-
-        // Force immediate compositing
-        ca_transaction_flush();
-    }
+    // Force immediate compositing after rendering (if any windows were drawn)
+    // ca_transaction_flush is cheap when no CATransaction was started
+    ca_transaction_flush();
 }
 
 fn handle_command(cmd: DisplayCommand) {
@@ -1581,8 +1615,9 @@ fn get_ns_cursor(cursor_type: u8) -> *mut AnyObject {
     }
 }
 
-///// Notify CA that display_surface contents changed. Single-buffer: same
-/// IOSurface pointer, no swap. setContentsChanged tells CA to re-read.
+/// Inner flush: set display_surface as CALayer contents.
+/// Double-buffering ensures the pointer alternates each frame, forcing CALayer
+/// to re-read pixel data. No CGImage creation needed — zero color-space conversion overhead.
 fn flush_window(info: &WindowInfo) {
     unsafe {
         if info.width == 0 || info.height == 0 || info.display_surface.is_null() { return; }
@@ -1592,7 +1627,6 @@ fn flush_window(info: &WindowInfo) {
                 let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
                 let _: () = msg_send![ca_cls, begin];
                 let _: () = msg_send![ca_cls, setDisableActions: true];
-                let _: () = msg_send![layer, setContentsChanged];
                 let _: () = msg_send![layer, setContents: info.display_surface as *mut AnyObject];
                 let _: () = msg_send![ca_cls, commit];
             }
@@ -2117,13 +2151,19 @@ fn get_modifier_state(event: &AnyObject) -> u16 {
 }
 
 /// Get current mouse button state without an event (for polling path).
-fn get_mouse_button_state() -> u16 {
-    let pressed: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
+/// Convert macOS pressedMouseButtons bitmask to X11 button state.
+/// Call once and reuse, avoiding repeated ObjC calls.
+fn buttons_to_x11_state(pressed: u64) -> u16 {
     let mut state = 0u16;
     if pressed & (1 << 0) != 0 { state |= 0x100; }  // Button1Mask
     if pressed & (1 << 1) != 0 { state |= 0x400; }  // Button3Mask
     if pressed & (1 << 2) != 0 { state |= 0x200; }  // Button2Mask
     state
+}
+
+fn get_mouse_button_state() -> u16 {
+    let pressed: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
+    buttons_to_x11_state(pressed)
 }
 
 fn send_display_event(evt: DisplayEvent) {
