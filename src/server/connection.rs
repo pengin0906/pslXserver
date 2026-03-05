@@ -26,6 +26,8 @@ pub struct ClientConnection {
     pub sequence_number: AtomicU16,
     /// Channel for sending X11 events to this client's connection task.
     pub event_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Signaled when client processes GetKeyboardMapping after MappingNotify.
+    pub mapping_ack: tokio::sync::Notify,
 }
 
 impl ClientConnection {
@@ -128,6 +130,7 @@ where
         byte_order,
         sequence_number: AtomicU16::new(1),
         event_tx,
+        mapping_ack: tokio::sync::Notify::new(),
     });
 
     // Register the connection
@@ -3621,6 +3624,8 @@ async fn handle_get_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     stream.write_all(&reply).await?;
+    // Signal that client has fetched the updated keymap
+    conn.mapping_ack.notify_one();
     Ok(())
 }
 

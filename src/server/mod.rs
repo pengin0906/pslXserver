@@ -602,14 +602,17 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 } else {
                     // Non-XIM clients (xterm, VS Code): inline preedit via BS + KeyPress
                     // Incremental update: if new text extends old, only send appended chars
-                    if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
-                        // Append only the new suffix (no BS needed)
+                    let is_incremental = !preedit_text.is_empty() && text.starts_with(&*preedit_text);
+                    if is_incremental {
                         let suffix = &text[preedit_text.len()..];
+                        info!("ImePreeditDraw: INCREMENTAL old='{}' col={} suffix='{}'",
+                            preedit_text, preedit_col_count, suffix);
                         if !suffix.is_empty() {
                             send_ime_text(&server, target, suffix).await;
                         }
                     } else {
-                        // Text changed (conversion, deletion, etc.) — full erase + redraw
+                        info!("ImePreeditDraw: FULL ERASE old='{}' col={} new='{}'",
+                            preedit_text, preedit_col_count, text);
                         if preedit_col_count > 0 {
                             send_backspaces(&server, target, preedit_col_count);
                         }
@@ -1057,9 +1060,16 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
             mapping_notify[6] = total_virtual as u8; // count
             let _ = c.event_tx.send(mapping_notify.to_vec());
         }
-        // Give clients time to process MappingNotify and refresh their keyboard map
-        // (XkbGetMap/GetKeyboardMapping round-trip must complete before we send KeyPress)
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for the target client to fetch updated keymap (GetKeyboardMapping round-trip).
+        // This is critical for remote connections where network latency exceeds 50ms.
+        let ack_timeout = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            conn.mapping_ack.notified(),
+        );
+        match ack_timeout.await {
+            Ok(()) => info!("send_ime_text: client {} acknowledged keymap update", conn_id),
+            Err(_) => info!("send_ime_text: keymap ack timeout (500ms) for client {}", conn_id),
+        }
     }
 
     // Send KeyPress + KeyRelease for each character

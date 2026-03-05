@@ -65,34 +65,22 @@ pub async fn handle_render_request<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(())
         }
         RENDER_QUERY_PICT_FORMATS => {
-            // Return a minimal set of PictFormats that covers ARGB32 and RGB24
-            // This is what most apps need to proceed
-            let mut reply = vec![1u8, 0];
-            write_u16_to(conn, &mut reply, seq);
+            // Return a minimal set of PictFormats that covers ARGB32, RGB24, A8
+            // Header: 32 bytes (type, pad, seq, length, numFormats, numScreens,
+            //         numDepths, numVisuals, numSubpixel, pad)
+            // Body:   PictFormInfo[numFormats] + Screen[numScreens] + Subpixel[numScreens]
 
-            // We'll build the body, then set the length
+            // Build body first to compute length
             let mut body = Vec::new();
 
-            // numFormats
-            write_u32_to(conn, &mut body, 3); // 3 formats: ARGB32, RGB24, A8
-            // numScreens
-            write_u32_to(conn, &mut body, 1);
-            // numDepths
-            write_u32_to(conn, &mut body, 2); // depth 24, depth 32
-            // numVisuals
-            write_u32_to(conn, &mut body, 1); // 1 visual
-            // numSubpixel (v0.6+)
-            write_u32_to(conn, &mut body, 1);
-
             // PictFormInfo entries (28 bytes each):
-            // id, type, depth, pad, direct{red,redMask,green,greenMask,blue,blueMask,alpha,alphaMask}, colormap
+            // id(4), type(1), depth(1), pad(2), direct(16), colormap(4)
 
             // Format 1: ARGB32 (id=1)
             write_u32_to(conn, &mut body, 1); // id
             body.push(1); // type = Direct
             body.push(32); // depth
             body.extend([0u8; 2]); // pad
-            // Direct: red offset=16, mask=0xFF, green offset=8, mask=0xFF, blue offset=0, mask=0xFF, alpha offset=24, mask=0xFF
             write_u16_to(conn, &mut body, 16); write_u16_to(conn, &mut body, 0xFF); // red
             write_u16_to(conn, &mut body, 8); write_u16_to(conn, &mut body, 0xFF);  // green
             write_u16_to(conn, &mut body, 0); write_u16_to(conn, &mut body, 0xFF);  // blue
@@ -121,7 +109,7 @@ pub async fn handle_render_request<S: AsyncRead + AsyncWrite + Unpin>(
             write_u16_to(conn, &mut body, 0); write_u16_to(conn, &mut body, 0xFF); // alpha
             write_u32_to(conn, &mut body, 0);
 
-            // Screen info: numDepths, fallback pictformat
+            // Screen[0]: numDepths(4) + fallback(4) + Depth entries
             write_u32_to(conn, &mut body, 2); // numDepths
             write_u32_to(conn, &mut body, 2); // fallback = RGB24
 
@@ -143,13 +131,20 @@ pub async fn handle_render_request<S: AsyncRead + AsyncWrite + Unpin>(
             // Subpixel info: 1 screen, subpixel order = Unknown (0)
             write_u32_to(conn, &mut body, 0); // SubPixelUnknown
 
-            // Set reply length
-            let pad = (4 - (body.len() % 4)) % 4;
-            let reply_len = (body.len() + pad) / 4;
-            write_u32_to(conn, &mut reply, reply_len as u32);
-            reply.extend(std::iter::repeat(0).take(24)); // pad header to 32
+            // Build reply header (32 bytes)
+            let mut reply = vec![1u8, 0]; // type=Reply, pad
+            write_u16_to(conn, &mut reply, seq);
+            let reply_len = body.len() / 4;
+            write_u32_to(conn, &mut reply, reply_len as u32); // length in 4-byte words
+            write_u32_to(conn, &mut reply, 3); // numFormats
+            write_u32_to(conn, &mut reply, 1); // numScreens
+            write_u32_to(conn, &mut reply, 2); // numDepths (total across all screens)
+            write_u32_to(conn, &mut reply, 1); // numVisuals (total across all screens)
+            write_u32_to(conn, &mut reply, 1); // numSubpixel
+            write_u32_to(conn, &mut reply, 0); // pad
+            // header is now 32 bytes: 1+1+2+4 + 6*4 = 32
+
             reply.extend_from_slice(&body);
-            reply.extend(std::iter::repeat(0).take(pad));
             stream.write_all(&reply).await?;
             debug!("RENDER QueryPictFormats: 3 formats, 1 screen");
             Ok(())

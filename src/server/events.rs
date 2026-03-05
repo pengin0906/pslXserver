@@ -191,6 +191,7 @@ mod tests {
             byte_order,
             sequence_number: AtomicU16::new(seq),
             event_tx: tx,
+            mapping_ack: tokio::sync::Notify::new(),
         };
         conn
     }
