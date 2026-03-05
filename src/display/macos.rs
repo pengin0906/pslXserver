@@ -1403,26 +1403,6 @@ fn handle_command(cmd: DisplayCommand) {
                             if !image.is_null() {
                                 let _: () = msg_send![image, addRepresentation: rep];
 
-                                // Set title bar proxy icon via representedURL
-                                // This makes the icon appear in the window title bar
-                                let url: *mut AnyObject = msg_send![
-                                    objc2::class!(NSURL),
-                                    fileURLWithPath: &*NSString::from_str("/tmp/.pslx_icon")
-                                ];
-                                if !url.is_null() {
-                                    let _: () = msg_send![&*info.window, setRepresentedURL: url];
-                                }
-                                // Override the proxy icon with our custom image
-                                let icon_button: *mut AnyObject = msg_send![
-                                    &*info.window,
-                                    standardWindowButton: 4isize  // NSWindowDocumentIconButton = 4
-                                ];
-                                if !icon_button.is_null() {
-                                    let icon_size = NSSize { width: 16.0, height: 16.0 };
-                                    let _: () = msg_send![image, setSize: icon_size];
-                                    let _: () = msg_send![icon_button, setImage: image];
-                                }
-
                                 // Set as Dock icon
                                 let dock_tile: *mut AnyObject = msg_send![&*info.window, dockTile];
                                 if !dock_tile.is_null() {
