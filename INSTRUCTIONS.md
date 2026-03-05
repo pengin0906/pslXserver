@@ -143,6 +143,10 @@
 - [x] IME変換中キーイベント漏れ: IME_COMPOSINGチェック追加
 
 ### 今後の課題
+- [ ] Chrome/VS CodeのURL窓・検索窓でキーボード入力が効かない（FocusIn/Out送信追加済み、要検証）
+- [ ] Chrome/VS Codeで日本語IMEインライン編集が動かない
+- [ ] xtermでIME確定後バックスペースで1文字残るバグ
+- [ ] ブラウザ音声出力: PulseAudio/PipeWireフォワーディングで再起動後も自動復旧
 - [ ] SHAPE拡張実装 (xeyes/xlogo非矩形ウィンドウ対応)
 - [ ] RENDER拡張実装 (アンチエイリアス描画)
 - [ ] BIG-REQUESTS拡張実装

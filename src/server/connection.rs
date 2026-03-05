@@ -3467,8 +3467,19 @@ async fn handle_set_input_focus<S: AsyncRead + AsyncWrite + Unpin>(
     let revert_to = data[1]; // 0=None, 1=PointerRoot, 2=Parent
     let focus = read_u32(conn, &data[4..8]); // 0=None, 1=PointerRoot, else=window
     info!("SetInputFocus: focus=0x{:08X} revert_to={}", focus, revert_to);
+
+    // Send FocusOut to the old focus window, FocusIn to the new one.
+    // Chrome/Electron require these events to enable keyboard input in focused widgets.
+    let old_focus = server.focus_window.load(std::sync::atomic::Ordering::Relaxed);
     server.focus_window.store(focus, std::sync::atomic::Ordering::Relaxed);
     server.focus_revert_to.store(revert_to as u32, std::sync::atomic::Ordering::Relaxed);
+
+    if old_focus > 1 && old_focus != focus {
+        crate::server::send_focus_event(server, 10, old_focus); // FocusOut=10
+    }
+    if focus > 1 && focus != old_focus {
+        crate::server::send_focus_event(server, 9, focus); // FocusIn=9
+    }
     Ok(())
 }
 
@@ -3557,10 +3568,10 @@ async fn handle_get_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
     for i in 0..count {
         let keycode = first_keycode + i;
 
-        if keycode >= 200 {
-            // Virtual keycodes 200+ for IME input (Unicode keysyms)
+        if keycode >= 136 {
+            // Virtual keycodes 136+ for IME input (Unicode keysyms)
             let vk = server.virtual_keysyms.read();
-            let idx = (keycode - 200) as usize;
+            let idx = (keycode - 136) as usize;
             let ks = if idx < vk.len() { vk[idx] } else { 0 };
             if ks != 0 {
                 log::info!("GetKeyboardMapping: keycode={} → keysym 0x{:08x} (U+{:04X})",
@@ -4086,6 +4097,11 @@ async fn handle_convert_selection<S: AsyncRead + AsyncWrite + Unpin>(
     let owner_opt = server.selections.get(&selection).map(|e| (e.0, e.1));
 
     if let Some((owner, _ts)) = owner_opt {
+        // Check if this is an XIM selection owned by our server
+        if server.xim.handle_selection_request(owner, requestor, selection, target, property, conn, server) {
+            return Ok(());
+        }
+
         // Build SelectionRequest event (type=30) and send to the owner's connection
         let mut event = [0u8; 32];
         event[0] = 30; // SelectionRequest
@@ -4165,6 +4181,33 @@ async fn handle_send_event<S: AsyncRead + AsyncWrite + Unpin>(
     let event_data = &data[12..44];
 
     debug!("SendEvent: dest=0x{:08x} mask=0x{:08x} propagate={}", destination, event_mask, propagate);
+
+    // Check if this is a ClientMessage for XIM protocol
+    let event_type = event_data[0] & 0x7F; // strip synthetic bit
+    if event_type == 33 { // ClientMessage
+        let format = event_data[1];
+        // Read the message_type (atom) at offset 8-11 of the event data
+        let msg_type = read_u32(conn, &event_data[8..12]);
+        let msg_window = read_u32(conn, &event_data[4..8]);
+
+        if msg_type == server.xim.atoms.xim_xconnect {
+            // XIM transport handshake — the client_comm_window is in data[12..16] (format=32)
+            let client_comm_window = if format == 32 {
+                read_u32(conn, &event_data[12..16])
+            } else {
+                msg_window
+            };
+            info!("SendEvent: intercepted _XIM_XCONNECT from conn {} client_comm=0x{:08x}",
+                conn.id, client_comm_window);
+            server.xim.handle_xconnect(client_comm_window, conn, server);
+            return Ok(());
+        } else if msg_type == server.xim.atoms.xim_protocol || msg_type == server.xim.atoms.xim_moredata {
+            // XIM protocol message
+            let xim_data = &event_data[12..32]; // 20 bytes of data
+            server.xim.handle_protocol_message(msg_window, msg_type, xim_data, conn, server);
+            return Ok(());
+        }
+    }
 
     // Resolve destination: 0=PointerWindow, 1=InputFocus, else=window ID
     let target_window = match destination {

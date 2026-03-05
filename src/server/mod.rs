@@ -4,6 +4,7 @@ pub mod events;
 pub mod extensions;
 pub mod protocol;
 pub mod resources;
+pub mod xim;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -121,6 +122,8 @@ pub struct XServer {
     pub modifier_state: AtomicU16,
     /// Available font names (XLFD) loaded from fonts.dir/fonts.alias files.
     pub font_names: Vec<String>,
+    /// XIM (X Input Method) server for inline preedit in GTK/Electron apps.
+    pub xim: xim::XimServer,
 }
 
 impl XServer {
@@ -211,6 +214,8 @@ impl XServer {
             resources::Resource::Window(Arc::new(parking_lot::RwLock::new(root_win))),
         );
 
+        let xim = xim::XimServer::new(&atoms, root_window_id);
+
         Self {
             connections: DashMap::new(),
             resources,
@@ -228,10 +233,19 @@ impl XServer {
             render_mailbox: std::sync::Arc::new(DashMap::new()),
             focus_window: AtomicU32::new(1), // PointerRoot by default
             focus_revert_to: AtomicU32::new(1), // PointerRoot
-            virtual_keysyms: parking_lot::RwLock::new(Vec::new()),
+            virtual_keysyms: parking_lot::RwLock::new({
+                // Pre-populate hiragana keysyms (86 chars) — leaves 33 slots for kanji
+                let mut v = Vec::with_capacity(119);
+                // All hiragana U+3041-U+3096 (86 chars: ぁ-ゖ)
+                for cp in 0x3041u32..=0x3096u32 {
+                    v.push(0x01000000 | cp);
+                }
+                v
+            }),
             pending_clipboard_copy: AtomicBool::new(false),
             modifier_state: AtomicU16::new(0),
             font_names: Self::load_font_names(),
+            xim,
         }
     }
 
@@ -318,6 +332,32 @@ pub async fn run_server(
 ) -> Result<(), ServerError> {
     let mut server = XServer::new(display_number, cmd_tx, screen_width, screen_height);
     server.render_mailbox = render_mailbox;
+
+    // Set up XIM server advertisement:
+    // 1. Set XIM_SERVERS property on root window with @server=pslx atom
+    // 2. Own the @server=pslx selection
+    {
+        let root_id = server.screens[0].root_window;
+        let xim_servers_atom = server.xim.atoms.xim_servers;
+        let server_atom = server.xim.atoms.server_atom;
+
+        if let Some(mut res) = server.resources.get_mut(&root_id) {
+            if let resources::Resource::Window(ref w) = res.value() {
+                let mut w = w.write();
+                // XIM_SERVERS property: array of ATOM containing @server=pslx
+                w.properties.push(resources::Property {
+                    name: xim_servers_atom,
+                    type_atom: 4, // ATOM
+                    format: 32,
+                    data: server_atom.to_le_bytes().to_vec(),
+                });
+            }
+        }
+        // Own the @server=pslx selection
+        server.selections.insert(server_atom, (root_id, server.startup_time));
+        info!("XIM: advertised @server=pslx on root window, owned selection atom={}", server_atom);
+    }
+
     let server = Arc::new(server);
 
     // Spawn event dispatch task: routes DisplayEvents from macOS to X11 clients
@@ -408,6 +448,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
     let mut entered_window: Xid = 0;
     let mut preedit_char_count: usize = 0; // char count for ImeCommit/Done BS
     let mut preedit_col_count: usize = 0;  // col count for ImePreeditDraw BS
+    let mut preedit_text = String::new();   // current preedit text for incremental diff
     // Implicit pointer grab: when a button is pressed, the target window
     // receives all subsequent MotionNotify/ButtonRelease until all buttons are released.
     // This is essential for xterm text selection + scroll-back.
@@ -521,35 +562,65 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 send_key_event(&server, protocol::event_type::KEY_RELEASE, window, keycode, state, time);
             }
             DisplayEvent::ImeCommit { window, text } => {
-                // Erase inline preedit before inserting committed text
-                if preedit_char_count > 0 {
-                    info!("ImeCommit: erasing {} preedit chars first", preedit_char_count);
-                    send_backspaces(&server, window, preedit_char_count);
-                    preedit_char_count = 0;
-                    preedit_col_count = 0;
+                // Try XIM first (for GTK/Electron apps with XIM connections)
+                let focus = server.focus_window.load(Ordering::Relaxed);
+                let target = if focus > 1 { focus } else { window };
+                if server.xim.has_xim_client(&server, target) {
+                    server.xim.send_preedit_done(&server, target);
+                    server.xim.send_commit(&server, target, &text);
+                    info!("ImeCommit via XIM: '{}' to window 0x{:08x}", text, target);
+                } else {
+                    // Fallback: erase inline preedit, then send committed text
+                    if preedit_char_count > 0 {
+                        send_backspaces(&server, target, preedit_char_count);
+                    }
+                    send_ime_text(&server, target, &text).await;
                 }
-                send_ime_text(&server, window, &text).await;
+                preedit_text.clear();
+                preedit_char_count = 0;
+                preedit_col_count = 0;
+                // Reclaim kanji virtual keycode slots (keep pre-registered hiragana 86 chars)
+                server.virtual_keysyms.write().truncate(86);
             }
             DisplayEvent::ImePreeditDraw { window, text, .. } => {
-                // Erase old preedit, then send new preedit as temporary characters
-                if preedit_char_count > 0 {
-                    send_backspaces(&server, window, preedit_char_count);
-                }
                 let new_count = text.chars().count();
-                if !text.is_empty() {
-                    info!("ImePreeditDraw: showing '{}' ({} chars, was {})", text, new_count, preedit_char_count);
-                    send_ime_text(&server, window, &text).await;
+                let focus = server.focus_window.load(Ordering::Relaxed);
+                let target = if focus > 1 { focus } else { window };
+
+                if server.xim.has_xim_client(&server, target) {
+                    // Send preedit via XIM protocol
+                    if preedit_char_count == 0 && new_count > 0 {
+                        server.xim.send_preedit_start(&server, target);
+                    }
+                    if new_count > 0 {
+                        server.xim.send_preedit_draw(&server, target, &text, new_count as u32);
+                    } else if preedit_char_count > 0 {
+                        server.xim.send_preedit_done(&server, target);
+                    }
+                } else {
+                    // Non-XIM clients (xterm, VS Code): inline preedit via BS + KeyPress
+                    if preedit_char_count > 0 {
+                        send_backspaces(&server, target, preedit_char_count);
+                    }
+                    if !text.is_empty() {
+                        send_ime_text(&server, target, &text).await;
+                    }
+                    preedit_char_count = new_count;
                 }
-                preedit_char_count = new_count;
+
                 preedit_col_count = preedit_display_cols(&text);
+                preedit_text = text;
             }
             DisplayEvent::ImePreeditDone { window } => {
-                if preedit_char_count > 0 {
-                    info!("ImePreeditDone: erasing {} preedit chars", preedit_char_count);
-                    send_backspaces(&server, window, preedit_char_count);
-                    preedit_char_count = 0;
-                    preedit_col_count = 0;
+                let focus = server.focus_window.load(Ordering::Relaxed);
+                let target = if focus > 1 { focus } else { window };
+                if server.xim.has_xim_client(&server, target) && preedit_char_count > 0 {
+                    server.xim.send_preedit_done(&server, target);
                 }
+                preedit_text.clear();
+                preedit_char_count = 0;
+                preedit_col_count = 0;
+                server.virtual_keysyms.write().truncate(86);
             }
             DisplayEvent::Expose { window, x, y, width, height, count } => {
                 send_expose_event(&server, window, x, y, width, height, count);
@@ -859,7 +930,7 @@ fn send_key_event(
 ///
 /// Requires xterm to be launched with UTF-8 locale (LANG=ja_JP.UTF-8).
 async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
-    const VIRTUAL_BASE: u8 = 200;
+    const VIRTUAL_BASE: u8 = 136;
     info!("send_ime_text: window=0x{:08x} text='{}'", window, text);
 
     let focus = server.focus_window.load(Ordering::Relaxed);
@@ -919,7 +990,7 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     let chars: Vec<char> = text.chars().collect();
     let mut virtual_idx = 0usize;
     let mut char_keys: Vec<(u8, u16)> = Vec::with_capacity(chars.len());
-    const MAX_VIRTUAL: usize = 55;
+    const MAX_VIRTUAL: usize = 119; // keycodes 136-254
 
     let new_keysyms_added;
     {
@@ -962,7 +1033,7 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
 
     // Send MappingNotify only when new keysyms were added (avoids unnecessary round-trips)
     if new_keysyms_added {
-        info!("send_ime_text: {} total keysyms on virtual keycodes (200..{})", total_virtual, 200 + total_virtual);
+        info!("send_ime_text: {} total keysyms on virtual keycodes ({}..{})", total_virtual, VIRTUAL_BASE, VIRTUAL_BASE as usize + total_virtual);
         for conn_entry in server.connections.iter() {
             let c = conn_entry.value();
             let mut mapping_notify = [0u8; 32];
@@ -970,13 +1041,13 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
             // [1] = 0 (unused per X11 wire protocol)
             // [2-3] = 0 (sequence number)
             mapping_notify[4] = 1;  // request = MappingKeyboard (1)
-            mapping_notify[5] = VIRTUAL_BASE;        // first_keycode = 200
+            mapping_notify[5] = VIRTUAL_BASE;        // first_keycode
             mapping_notify[6] = total_virtual as u8; // count
             let _ = c.event_tx.send(mapping_notify.to_vec());
         }
         // Give clients time to process MappingNotify and refresh their keyboard map
         // (XkbGetMap/GetKeyboardMapping round-trip must complete before we send KeyPress)
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     // Send KeyPress + KeyRelease for each character
@@ -1301,7 +1372,7 @@ fn send_enter_leave_event(
     }
 }
 
-fn send_focus_event(
+pub(crate) fn send_focus_event(
     server: &XServer, event_type: u8, window: Xid,
 ) {
     if let Some(res) = server.resources.get(&window) {
