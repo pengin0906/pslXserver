@@ -102,8 +102,11 @@ fn create_iosurface(width: u16, height: u16) -> *mut c_void {
 
 struct WindowInfo {
     window: Retained<NSWindow>,
-    /// IOSurface-backed pixel buffer for software rendering.
+    /// IOSurface-backed pixel buffer for software rendering (render target).
     surface: *mut c_void,
+    /// Second IOSurface for double-buffering display.
+    /// Alternating pointers forces CALayer to re-read pixel data each frame.
+    display_surface: *mut c_void,
     width: u16,
     height: u16,
     /// X11 window ID for routing events back to clients.
@@ -127,6 +130,9 @@ impl Drop for WindowInfo {
     fn drop(&mut self) {
         if !self.surface.is_null() {
             unsafe { CFRelease(self.surface as *const c_void); }
+        }
+        if !self.display_surface.is_null() {
+            unsafe { CFRelease(self.display_surface as *const c_void); }
         }
     }
 }
@@ -631,21 +637,19 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
                 }
             });
 
-            // Growing: create new IOSurface with headroom to reduce re-allocations
+            // Growing: create new IOSurface pair with headroom to reduce re-allocations
             let alloc_w = ((new_w as usize + 127) & !127).max(new_w as usize) as u16;
             let alloc_h = ((new_h as usize + 127) & !127).max(new_h as usize) as u16;
             let new_surface = create_iosurface(alloc_w, alloc_h);
-            if new_surface.is_null() {
+            let new_display = create_iosurface(alloc_w, alloc_h);
+            if new_surface.is_null() || new_display.is_null() {
                 log::error!("Failed to create IOSurface in setFrameSize");
                 return None;
             }
 
-            // Clear ENTIRE new surface to background_pixel.
+            // Clear ENTIRE new surfaces to background_pixel.
             // X11 servers clear the window background before sending Expose.
             // Apps (xclock etc.) draw on top without clearing first.
-            IOSurfaceLock(new_surface, 0, std::ptr::null_mut());
-            let new_base = IOSurfaceGetBaseAddress(new_surface) as *mut u8;
-            let new_stride = IOSurfaceGetBytesPerRow(new_surface);
             let bg = info.background_pixel;
             let bg_bytes: [u8; 4] = [
                 (bg & 0xFF) as u8,
@@ -653,18 +657,26 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
                 ((bg >> 16) & 0xFF) as u8,
                 0xFF,
             ];
-            for row in 0..(new_h as usize) {
-                let row_base = new_base.add(row * new_stride);
-                for col in 0..(new_w as usize) {
-                    let off = col * 4;
-                    std::ptr::copy_nonoverlapping(bg_bytes.as_ptr(), row_base.add(off), 4);
+            for s in [new_surface, new_display] {
+                IOSurfaceLock(s, 0, std::ptr::null_mut());
+                let base = IOSurfaceGetBaseAddress(s) as *mut u8;
+                let stride = IOSurfaceGetBytesPerRow(s);
+                for row in 0..(new_h as usize) {
+                    let row_base = base.add(row * stride);
+                    for col in 0..(new_w as usize) {
+                        let off = col * 4;
+                        std::ptr::copy_nonoverlapping(bg_bytes.as_ptr(), row_base.add(off), 4);
+                    }
                 }
+                IOSurfaceUnlock(s, 0, std::ptr::null_mut());
             }
-            IOSurfaceUnlock(new_surface, 0, std::ptr::null_mut());
 
             let old_surface = info.surface;
+            let old_display = info.display_surface;
             info.surface = new_surface;
+            info.display_surface = new_display;
             CFRelease(old_surface as *const c_void);
+            CFRelease(old_display as *const c_void);
         } else {
             // Shrinking or same-surface: clear visible area to background_pixel.
             // X11 servers clear the window background before sending Expose.
@@ -688,7 +700,8 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
             IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
         }
 
-        // Flush to CALayer (clipped by masksToBounds when shrinking)
+        // Swap + flush: cleared surface becomes display surface for immediate visual update.
+        std::mem::swap(&mut info.surface, &mut info.display_surface);
         flush_window(info);
         ca_transaction_flush();
 
@@ -901,14 +914,21 @@ fn check_window_resizes() {
                         IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
                     }
 
-                    // Replace surface and update dimensions
+                    // Replace both surfaces and update dimensions
                     let old_surface = info.surface;
+                    let old_display = info.display_surface;
+                    let new_display = create_iosurface(change.new_w, change.new_h);
                     info.surface = new_surface;
+                    info.display_surface = new_display;
                     info.width = change.new_w;
                     info.height = change.new_h;
-                    unsafe { CFRelease(old_surface as *const c_void); }
+                    unsafe {
+                        CFRelease(old_surface as *const c_void);
+                        CFRelease(old_display as *const c_void);
+                    }
 
-                    // Flush CGImage to layer so resize is visible immediately
+                    // Swap + flush so resize is visible immediately
+                    std::mem::swap(&mut info.surface, &mut info.display_surface);
                     flush_window(info);
                     ca_transaction_flush();
 
@@ -1132,8 +1152,31 @@ fn process_commands() {
             let mut ws = w.borrow_mut();
             for (win_id, commands) in render_batches {
                 if let Some(info) = ws.get_mut(&win_id) {
-                    let lock_result = unsafe { IOSurfaceLock(info.surface, 0, std::ptr::null_mut()) };
-                    if lock_result != 0 { continue; }
+                    // Copy current display content → render surface (for incremental updates).
+                    // After last frame's swap, render surface has stale data from 2 frames ago.
+                    unsafe {
+                        IOSurfaceLock(info.display_surface, 1, std::ptr::null_mut()); // read-only
+                        IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
+                        let src = IOSurfaceGetBaseAddress(info.display_surface) as *const u8;
+                        let dst = IOSurfaceGetBaseAddress(info.surface) as *mut u8;
+                        let src_stride = IOSurfaceGetBytesPerRow(info.display_surface);
+                        let dst_stride = IOSurfaceGetBytesPerRow(info.surface);
+                        let h = info.height as usize;
+                        if src_stride == dst_stride {
+                            std::ptr::copy_nonoverlapping(src, dst, src_stride * h);
+                        } else {
+                            let row_bytes = (info.width as usize) * 4;
+                            for row in 0..h {
+                                std::ptr::copy_nonoverlapping(
+                                    src.add(row * src_stride),
+                                    dst.add(row * dst_stride),
+                                    row_bytes,
+                                );
+                            }
+                        }
+                        IOSurfaceUnlock(info.display_surface, 1, std::ptr::null_mut());
+                        // surface remains locked for rendering below
+                    }
 
                     let base = unsafe { IOSurfaceGetBaseAddress(info.surface) };
                     let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.surface) };
@@ -1155,6 +1198,10 @@ fn process_commands() {
                     }
 
                     unsafe { IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut()); }
+
+                    // Double-buffer swap: rendered surface becomes display surface.
+                    // CA sees a different IOSurface pointer each frame → forces re-read.
+                    std::mem::swap(&mut info.surface, &mut info.display_surface);
                     flush_window(info);
 
                     // Deferred show: make window visible after the first render
@@ -1241,29 +1288,33 @@ fn handle_command(cmd: DisplayCommand) {
                 let _: () = msg_send![&*window, setAcceptsMouseMovedEvents: true];
             }
 
-            // IOSurface for zero-copy compositing via CoreAnimation
+            // Double-buffered IOSurfaces: render target + display target.
+            // Alternating pointers forces CALayer to re-read pixel data each frame.
             let surface = create_iosurface(width, height);
-            if surface.is_null() {
+            let display_surface = create_iosurface(width, height);
+            if surface.is_null() || display_surface.is_null() {
                 log::error!("Failed to create IOSurface for window {}", id);
                 return;
             }
 
-            // Fill IOSurface with opaque black (0xFF000000 BGRA) before attaching to CALayer.
+            // Fill both IOSurfaces with opaque black (0xFF000000 BGRA).
             // Without this, the IOSurface is transparent and the NSWindow's white background
             // shows through until the client draws, causing a visible white flash on startup.
             unsafe {
-                IOSurfaceLock(surface, 0, std::ptr::null_mut());
-                let base = IOSurfaceGetBaseAddress(surface) as *mut u8;
-                let stride = IOSurfaceGetBytesPerRow(surface);
-                let h = height as usize;
-                let w = width as usize;
-                for row in 0..h {
-                    let row_ptr = base.add(row * stride) as *mut u32;
-                    for col in 0..w {
-                        *row_ptr.add(col) = 0xFF000000; // opaque black (BGRA)
+                for s in [surface, display_surface] {
+                    IOSurfaceLock(s, 0, std::ptr::null_mut());
+                    let base = IOSurfaceGetBaseAddress(s) as *mut u8;
+                    let stride = IOSurfaceGetBytesPerRow(s);
+                    let h = height as usize;
+                    let w = width as usize;
+                    for row in 0..h {
+                        let row_ptr = base.add(row * stride) as *mut u32;
+                        for col in 0..w {
+                            *row_ptr.add(col) = 0xFF000000; // opaque black (BGRA)
+                        }
                     }
+                    IOSurfaceUnlock(s, 0, std::ptr::null_mut());
                 }
-                IOSurfaceUnlock(surface, 0, std::ptr::null_mut());
             }
 
             // Calculate initial X11 screen position from actual macOS window position
@@ -1315,7 +1366,7 @@ fn handle_command(cmd: DisplayCommand) {
             }
 
             WINDOWS.with(|w| {
-                w.borrow_mut().insert(id, WindowInfo { window, surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF, pending_show: false });
+                w.borrow_mut().insert(id, WindowInfo { window, surface, display_surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF, pending_show: false });
             });
 
             info!("Created window {} for X11 0x{:08X} ({}x{}) [IOSurface]", id, x11_id, width, height);
@@ -1550,22 +1601,19 @@ fn get_ns_cursor(cursor_type: u8) -> *mut AnyObject {
     }
 }
 
-/// Inner flush: update CALayer contents.
-/// Set IOSurface directly as CALayer contents — zero-copy, no color space conversion.
-/// nil→surface cycle forces CALayer to re-read the IOSurface backing store.
-/// Disables implicit animations to prevent visual glitches during resize.
+/// Inner flush: set display_surface as CALayer contents.
+/// Double-buffering ensures the pointer alternates each frame, forcing CALayer
+/// to re-read pixel data. No CGImage creation needed — zero color-space conversion overhead.
 fn flush_window(info: &WindowInfo) {
     unsafe {
-        if info.width == 0 || info.height == 0 || info.surface.is_null() { return; }
+        if info.width == 0 || info.height == 0 || info.display_surface.is_null() { return; }
         if let Some(view) = info.window.contentView() {
             let layer: *mut AnyObject = msg_send![&*view, layer];
             if !layer.is_null() {
                 let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
                 let _: () = msg_send![ca_cls, begin];
                 let _: () = msg_send![ca_cls, setDisableActions: true];
-                let null_obj: *mut AnyObject = std::ptr::null_mut();
-                let _: () = msg_send![layer, setContents: null_obj];
-                let _: () = msg_send![layer, setContents: info.surface as *mut AnyObject];
+                let _: () = msg_send![layer, setContents: info.display_surface as *mut AnyObject];
                 let _: () = msg_send![ca_cls, commit];
             }
         }
