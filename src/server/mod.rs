@@ -572,8 +572,9 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     info!("ImeCommit via XIM: '{}' to window 0x{:08x}", text, target);
                 } else {
                     // Fallback: erase inline preedit, then send committed text
-                    if preedit_char_count > 0 {
-                        send_backspaces(&server, target, preedit_char_count);
+                    // Use col count (not char count) because CJK chars are 2 columns wide in xterm
+                    if preedit_col_count > 0 {
+                        send_backspaces(&server, target, preedit_col_count);
                     }
                     send_ime_text(&server, target, &text).await;
                 }
@@ -600,8 +601,9 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     }
                 } else {
                     // Non-XIM clients (xterm, VS Code): inline preedit via BS + KeyPress
-                    if preedit_char_count > 0 {
-                        send_backspaces(&server, target, preedit_char_count);
+                    // Use col count for BS because CJK chars are 2 columns wide in xterm
+                    if preedit_col_count > 0 {
+                        send_backspaces(&server, target, preedit_col_count);
                     }
                     if !text.is_empty() {
                         send_ime_text(&server, target, &text).await;
