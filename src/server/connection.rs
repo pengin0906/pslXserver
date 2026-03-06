@@ -256,7 +256,7 @@ where
                 // would violate xcb's monotonic sequence requirement.
                 let cur_seq = conn.current_request_sequence();
                 set_event_sequence(&conn, &mut event_data, cur_seq);
-                if event_data[0] == 2 || event_data[0] == 3 || event_data[0] == 34 {
+                if event_data[0] == 2 || event_data[0] == 3 || event_data[0] == 4 || event_data[0] == 5 || event_data[0] == 34 {
                     let detail = event_data[1];
                     info!("Writing event to conn {}: type={} detail={} seq={}", conn_id, event_data[0], detail, cur_seq);
                 }
@@ -268,7 +268,7 @@ where
                         while let Ok(mut more) = event_rx.try_recv() {
                             let cur_seq = conn.current_request_sequence();
                             set_event_sequence(&conn, &mut more, cur_seq);
-                            if more[0] == 2 || more[0] == 3 || more[0] == 34 {
+                            if more[0] == 2 || more[0] == 3 || more[0] == 4 || more[0] == 5 || more[0] == 34 {
                                 info!("Writing event (drain) to conn {}: type={} detail={} seq={}", conn_id, more[0], more[1], cur_seq);
                             }
                             if stream.write_all(&more).await.is_err() { break; }
@@ -1351,12 +1351,33 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
                     },
                 );
             }
+            // Determine visibility: show the first window per connection,
+            // transient (dialog) windows, and override_redirect windows.
+            // Other windows stay hidden (render-only IOSurface buffers).
+            let visible = {
+                let has_transient = if let Some(res) = server.resources.get(&wid) {
+                    if let super::resources::Resource::Window(win) = res.value() {
+                        win.read().get_property(crate::server::atoms::predefined::WM_TRANSIENT_FOR).is_some()
+                    } else { false }
+                } else { false };
+                if override_redirect || has_transient {
+                    true
+                } else {
+                    // Check if this connection already has a visible native window
+                    let resource_base = wid & 0xFFE00000;
+                    !server.resources.iter().any(|r| {
+                        let rid = *r.key();
+                        if (rid & 0xFFE00000) == resource_base && rid != wid {
+                            if let super::resources::Resource::Window(w2) = r.value() {
+                                w2.read().native_window.is_some()
+                            } else { false }
+                        } else { false }
+                    })
+                }
+            };
             let _ = server.display_cmd_tx.send(
-                crate::display::DisplayCommand::ShowWindow { handle },
+                crate::display::DisplayCommand::ShowWindow { handle, visible },
             );
-            // No server-side background clear here — the IOSurface is already
-            // initialized (black) and the window show is deferred until the first
-            // client render frame. The client fills its own background via Expose.
         }
     }
 
@@ -2926,7 +2947,9 @@ async fn handle_put_image<S: AsyncRead + AsyncWrite + Unpin>(
         } else { 3 }
     } else { 3 };
 
-    // debug!("PutImage: drawable=0x{:08X} {}x{} at ({},{}) depth={} format={}", drawable, width, height, dst_x, dst_y, depth, format);
+    if width > 100 && height > 100 {
+        info!("PutImage: drawable=0x{:08X} {}x{} at ({},{}) depth={} format={}", drawable, width, height, dst_x, dst_y, depth, format);
+    }
     let image_data = data[24..].to_vec();
 
     // Track PutImage position as IME cursor hint (xterm Xft renders glyphs via PutImage)

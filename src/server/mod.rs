@@ -770,8 +770,7 @@ fn send_button_event(
                 let w = win.read();
                 for &(conn_id, emask) in &w.event_selections {
                     if (emask & mask_bit) != 0 {
-                        log::debug!("  -> Delivering ButtonEvent to conn {} on window 0x{:08x} (propagated from 0x{:08x})",
-                            conn_id, current, window);
+                        eprintln!("  BTN_DELIVER: conn={} win=0x{:08x} from=0x{:08x} type={}", conn_id, current, window, event_type);
                         if let Some(conn_ref) = server.connections.get(&conn_id) {
                             let conn = conn_ref.value();
                             let mut evt = events::EventBuilder::new(conn, event_type);
@@ -1265,13 +1264,17 @@ fn find_child_at_point(server: &XServer, window: Xid, x: i16, y: i16) -> (Xid, i
     let mut current = window;
     let mut cx = x;
     let mut cy = y;
-    for _ in 0..16 {
+    for depth in 0..16 {
         let children = if let Some(res) = server.resources.get(&current) {
             if let Resource::Window(win) = res.value() {
                 let w = win.read();
                 w.children.clone()
             } else { Vec::new() }
         } else { Vec::new() };
+
+        if depth == 0 && !children.is_empty() {
+            eprintln!("  find_child_at_point: win=0x{:08x} ({},{}) children={:?}", current, cx, cy, children.iter().map(|c| format!("0x{:08x}", c)).collect::<Vec<_>>());
+        }
 
         let mut found = None;
         // Check children in reverse order (top-most first)

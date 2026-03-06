@@ -120,10 +120,6 @@ struct WindowInfo {
     /// X11 background pixel color (BGRA). Used to fill new areas during resize
     /// instead of white, matching XQuartz's behavior of preserving content with gravity.
     background_pixel: u32,
-    /// Deferred show: counts render frames before making window visible.
-    /// Window appears after receiving enough frames with real content,
-    /// preventing the white flash on startup (Chrome sends white PutImage first).
-    pending_show_frames: u8,
 }
 
 impl Drop for WindowInfo {
@@ -448,11 +444,9 @@ unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut
     if this.is_null() { return; }
     let flag_ivar = (*this).class().instance_variable(c"textInserted").unwrap();
     *flag_ivar.load_mut::<u8>(&mut *this) = 1;
-    crate::display::IME_COMPOSING.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    // Only send preedit to X11 after space is pressed (conversion started).
-    // Before space, macOS candidate window handles display alone.
-    if !text.is_null() {
+    // Extract preedit text
+    let preedit_str = if !text.is_null() {
         let is_attr_str: bool = msg_send![&*text, isKindOfClass: objc2::class!(NSAttributedString)];
         let ns_string: *mut AnyObject = if is_attr_str {
             msg_send![&*text, string]
@@ -462,17 +456,31 @@ unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut
         if !ns_string.is_null() {
             let utf8: *const std::os::raw::c_char = msg_send![&*ns_string, UTF8String];
             if !utf8.is_null() {
-                if let Ok(s) = std::ffi::CStr::from_ptr(utf8).to_str() {
-                    let x11_id_ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
-                    let x11_id = *x11_id_ivar.load::<u32>(&*this) as crate::display::Xid;
-                    info!("IME setMarkedText: preedit='{}' (sent to X11)", s);
-                    send_display_event(DisplayEvent::ImePreeditDraw {
-                        window: x11_id,
-                        text: s.to_string(),
-                        cursor_pos: s.chars().count() as u32,
-                    });
-                }
-            }
+                std::ffi::CStr::from_ptr(utf8).to_str().ok().map(|s| s.to_string())
+            } else { None }
+        } else { None }
+    } else { None };
+
+    let preedit_empty = preedit_str.as_ref().map_or(true, |s| s.is_empty());
+
+    if preedit_empty {
+        // Preedit cleared (e.g., BS deleted all preedit chars) — end composition
+        crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::display::IME_CONVERTING.store(false, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        crate::display::IME_COMPOSING.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    if let Some(s) = preedit_str {
+        if !s.is_empty() {
+            let x11_id_ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
+            let x11_id = *x11_id_ivar.load::<u32>(&*this) as crate::display::Xid;
+            info!("IME setMarkedText: preedit='{}' (sent to X11)", s);
+            send_display_event(DisplayEvent::ImePreeditDraw {
+                window: x11_id,
+                text: s,
+                cursor_pos: 0,
+            });
         }
     }
 }
@@ -1068,7 +1076,7 @@ fn process_commands() {
                 // duplicate ButtonPress/Release which breaks implicit grab.
                 WINDOWS.with(|w| {
                     let ws = w.borrow();
-                    let mut best: Option<(crate::display::Xid, i16, i16, f64)> = None;
+                    let mut best: Option<(crate::display::Xid, i16, i16, isize)> = None;
                     for (_id, info) in ws.iter() {
                         let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
                         let content_h = if let Some(view) = info.window.contentView() {
@@ -1082,12 +1090,11 @@ fn process_commands() {
                         let in_window = win_x >= 0 && win_y >= 0
                             && (win_x as f64) < frame.size.width
                             && (win_y as f64) < content_h;
-                        if in_window {
-                            let area = frame.size.width * content_h;
-                            // Pick largest visible window (main content window)
-                            if best.is_none() || area > best.unwrap().3 {
-                                best = Some((info.x11_id, win_x, win_y, area));
-                            }
+                        if !in_window { continue; }
+                        // Pick frontmost window (highest windowNumber)
+                        let win_num: isize = unsafe { msg_send![&*info.window, windowNumber] };
+                        if best.is_none() || win_num > best.unwrap().3 {
+                            best = Some((info.x11_id, win_x, win_y, win_num));
                         }
                     }
                     if let Some((x11_id, win_x, win_y, _)) = best {
@@ -1225,26 +1232,6 @@ fn process_commands() {
                         std::mem::swap(&mut info.surface, &mut info.display_surface);
                         flush_window(info);
 
-                        if info.pending_show_frames > 0 {
-                            let has_real_content = commands.iter().any(|c| match c {
-                                crate::display::RenderCommand::DrawText { .. } => true,
-                                crate::display::RenderCommand::PutImage { data, .. } => {
-                                    // Sample every 64th pixel — if any is non-white, it's real content
-                                    data.chunks(4).step_by(64).any(|px| {
-                                        px.len() == 4 && (px[0] != 0xFF || px[1] != 0xFF || px[2] != 0xFF)
-                                    })
-                                }
-                                _ => false,
-                            });
-                            if has_real_content {
-                                info.pending_show_frames = 0;
-                                let mtm = MainThreadMarker::new().unwrap();
-                                let app = NSApplication::sharedApplication(mtm);
-                                unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
-                                info.window.makeKeyAndOrderFront(None);
-                                flush_window(info);
-                            }
-                        }
                     }
                 }
             });
@@ -1400,20 +1387,27 @@ fn handle_command(cmd: DisplayCommand) {
             }
 
             WINDOWS.with(|w| {
-                w.borrow_mut().insert(id, WindowInfo { window, surface, display_surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF, pending_show_frames: 0 });
+                w.borrow_mut().insert(id, WindowInfo { window, surface, display_surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF });
             });
 
             info!("Created window {} for X11 0x{:08X} ({}x{}) [IOSurface]", id, x11_id, width, height);
             let _ = reply.send(NativeWindowHandle { id });
         }
 
-        DisplayCommand::ShowWindow { handle } => {
+        DisplayCommand::ShowWindow { handle, visible } => {
             WINDOWS.with(|w| {
-                if let Some(info) = w.borrow_mut().get_mut(&handle.id) {
-                    // Defer actual show until first render frame so the client's
-                    // initial drawing is already in the IOSurface before the window
-                    // becomes visible. This eliminates the background flash on startup.
-                    info.pending_show_frames = 3; // wait 3 content frames before showing
+                if let Some(info) = w.borrow().get(&handle.id) {
+                    if visible {
+                        info!("ShowWindow: id={} x11=0x{:08X} - makeKeyAndOrderFront", handle.id, info.x11_id);
+                        let mtm = MainThreadMarker::new().unwrap();
+                        let app = NSApplication::sharedApplication(mtm);
+                        unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
+                        info.window.makeKeyAndOrderFront(None);
+                        flush_window(info);
+                    } else {
+                        info!("ShowWindow: id={} x11=0x{:08X} - hidden (render-only)", handle.id, info.x11_id);
+                        // Window stays hidden but IOSurface is ready for rendering
+                    }
                 }
             });
         }

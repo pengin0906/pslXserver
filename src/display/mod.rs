@@ -56,6 +56,8 @@ pub enum DisplayCommand {
     /// Show (map) a window.
     ShowWindow {
         handle: NativeWindowHandle,
+        /// If false, window is created for off-screen rendering only (not shown).
+        visible: bool,
     },
     /// Hide (unmap) a window.
     HideWindow {
