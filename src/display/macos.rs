@@ -120,6 +120,8 @@ struct WindowInfo {
     /// X11 background pixel color (BGRA). Used to fill new areas during resize
     /// instead of white, matching XQuartz's behavior of preserving content with gravity.
     background_pixel: u32,
+    /// Whether this window is visible on screen (vs hidden render-only buffer).
+    visible: bool,
 }
 
 impl Drop for WindowInfo {
@@ -1078,6 +1080,7 @@ fn process_commands() {
                     let ws = w.borrow();
                     let mut best: Option<(crate::display::Xid, i16, i16, isize)> = None;
                     for (_id, info) in ws.iter() {
+                        if !info.visible { continue; } // skip hidden render-only windows
                         let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
                         let content_h = if let Some(view) = info.window.contentView() {
                             let bounds: NSRect = unsafe { msg_send![&*view, bounds] };
@@ -1129,9 +1132,12 @@ fn process_commands() {
                 let uptime: f64 = msg_send![pi, systemUptime];
                 (uptime * 1000.0) as u32
             };
+            // Send MotionNotify only to the frontmost visible window under cursor
             WINDOWS.with(|w| {
                 let ws = w.borrow();
+                let mut best: Option<(crate::display::Xid, i16, i16, isize)> = None;
                 for (_id, info) in ws.iter() {
+                    if !info.visible { continue; }
                     let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
                     let content_h = if let Some(view) = info.window.contentView() {
                         let bounds: NSRect = unsafe { msg_send![&*view, bounds] };
@@ -1141,9 +1147,18 @@ fn process_commands() {
                     };
                     let win_x = (mouse_loc.x - frame.origin.x) as i16;
                     let win_y = (frame.origin.y + content_h - mouse_loc.y) as i16;
-
+                    let in_window = win_x >= 0 && win_y >= 0
+                        && (win_x as f64) < frame.size.width
+                        && (win_y as f64) < content_h;
+                    if !in_window { continue; }
+                    let win_num: isize = unsafe { msg_send![&*info.window, windowNumber] };
+                    if best.is_none() || win_num > best.unwrap().3 {
+                        best = Some((info.x11_id, win_x, win_y, win_num));
+                    }
+                }
+                if let Some((x11_id, win_x, win_y, _)) = best {
                     send_display_event(DisplayEvent::MotionNotify {
-                        window: info.x11_id,
+                        window: x11_id,
                         x: win_x,
                         y: win_y,
                         root_x: rx,
@@ -1387,7 +1402,7 @@ fn handle_command(cmd: DisplayCommand) {
             }
 
             WINDOWS.with(|w| {
-                w.borrow_mut().insert(id, WindowInfo { window, surface, display_surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF });
+                w.borrow_mut().insert(id, WindowInfo { window, surface, display_surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF, visible: false });
             });
 
             info!("Created window {} for X11 0x{:08X} ({}x{}) [IOSurface]", id, x11_id, width, height);
@@ -1396,7 +1411,8 @@ fn handle_command(cmd: DisplayCommand) {
 
         DisplayCommand::ShowWindow { handle, visible } => {
             WINDOWS.with(|w| {
-                if let Some(info) = w.borrow().get(&handle.id) {
+                if let Some(info) = w.borrow_mut().get_mut(&handle.id) {
+                    info.visible = visible;
                     if visible {
                         info!("ShowWindow: id={} x11=0x{:08X} - makeKeyAndOrderFront", handle.id, info.x11_id);
                         let mtm = MainThreadMarker::new().unwrap();
@@ -1406,7 +1422,6 @@ fn handle_command(cmd: DisplayCommand) {
                         flush_window(info);
                     } else {
                         info!("ShowWindow: id={} x11=0x{:08X} - hidden (render-only)", handle.id, info.x11_id);
-                        // Window stays hidden but IOSurface is ready for rendering
                     }
                 }
             });
