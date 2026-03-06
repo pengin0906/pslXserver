@@ -120,10 +120,10 @@ struct WindowInfo {
     /// X11 background pixel color (BGRA). Used to fill new areas during resize
     /// instead of white, matching XQuartz's behavior of preserving content with gravity.
     background_pixel: u32,
-    /// Deferred show: window is made visible on the first render frame,
-    /// so the client's initial drawing is already in the IOSurface before
-    /// the window appears. Prevents the background-color flash on startup.
-    pending_show: bool,
+    /// Deferred show: counts render frames before making window visible.
+    /// Window appears after receiving enough frames with real content,
+    /// preventing the white flash on startup (Chrome sends white PutImage first).
+    pending_show_frames: u8,
 }
 
 impl Drop for WindowInfo {
@@ -1225,13 +1225,25 @@ fn process_commands() {
                         std::mem::swap(&mut info.surface, &mut info.display_surface);
                         flush_window(info);
 
-                        log::debug!("Rendering {} cmds to window {} (pending_show={})", commands.len(), win_id, info.pending_show);
-                        if info.pending_show {
-                            info.pending_show = false;
-                            let mtm = MainThreadMarker::new().unwrap();
-                            let app = NSApplication::sharedApplication(mtm);
-                            unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
-                            info.window.makeKeyAndOrderFront(None);
+                        if info.pending_show_frames > 0 {
+                            let has_real_content = commands.iter().any(|c| match c {
+                                crate::display::RenderCommand::DrawText { .. } => true,
+                                crate::display::RenderCommand::PutImage { data, .. } => {
+                                    // Sample every 64th pixel — if any is non-white, it's real content
+                                    data.chunks(4).step_by(64).any(|px| {
+                                        px.len() == 4 && (px[0] != 0xFF || px[1] != 0xFF || px[2] != 0xFF)
+                                    })
+                                }
+                                _ => false,
+                            });
+                            if has_real_content {
+                                info.pending_show_frames = 0;
+                                let mtm = MainThreadMarker::new().unwrap();
+                                let app = NSApplication::sharedApplication(mtm);
+                                unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
+                                info.window.makeKeyAndOrderFront(None);
+                                flush_window(info);
+                            }
                         }
                     }
                 }
@@ -1388,7 +1400,7 @@ fn handle_command(cmd: DisplayCommand) {
             }
 
             WINDOWS.with(|w| {
-                w.borrow_mut().insert(id, WindowInfo { window, surface, display_surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF, pending_show: false });
+                w.borrow_mut().insert(id, WindowInfo { window, surface, display_surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF, pending_show_frames: 0 });
             });
 
             info!("Created window {} for X11 0x{:08X} ({}x{}) [IOSurface]", id, x11_id, width, height);
@@ -1401,7 +1413,7 @@ fn handle_command(cmd: DisplayCommand) {
                     // Defer actual show until first render frame so the client's
                     // initial drawing is already in the IOSurface before the window
                     // becomes visible. This eliminates the background flash on startup.
-                    info.pending_show = true;
+                    info.pending_show_frames = 3; // wait 3 content frames before showing
                 }
             });
         }
