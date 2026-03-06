@@ -4,12 +4,12 @@ use super::connection::{ClientConnection, ByteOrder};
 /// Build a 32-byte X11 event in the client's byte order.
 pub struct EventBuilder<'a> {
     conn: &'a ClientConnection,
-    buf: Vec<u8>,
+    buf: [u8; 32],
 }
 
 impl<'a> EventBuilder<'a> {
     pub fn new(conn: &'a ClientConnection, event_type: u8) -> Self {
-        let mut buf = vec![0u8; 32];
+        let mut buf = [0u8; 32];
         buf[0] = event_type;
         // Set sequence number at offset 2-3
         let seq = conn.current_request_sequence();
@@ -59,7 +59,7 @@ impl<'a> EventBuilder<'a> {
         self
     }
 
-    pub fn build(self) -> Vec<u8> {
+    pub fn build(self) -> [u8; 32] {
         self.buf
     }
 }
@@ -79,7 +79,7 @@ pub fn build_key_event(
     event_y: i16,
     state: u16,
     same_screen: bool,
-) -> Vec<u8> {
+) -> [u8; 32] {
     let mut eb = EventBuilder::new(conn, event_type);
     eb.set_u8(1, keycode)
       // sequence at offset 2-3 already set by EventBuilder::new
@@ -105,7 +105,7 @@ pub fn build_expose_event(
     width: u16,
     height: u16,
     count: u16,
-) -> Vec<u8> {
+) -> [u8; 32] {
     let mut eb = EventBuilder::new(conn, super::protocol::event_type::EXPOSE);
     eb.set_u32(4, window)
       .set_u16(8, x)
@@ -128,7 +128,7 @@ pub fn build_configure_notify(
     height: u16,
     border_width: u16,
     override_redirect: bool,
-) -> Vec<u8> {
+) -> [u8; 32] {
     let mut eb = EventBuilder::new(conn, super::protocol::event_type::CONFIGURE_NOTIFY);
     eb.set_u32(4, event_window)
       .set_u32(8, window)
@@ -148,7 +148,7 @@ pub fn build_map_notify(
     event_window: Xid,
     window: Xid,
     override_redirect: bool,
-) -> Vec<u8> {
+) -> [u8; 32] {
     let mut eb = EventBuilder::new(conn, super::protocol::event_type::MAP_NOTIFY);
     eb.set_u32(4, event_window)
       .set_u32(8, window)
@@ -163,7 +163,7 @@ pub fn build_client_message(
     window: Xid,
     message_type: u32,
     data: &[u32; 5],
-) -> Vec<u8> {
+) -> [u8; 32] {
     let mut eb = EventBuilder::new(conn, super::protocol::event_type::CLIENT_MESSAGE);
     eb.set_u8(1, format)
       .set_u32(4, window)

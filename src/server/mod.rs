@@ -123,6 +123,8 @@ pub struct XServer {
     pub modifier_state: AtomicU16,
     /// Available font names (XLFD) loaded from fonts.dir/fonts.alias files.
     pub font_names: Vec<String>,
+    /// Pre-lowercased font names for fast pattern matching.
+    pub font_names_lower: Vec<String>,
     /// XIM (X Input Method) server for inline preedit in GTK/Electron apps.
     pub xim: xim::XimServer,
 }
@@ -217,7 +219,7 @@ impl XServer {
 
         let xim = xim::XimServer::new(&atoms, root_window_id);
 
-        Self {
+        let mut server = Self {
             connections: DashMap::new(),
             resources,
             atoms,
@@ -245,60 +247,28 @@ impl XServer {
             }),
             pending_clipboard_copy: AtomicBool::new(false),
             modifier_state: AtomicU16::new(0),
+            font_names_lower: Vec::new(), // set below
             font_names: Self::load_font_names(),
             xim,
-        }
+        };
+        server.font_names_lower = server.font_names.iter().map(|n| n.to_lowercase()).collect();
+        server
     }
 
-    /// Load XLFD font names from system fonts.dir and fonts.alias files.
+    /// Return the minimal set of font names pslXserver advertises.
+    /// We use CoreText for all rendering, so these are just names clients can OpenFont.
     fn load_font_names() -> Vec<String> {
-        let font_dirs = [
-            "/opt/X11/share/fonts/misc",
-            "/opt/X11/share/fonts/75dpi",
-            "/opt/X11/share/fonts/100dpi",
-            "/opt/X11/share/fonts/TTF",
-            "/opt/X11/share/fonts/Type1",
-            "/opt/X11/lib/X11/fonts/misc",
-            "/opt/X11/lib/X11/fonts/75dpi",
-            "/opt/X11/lib/X11/fonts/100dpi",
-            "/opt/X11/lib/X11/fonts/TTF",
-            "/opt/X11/lib/X11/fonts/Type1",
+        // Only advertise fonts we actually handle. 4600+ system fonts cause
+        // huge ListFonts responses that slow xterm startup significantly.
+        let names: &[&str] = &[
+            "fixed",
+            "cursor",
+            "-misc-fixed-medium-r-normal--13-120-75-75-c-70-iso10646-1",
+            "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso10646-1",
+            "-misc-fixed-medium-r-normal--14-130-75-75-c-70-iso8859-1",
+            "-misc-fixed-medium-r-normal--13-120-75-75-c-70-iso8859-1",
         ];
-        let mut names = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        for dir in &font_dirs {
-            // Read fonts.dir — first line is count, rest are "filename XLFD-name"
-            if let Ok(content) = std::fs::read_to_string(format!("{}/fonts.dir", dir)) {
-                for line in content.lines().skip(1) {
-                    if let Some(pos) = line.find(' ') {
-                        let xlfd = line[pos + 1..].trim();
-                        if !xlfd.is_empty() && seen.insert(xlfd.to_lowercase()) {
-                            names.push(xlfd.to_string());
-                        }
-                    }
-                }
-            }
-            // Read fonts.alias — "alias XLFD-name"
-            if let Ok(content) = std::fs::read_to_string(format!("{}/fonts.alias", dir)) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('!') {
-                        continue;
-                    }
-                    if let Some(pos) = line.find(char::is_whitespace) {
-                        let alias = line[..pos].trim();
-                        if !alias.is_empty() && seen.insert(alias.to_lowercase()) {
-                            names.push(alias.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        names.sort();
-        log::info!("Loaded {} font names from system font directories", names.len());
-        names
+        names.iter().map(|s| s.to_string()).collect()
     }
 
     /// Allocate a resource ID base for a new connection.
@@ -450,6 +420,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
     let mut preedit_char_count: usize = 0; // char count for ImeCommit/Done BS
     let mut preedit_col_count: usize = 0;  // col count for ImePreeditDraw BS
     let mut preedit_text = String::new();   // current preedit text for incremental diff
+    let mut preedit_injected: bool = false; // whether preedit was sent as raw keys (xterm only)
     // Implicit pointer grab: when a button is pressed, the target window
     // receives all subsequent MotionNotify/ButtonRelease until all buttons are released.
     // This is essential for xterm text selection + scroll-back.
@@ -457,6 +428,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
     let mut grab_offset_x: i16 = 0;     // top-level coord - grab window coord
     let mut grab_offset_y: i16 = 0;
     let mut buttons_pressed: u8 = 0;    // count of currently pressed buttons
+    let mut last_cursor_type: u8 = 0;   // track current macOS cursor to avoid redundant updates
     loop {
         // Use spawn_blocking to avoid blocking the tokio runtime
         let evt = {
@@ -490,15 +462,33 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                         target, cx, cy, root_x, root_y, state, time);
                     entered_window = target;
                 }
-                // Send FocusIn/FocusOut and update global focus on click
-                if focused_window != target {
-                    if focused_window != 0 {
+                // Sync local focused_window with global (may have changed via SetInputFocus/MapWindow)
+                let global_focus = server.focus_window.load(Ordering::Relaxed);
+                if global_focus > 1 {
+                    focused_window = global_focus;
+                }
+                // Only change focus when clicking on a different top-level window.
+                // Within the same top-level, let the app manage focus via SetInputFocus.
+                let target_toplevel = find_toplevel(&server, target);
+                let focused_toplevel = if focused_window > 1 { find_toplevel(&server, focused_window) } else { 0 };
+                if focused_toplevel != target_toplevel {
+                    if focused_window > 1 {
                         send_focus_event(&server, protocol::event_type::FOCUS_OUT, focused_window);
                     }
-                    send_focus_event(&server, protocol::event_type::FOCUS_IN, target);
-                    focused_window = target;
+                    send_focus_event(&server, protocol::event_type::FOCUS_IN, target_toplevel);
+                    focused_window = target_toplevel;
                     // Update global focus so send_key_event routes to clicked window
-                    server.focus_window.store(target, Ordering::Relaxed);
+                    server.focus_window.store(target_toplevel, Ordering::Relaxed);
+                }
+                // Update cursor on click (in case MotionNotify didn't fire first)
+                let desired_cursor = determine_cursor(&server, target, cx, cy);
+                if desired_cursor != last_cursor_type {
+                    last_cursor_type = desired_cursor;
+                    if let Some(handle) = find_native_handle_for_event(&server, window) {
+                        let _ = server.display_cmd_tx.send(
+                            DisplayCommand::SetWindowCursor { handle, cursor_type: desired_cursor }
+                        );
+                    }
                 }
                 eprintln!("BTN_PRESS: src=0x{:08x} target=0x{:08x} btn={} ({},{}) root=({},{}) state=0x{:04x} grab=0x{:08x}", window, target, button, cx, cy, root_x, root_y, state, grab_window);
                 send_button_event(&server, protocol::event_type::BUTTON_PRESS,
@@ -553,6 +543,16 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                         target, cx, cy, root_x, root_y, state, time);
                     entered_window = target;
                 }
+                // Update macOS cursor based on window cursor attribute + edge zone
+                let desired_cursor = determine_cursor(&server, target, cx, cy);
+                if desired_cursor != last_cursor_type {
+                    last_cursor_type = desired_cursor;
+                    if let Some(handle) = find_native_handle_for_event(&server, window) {
+                        let _ = server.display_cmd_tx.send(
+                            DisplayCommand::SetWindowCursor { handle, cursor_type: desired_cursor }
+                        );
+                    }
+                }
                 send_motion_event(&server, target, cx, cy, root_x, root_y, state, time);
             }
             DisplayEvent::KeyPress { window, keycode, state, time } => {
@@ -571,9 +571,10 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     server.xim.send_preedit_done(&server, target);
                     server.xim.send_commit(&server, target, &text);
                     info!("ImeCommit via XIM: '{}' to window 0x{:08x}", text, target);
-                } else {
-                    // Incremental commit: if committed text extends preedit, send suffix only
+                } else if preedit_injected {
+                    // xterm: preedit was injected inline — erase it and send committed text
                     if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
+                        // Incremental: only send the new suffix (preedit already in xterm)
                         let suffix = &text[preedit_text.len()..];
                         if !suffix.is_empty() {
                             send_ime_text(&server, target, suffix).await;
@@ -584,12 +585,14 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                         }
                         send_ime_text(&server, target, &text).await;
                     }
+                } else {
+                    // Non-xterm (Chrome etc.): preedit was NOT injected — send full committed text
+                    send_ime_text(&server, target, &text).await;
                 }
                 preedit_text.clear();
                 preedit_char_count = 0;
                 preedit_col_count = 0;
-                // Reclaim kanji virtual keycode slots (keep pre-registered hiragana 86 chars)
-                server.virtual_keysyms.write().truncate(86);
+                preedit_injected = false;
             }
             DisplayEvent::ImePreeditDraw { window, text, .. } => {
                 let new_count = text.chars().count();
@@ -607,23 +610,33 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                         server.xim.send_preedit_done(&server, target);
                     }
                 } else {
-                    // Non-XIM clients (xterm, VS Code): inline preedit via BS + KeyPress
-                    // Incremental: if new text extends old, only send the appended suffix
-                    if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
-                        let suffix = &text[preedit_text.len()..];
-                        if !suffix.is_empty() {
-                            send_ime_text(&server, target, suffix).await;
+                    // Non-XIM clients: only inject preedit inline into xterm.
+                    // Chrome/browsers use macOS native floating IME for display.
+                    // Injecting preedit chars into Chrome URL bar triggers autocomplete,
+                    // breaking BackSpace and cursor behaviour.
+                    if window_is_xterm(&server, target) {
+                        // xterm: inline preedit via BS + KeyPress
+                        // Incremental: if new text extends old, only send the appended suffix
+                        if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
+                            let suffix = &text[preedit_text.len()..];
+                            if !suffix.is_empty() {
+                                send_ime_text(&server, target, suffix).await;
+                            }
+                        } else {
+                            // Full erase + resend (conversion, deletion, or first char)
+                            if preedit_char_count > 0 {
+                                send_backspaces(&server, target, preedit_char_count);
+                            }
+                            if !text.is_empty() {
+                                send_ime_text(&server, target, &text).await;
+                            }
                         }
+                        preedit_char_count = new_count;
+                        preedit_injected = true;
                     } else {
-                        // Full erase + resend (conversion, deletion, or first char)
-                        if preedit_char_count > 0 {
-                            send_backspaces(&server, target, preedit_char_count);
-                        }
-                        if !text.is_empty() {
-                            send_ime_text(&server, target, &text).await;
-                        }
+                        // Non-xterm: track state only, no raw key injection
+                        preedit_injected = false;
                     }
-                    preedit_char_count = new_count;
                 }
 
                 preedit_col_count = preedit_display_cols(&text);
@@ -634,11 +647,14 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 let target = if focus > 1 { focus } else { window };
                 if server.xim.has_xim_client(&server, target) && preedit_char_count > 0 {
                     server.xim.send_preedit_done(&server, target);
+                } else if preedit_injected && preedit_char_count > 0 {
+                    // xterm: erase injected preedit on cancel
+                    send_backspaces(&server, target, preedit_char_count);
                 }
                 preedit_text.clear();
                 preedit_char_count = 0;
                 preedit_col_count = 0;
-                server.virtual_keysyms.write().truncate(86);
+                preedit_injected = false;
             }
             DisplayEvent::Expose { window, x, y, width, height, count } => {
                 send_expose_event(&server, window, x, y, width, height, count);
@@ -725,7 +741,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                             crate::server::connection::write_u32_at(c, &mut event, 16, primary);
                             crate::server::connection::write_u32_at(c, &mut event, 20, utf8_atom); // target
                             crate::server::connection::write_u32_at(c, &mut event, 24, clip_prop); // property
-                            let _ = c.event_tx.send(event.to_vec());
+                            let _ = c.event_tx.send(event.into());
 
                             // Mark that we're waiting for selection data
                             server.pending_clipboard_copy.store(true, Ordering::Relaxed);
@@ -785,7 +801,7 @@ fn send_button_event(
                                .set_i16(26, event_y)
                                .set_u16(28, state)
                                .set_u8(30, 1); // same-screen
-                            let _ = conn.event_tx.send(evt.build());
+                            let _ = conn.event_tx.send(evt.build().into());
                         }
                         return;
                     }
@@ -842,7 +858,7 @@ fn send_motion_event(
                                .set_i16(26, event_y)
                                .set_u16(28, state)
                                .set_u8(30, 1); // same-screen
-                            let _ = conn.event_tx.send(evt.build());
+                            let _ = conn.event_tx.send(evt.build().into());
                         }
                         return;
                     }
@@ -881,10 +897,13 @@ fn send_key_event(
 
     // Walk up from the target window, looking for a window that selected key events.
     // X11 spec: key events propagate from focus window up to root.
+    // Track 'child' field: the direct child of the event window that is an ancestor of
+    // (or is) the source/focus window.
     let mut current = target;
+    let mut prev = 0u32; // previous window in walk-up chain (becomes 'child' field)
     for _ in 0..32 {
         if current == 0 { break; }
-        let (found_conn, parent, xi2_sels) = if let Some(res) = server.resources.get(&current) {
+        let (found_conn, parent) = if let Some(res) = server.resources.get(&current) {
             if let Resource::Window(win) = res.value() {
                 let w = win.read();
                 let mut found = None;
@@ -894,43 +913,27 @@ fn send_key_event(
                         break;
                     }
                 }
-                (found, w.parent, w.xi2_event_selections.clone())
-            } else { (None, 0, Vec::new()) }
-        } else { (None, 0, Vec::new()) };
+                (found, w.parent)
+            } else { (None, 0) }
+        } else { (None, 0) };
 
-        // Send XI2 GenericEvent to connections that selected XI2 key events on this window
-        let xi2_evtype = match event_type {
-            protocol::event_type::KEY_PRESS => extensions::xinput2::XI_KEY_PRESS,
-            _ => extensions::xinput2::XI_KEY_RELEASE,
-        };
-        let xi2_mask_bit = 1u32 << xi2_evtype;
-        for &(conn_id, _deviceid, mask) in &xi2_sels {
-            if (mask & xi2_mask_bit) != 0 {
-                if let Some(conn_ref) = server.connections.get(&conn_id) {
-                    let conn = conn_ref.value();
-                    let xi2_evt = extensions::xinput2::build_xi2_key_event(
-                        conn, xi2_evtype, keycode, time,
-                        server.screens[0].root_window, current, 0,
-                        0, 0, 0, 0, state,
-                    );
-                    let _ = conn.event_tx.send(xi2_evt);
-                }
-            }
-        }
-
+        // child = 0 if event delivered to the focus window itself,
+        // otherwise the direct child of event_window on the path to focus window
+        let child = if current == target { 0 } else { prev };
         if let Some(conn_id) = found_conn {
-            log::debug!("  -> Key delivered to conn {} window 0x{:08x}", conn_id, current);
+            log::info!("  -> Key delivered to conn {} event=0x{:08x} child=0x{:08x} target=0x{:08x}", conn_id, current, child, target);
             if let Some(conn_ref) = server.connections.get(&conn_id) {
                 let conn = conn_ref.value();
                 let evt_data = events::build_key_event(
                     conn, event_type, keycode, time,
-                    server.screens[0].root_window, current, 0,
+                    server.screens[0].root_window, current, child,
                     0, 0, 0, 0, state, true,
                 );
-                let _ = conn.event_tx.send(evt_data);
+                let _ = conn.event_tx.send(evt_data.into());
             }
             return;
         }
+        prev = current;
         current = parent;
     }
     log::debug!("  -> Key NOT delivered (no KEY_PRESS mask found)");
@@ -961,8 +964,10 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     };
 
     // Find the connection that selected key events on target (or ancestors)
-    let (conn_id, event_window) = {
+    // Track child field for proper event propagation
+    let (conn_id, event_window, child) = {
         let mut current = target;
+        let mut prev = 0u32;
         let mut result = None;
         for _ in 0..32 {
             if current == 0 { break; }
@@ -971,11 +976,13 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
                     let w = win.read();
                     for &(cid, emask) in &w.event_selections {
                         if (emask & protocol::event_mask::KEY_PRESS) != 0 {
-                            result = Some((cid, current));
+                            let child = if current == target { 0 } else { prev };
+                            result = Some((cid, current, child));
                             break;
                         }
                     }
                     if result.is_some() { break; }
+                    prev = current;
                     current = w.parent;
                 } else { break; }
             } else { break; }
@@ -989,7 +996,7 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
         }
     };
 
-    info!("send_ime_text: target=0x{:08x} conn={} event_window=0x{:08x}", target, conn_id, event_window);
+    info!("send_ime_text: target=0x{:08x} conn={} event=0x{:08x} child=0x{:08x}", target, conn_id, event_window, child);
 
     let conn_ref = match server.connections.get(&conn_id) {
         Some(c) => c,
@@ -1012,6 +1019,11 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     let new_keysyms_added;
     {
         let mut vk = server.virtual_keysyms.write();
+        // If slots are full, reset kanji slots so new chars can be registered.
+        // This triggers one MappingNotify+50ms, but only happens after 33 unique kanji.
+        if vk.len() >= MAX_VIRTUAL {
+            vk.truncate(86);
+        }
         let prev_len = vk.len();
         for &ch in &chars {
             let ch = if ch >= '\u{FF01}' && ch <= '\u{FF5E}' {
@@ -1051,6 +1063,9 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     // Send MappingNotify only when new keysyms were added (avoids unnecessary round-trips)
     if new_keysyms_added {
         info!("send_ime_text: {} total keysyms on virtual keycodes ({}..{})", total_virtual, VIRTUAL_BASE, VIRTUAL_BASE as usize + total_virtual);
+        // Save generation before sending MappingNotify — we wait for it to increment,
+        // meaning the client has sent GetKeyboardMapping and fetched the updated keymap.
+        let gen_before = conn_ref.mapping_gen.load(std::sync::atomic::Ordering::Acquire);
         for conn_entry in server.connections.iter() {
             let c = conn_entry.value();
             let mut mapping_notify = [0u8; 32];
@@ -1060,30 +1075,39 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
             mapping_notify[4] = 1;  // request = MappingKeyboard (1)
             mapping_notify[5] = VIRTUAL_BASE;        // first_keycode
             mapping_notify[6] = total_virtual as u8; // count
-            let _ = c.event_tx.send(mapping_notify.to_vec());
+            let _ = c.event_tx.send(mapping_notify.into());
         }
-        // Give the client time to process MappingNotify and fetch the new keymap
-        // via GetKeyboardMapping round-trip before we send KeyPress events.
-        // Note: mapping_ack (Notify) approach doesn't work — startup GetKeyboardMapping
-        // stores a spurious permit that causes false acks on the first MappingNotify.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for client to process MappingNotify → GetKeyboardMapping round-trip.
+        // Poll mapping_gen with 1ms intervals; timeout at 200ms to avoid hanging.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+        loop {
+            if conn_ref.mapping_gen.load(std::sync::atomic::Ordering::Acquire) != gen_before {
+                break; // client fetched new keymap
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Timeout: client didn't respond, wait a bit anyway to be safe
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 
     // Send KeyPress + KeyRelease for each character
     for &(keycode, state) in &char_keys {
         let press = events::build_key_event(
             conn, protocol::event_type::KEY_PRESS, keycode, time,
-            server.screens[0].root_window, event_window, 0,
+            server.screens[0].root_window, event_window, child,
             0, 0, 0, 0, state, true,
         );
-        let _ = conn.event_tx.send(press);
+        let _ = conn.event_tx.send(press.into());
 
         let release = events::build_key_event(
             conn, protocol::event_type::KEY_RELEASE, keycode, time,
-            server.screens[0].root_window, event_window, 0,
+            server.screens[0].root_window, event_window, child,
             0, 0, 0, 0, state, true,
         );
-        let _ = conn.event_tx.send(release);
+        let _ = conn.event_tx.send(release.into());
     }
 }
 
@@ -1108,9 +1132,10 @@ fn send_backspaces(server: &XServer, window: Xid, count: usize) {
         return;
     };
 
-    // Find connection with KEY_PRESS mask (same logic as send_ime_text)
-    let (conn_id, event_window) = {
+    // Find connection with KEY_PRESS mask, tracking child field for event propagation
+    let (conn_id, event_window, child) = {
         let mut current = target;
+        let mut prev = 0u32;
         let mut result = None;
         for _ in 0..32 {
             if current == 0 { break; }
@@ -1119,11 +1144,13 @@ fn send_backspaces(server: &XServer, window: Xid, count: usize) {
                     let w = win.read();
                     for &(cid, emask) in &w.event_selections {
                         if (emask & protocol::event_mask::KEY_PRESS) != 0 {
-                            result = Some((cid, current));
+                            let child = if current == target { 0 } else { prev };
+                            result = Some((cid, current, child));
                             break;
                         }
                     }
                     if result.is_some() { break; }
+                    prev = current;
                     current = w.parent;
                 } else { break; }
             } else { break; }
@@ -1144,22 +1171,22 @@ fn send_backspaces(server: &XServer, window: Xid, count: usize) {
         .unwrap_or_default()
         .as_millis() as u32;
 
-    info!("send_backspaces: {} backspaces to conn={} window=0x{:08x}", count, conn_id, event_window);
+    info!("send_backspaces: {} backspaces to conn={} event=0x{:08x} child=0x{:08x}", count, conn_id, event_window, child);
 
     for _ in 0..count {
         let press = events::build_key_event(
             conn, protocol::event_type::KEY_PRESS, BACKSPACE_KEYCODE, time,
-            server.screens[0].root_window, event_window, 0,
+            server.screens[0].root_window, event_window, child,
             0, 0, 0, 0, 0, true,
         );
-        let _ = conn.event_tx.send(press);
+        let _ = conn.event_tx.send(press.into());
 
         let release = events::build_key_event(
             conn, protocol::event_type::KEY_RELEASE, BACKSPACE_KEYCODE, time,
-            server.screens[0].root_window, event_window, 0,
+            server.screens[0].root_window, event_window, child,
             0, 0, 0, 0, 0, true,
         );
-        let _ = conn.event_tx.send(release);
+        let _ = conn.event_tx.send(release.into());
     }
 }
 
@@ -1342,6 +1369,134 @@ fn find_deepest_child(server: &XServer, window: Xid) -> Xid {
     current
 }
 
+/// Edge zone width in pixels for resize cursor detection.
+const EDGE_ZONE: i16 = 5;
+
+/// Get the effective macOS cursor type for a window, inheriting from parents if not set.
+fn get_effective_cursor_type(server: &XServer, window_id: Xid) -> u8 {
+    let mut current = window_id;
+    for _ in 0..32 {
+        if let Some(res) = server.resources.get(&current) {
+            if let Resource::Window(win) = res.value() {
+                let w = win.read();
+                if w.cursor != 0 {
+                    if let Some(cres) = server.resources.get(&w.cursor) {
+                        if let Resource::Cursor(cursor) = cres.value() {
+                            return cursor.macos_type;
+                        }
+                    }
+                    return 0; // cursor ID set but resource gone
+                }
+                if w.parent == 0 {
+                    break;
+                }
+                current = w.parent;
+            } else { break; }
+        } else { break; }
+    }
+    0 // default: arrow
+}
+
+/// Check if position is in the edge zone of a window. Returns resize cursor type if so.
+/// Only applies to windows with children (container/parent windows) or top-level windows.
+fn edge_resize_cursor(server: &XServer, window_id: Xid, x: i16, y: i16) -> Option<u8> {
+    if let Some(res) = server.resources.get(&window_id) {
+        if let Resource::Window(win) = res.value() {
+            let w = win.read();
+            let width = w.width as i16;
+            let height = w.height as i16;
+            // Only detect edges for windows large enough
+            if width < EDGE_ZONE * 3 || height < EDGE_ZONE * 3 {
+                return None;
+            }
+            let near_left = x < EDGE_ZONE;
+            let near_right = x >= width - EDGE_ZONE;
+            let near_top = y < EDGE_ZONE;
+            let near_bottom = y >= height - EDGE_ZONE;
+
+            if !near_left && !near_right && !near_top && !near_bottom {
+                return None;
+            }
+            // Corner: use left-right as best approximation (macOS NSCursor has no diagonal)
+            if (near_left || near_right) && (near_top || near_bottom) {
+                return Some(6); // ResizeLeftRight
+            }
+            if near_left || near_right {
+                return Some(6); // ResizeLeftRight
+            }
+            return Some(7); // ResizeUpDown
+        }
+    }
+    None
+}
+
+/// Find the native window handle for a given X11 window (walks up ancestor chain).
+fn find_native_handle_for_event(server: &XServer, wid: Xid) -> Option<crate::display::NativeWindowHandle> {
+    let mut current = wid;
+    for _ in 0..32 {
+        if let Some(res) = server.resources.get(&current) {
+            if let Resource::Window(win) = res.value() {
+                let w = win.read();
+                if let Some(ref handle) = w.native_window {
+                    return Some(handle.clone());
+                }
+                if w.parent == 0 {
+                    break;
+                }
+                current = w.parent;
+            } else { break; }
+        } else { break; }
+    }
+    None
+}
+
+/// Find the top-level X11 window (direct child of root) for a given window.
+/// Check if a window (or its toplevel ancestor) is xterm-like by WM_CLASS.
+/// Preedit is injected inline only into xterm; all other apps (Chrome, VS Code, etc.)
+/// use the macOS floating IME overlay instead of raw key injection.
+fn window_is_xterm(server: &XServer, window: Xid) -> bool {
+    let toplevel = find_toplevel(server, window);
+    if let Some(res) = server.resources.get(&toplevel) {
+        if let Resource::Window(win) = res.value() {
+            if let Some(prop) = win.read().get_property(crate::server::atoms::predefined::WM_CLASS) {
+                // WM_CLASS data: "instance_name\0class_name\0"
+                let data = &prop.data;
+                let instance = data.split(|&b| b == 0).next().unwrap_or(&[]);
+                return instance.eq_ignore_ascii_case(b"xterm");
+            }
+        }
+    }
+    false
+}
+
+fn find_toplevel(server: &XServer, wid: Xid) -> Xid {
+    let root = server.screens[0].root_window;
+    let mut current = wid;
+    for _ in 0..32 {
+        if current == 0 || current == root { return wid; }
+        if let Some(res) = server.resources.get(&current) {
+            if let Resource::Window(win) = res.value() {
+                let parent = win.read().parent;
+                if parent == root {
+                    return current;
+                }
+                current = parent;
+            } else { return wid; }
+        } else { return wid; }
+    }
+    wid
+}
+
+/// Determine the cursor to display: edge resize cursor overrides window cursor.
+fn determine_cursor(server: &XServer, window_id: Xid, x: i16, y: i16) -> u8 {
+    // Check edge zone first (visual feedback for window borders)
+    if let Some(resize_cursor) = edge_resize_cursor(server, window_id, x, y) {
+        return resize_cursor;
+    }
+    // Fall back to the window's (or inherited) cursor
+    get_effective_cursor_type(server, window_id)
+}
+
 fn send_enter_leave_event(
     server: &XServer, event_type: u8,
     window: Xid,
@@ -1373,7 +1528,7 @@ fn send_enter_leave_event(
                            .set_u16(28, state)
                            .set_u8(30, 0) // mode: Normal
                            .set_u8(31, 1); // same-screen + focus: yes
-                        let _ = conn.event_tx.send(evt.build());
+                        let _ = conn.event_tx.send(evt.build().into());
                     }
                 }
             }
@@ -1395,7 +1550,7 @@ pub(crate) fn send_focus_event(
                         evt.set_u8(1, 0) // detail: Ancestor
                            .set_u32(4, window)
                            .set_u8(8, 0); // mode: Normal
-                        let _ = conn.event_tx.send(evt.build());
+                        let _ = conn.event_tx.send(evt.build().into());
                     }
                 }
             }
@@ -1430,7 +1585,7 @@ fn send_configure_notify_event(
                             conn, window, window, 0,
                             x, y, width, height, border_width, override_redirect,
                         );
-                        let _ = conn.event_tx.send(evt_data);
+                        let _ = conn.event_tx.send(evt_data.into());
                         sent = true;
                     }
                 }
@@ -1458,7 +1613,7 @@ fn send_expose_event(
                         let evt_data = events::build_expose_event(
                             conn, window, x, y, width, height, count,
                         );
-                        let _ = conn.event_tx.send(evt_data);
+                        let _ = conn.event_tx.send(evt_data.into());
                         sent = true;
                     }
                 }

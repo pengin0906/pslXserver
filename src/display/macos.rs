@@ -271,6 +271,9 @@ fn get_input_view_class() -> &'static AnyClass {
 
 // --- PSLXInputView method implementations ---
 
+/// resetCursorRects — set up macOS cursor rects for window edge resize zones.
+/// macOS automatically changes the cursor when the mouse enters these rects.
+
 unsafe extern "C" fn accepts_first_responder(_this: *mut AnyObject, _sel: Sel) -> Bool {
     Bool::YES
 }
@@ -368,14 +371,8 @@ unsafe extern "C" fn view_key_down(this: *mut AnyObject, _sel: Sel, event: *mut 
 unsafe extern "C" fn insert_text_replacement(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, _range: NSRange) {
     if this.is_null() { return; }
 
-    // Set flag so view_key_down knows text was inserted
-    let flag_ivar = (*this).class().instance_variable(c"textInserted").unwrap();
-    *flag_ivar.load_mut::<u8>(&mut *this) = 1;
-    // Always suppress the next keyUp — ImeCommit already sends KeyPress+KeyRelease
-    // via send_ime_text, so the NS_KEY_UP handler's KeyRelease would be a duplicate.
     crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
     crate::display::IME_CONVERTING.store(false, std::sync::atomic::Ordering::Relaxed);
-    crate::display::SUPPRESS_NEXT_KEYUP.store(true, std::sync::atomic::Ordering::Relaxed);
 
     if text.is_null() { return; }
 
@@ -399,7 +396,22 @@ unsafe extern "C" fn insert_text_replacement(this: *mut AnyObject, _sel: Sel, te
 
     if rust_str.is_empty() { return; }
 
-    // Get the X11 window ID from the ivar
+    // For single ASCII chars, let the raw KeyPress path in view_key_down handle it.
+    // This gives VS Code/Chromium the proper macOS keycode they expect.
+    // Only use ImeCommit for non-ASCII text (CJK, multi-char, etc.)
+    let is_single_ascii = rust_str.len() == 1 && rust_str.as_bytes()[0] < 0x80;
+    if is_single_ascii {
+        // Don't set textInserted — view_key_down's raw KeyPress fallback will fire
+        debug!("insertText: single ASCII '{}' — letting raw KeyPress handle it", rust_str);
+        return;
+    }
+
+    // Non-ASCII or multi-char: send via ImeCommit
+    let flag_ivar = (*this).class().instance_variable(c"textInserted").unwrap();
+    *flag_ivar.load_mut::<u8>(&mut *this) = 1;
+    // Suppress next keyUp — ImeCommit already sends KeyPress+KeyRelease
+    crate::display::SUPPRESS_NEXT_KEYUP.store(true, std::sync::atomic::Ordering::Relaxed);
+
     let ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
     let x11_id = *ivar.load::<u32>(&*this) as crate::display::Xid;
 
@@ -1169,6 +1181,55 @@ fn process_commands() {
                 }
             });
         }
+
+        // 1.55. macOS-native resize cursor at window edges using private API
+        // _windowResizeEastWestCursor = the "pinched vertical bar" cursor (same as macOS window edges)
+        {
+            const EDGE_PX: f64 = 6.0;
+            let mut edge_type: u8 = 0; // 0=none, 1=left/right, 2=top/bottom, 3=NW-SE, 4=NE-SW
+            WINDOWS.with(|w| {
+                let ws = w.borrow();
+                for (_id, info) in ws.iter() {
+                    if !info.visible { continue; }
+                    let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
+                    let mx = mouse_loc.x - frame.origin.x;
+                    let my = mouse_loc.y - frame.origin.y;
+                    if mx < -EDGE_PX || mx > frame.size.width + EDGE_PX
+                        || my < -EDGE_PX || my > frame.size.height + EDGE_PX { continue; }
+                    let near_left = mx < EDGE_PX;
+                    let near_right = mx >= frame.size.width - EDGE_PX;
+                    let near_bottom = my < EDGE_PX;
+                    let near_top = my >= frame.size.height - EDGE_PX;
+                    if (near_left && near_top) || (near_right && near_bottom) {
+                        edge_type = 3; // NW-SE diagonal
+                    } else if (near_right && near_top) || (near_left && near_bottom) {
+                        edge_type = 4; // NE-SW diagonal
+                    } else if near_left || near_right {
+                        edge_type = 1; // East-West
+                    } else if near_top || near_bottom {
+                        edge_type = 2; // North-South
+                    }
+                    break;
+                }
+            });
+            // Apply resize cursor every tick (macOS resets cursor each run loop iteration)
+            if edge_type != 0 {
+                unsafe {
+                    let cls = objc2::class!(NSCursor);
+                    let sel_name = match edge_type {
+                        1 => c"_windowResizeEastWestCursor",
+                        2 => c"_windowResizeNorthSouthCursor",
+                        3 => c"_windowResizeNorthWestSouthEastCursor",
+                        _ => c"_windowResizeNorthEastSouthWestCursor",
+                    };
+                    let sel = objc2::runtime::Sel::register(sel_name);
+                    let cursor: *mut AnyObject = msg_send![cls, performSelector: sel];
+                    if !cursor.is_null() {
+                        let _: () = msg_send![&*cursor, set];
+                    }
+                }
+            }
+        }
     }
 
     // 1.6. Detect window resizes — compare content view size to stored IOSurface size
@@ -1734,6 +1795,18 @@ pub fn run_cocoa_app(
         let _: bool = msg_send![&*app, setActivationPolicy: 0i64];
     }
 
+    // Disable macOS autocorrect, inline predictions, and spellcheck
+    // (these interfere with X11 key event delivery)
+    unsafe {
+        let defaults: *mut AnyObject = msg_send![objc2::class!(NSUserDefaults), standardUserDefaults];
+        let key1: *mut AnyObject = msg_send![objc2::class!(NSString), stringWithUTF8String: c"NSAutomaticTextCompletionEnabled".as_ptr()];
+        let key2: *mut AnyObject = msg_send![objc2::class!(NSString), stringWithUTF8String: c"NSAutomaticSpellingCorrectionEnabled".as_ptr()];
+        let key3: *mut AnyObject = msg_send![objc2::class!(NSString), stringWithUTF8String: c"NSAutomaticTextReplacementEnabled".as_ptr()];
+        let _: () = msg_send![&*defaults, setBool: false forKey: &*key1];
+        let _: () = msg_send![&*defaults, setBool: false forKey: &*key2];
+        let _: () = msg_send![&*defaults, setBool: false forKey: &*key3];
+    }
+
     // Store channels and render mailbox in thread-local storage
     CMD_RX.with(|rx| *rx.borrow_mut() = Some(cmd_rx));
     EVT_TX.with(|tx| *tx.borrow_mut() = Some(evt_tx));
@@ -1999,7 +2072,10 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
             if (prev & btn_bit) != 0 {
                 let (x, y) = get_event_location(event, x11_id, win_width, win_height);
                 let (root_x, root_y) = get_screen_mouse_location();
-                let state = get_modifier_state(event);
+                // X11 spec: ButtonRelease state includes the releasing button mask
+                // (held "just before" the event). macOS pressedMouseButtons is already 0 at this point.
+                let btn_mask: u16 = match button { 1 => 0x100, 2 => 0x200, 3 => 0x400, _ => 0 };
+                let state = get_modifier_state(event) | btn_mask;
                 send_display_event(DisplayEvent::ButtonRelease {
                     window: x11_id, button, x, y, root_x, root_y, state, time,
                 });
@@ -2043,9 +2119,22 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
             let state = get_modifier_state(event);
             let has_precise: bool = unsafe { msg_send![event, hasPreciseScrollingDeltas] };
             if has_precise {
+                // Ignore momentum-phase events (after finger is lifted).
+                // Momentum scroll causes unintended extra scrolling ("bounce").
+                // NSEventPhaseMomentum = Began(0x01)|Changed(0x04)|Ended(0x08)|Cancelled(0x10)
+                let momentum_phase: u64 = unsafe { msg_send![event, momentumPhase] };
+                if momentum_phase != 0 {
+                    // Reset accumulator so residual doesn't trigger on next real scroll
+                    SCROLL_ACCUM.with(|a| a.set(0.0));
+                    SCROLL_ACCUM_X.with(|a| a.set(0.0));
+                    // skip this event
+                }
+                // Only process user-driven (non-momentum) scroll events
+                if momentum_phase == 0 {
+
                 // Trackpad: accumulate pixel deltas, emit X11 scroll when threshold hit.
                 // macOS sends many small deltas (2-5px each); X11 button 4/5 = ~3 lines.
-                let threshold = 80.0; // pixels per X11 scroll click
+                let threshold = 40.0; // pixels per X11 scroll click
 
                 // Vertical scroll (Button 4=up, 5=down)
                 let delta_y: f64 = unsafe { msg_send![event, scrollingDeltaY] };
@@ -2098,6 +2187,8 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
                         }
                     }
                 }
+
+                } // end if momentum_phase == 0
             } else {
                 // Discrete mouse wheel: scrollingDeltaY is ±1.0 per click
                 let delta_y: f64 = unsafe { msg_send![event, scrollingDeltaY] };

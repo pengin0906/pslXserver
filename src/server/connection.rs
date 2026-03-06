@@ -17,6 +17,47 @@ pub enum ByteOrder {
     LittleEndian,
 }
 
+/// X11 event data — stack-allocated for the common 32-byte case.
+#[derive(Clone)]
+pub enum EventData {
+    /// Standard 32-byte X11 event (most events).
+    Fixed([u8; 32]),
+    /// Extended event (XI2 GenericEvent, >32 bytes).
+    Extended(Vec<u8>),
+}
+
+impl EventData {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            EventData::Fixed(ref buf) => buf,
+            EventData::Extended(ref vec) => vec,
+        }
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            EventData::Fixed(ref mut buf) => buf,
+            EventData::Extended(ref mut vec) => vec,
+        }
+    }
+}
+
+impl From<[u8; 32]> for EventData {
+    #[inline]
+    fn from(buf: [u8; 32]) -> Self {
+        EventData::Fixed(buf)
+    }
+}
+
+impl From<Vec<u8>> for EventData {
+    #[inline]
+    fn from(vec: Vec<u8>) -> Self {
+        EventData::Extended(vec)
+    }
+}
+
 /// Per-client connection state.
 pub struct ClientConnection {
     pub id: u32,
@@ -25,9 +66,10 @@ pub struct ClientConnection {
     pub byte_order: ByteOrder,
     pub sequence_number: AtomicU16,
     /// Channel for sending X11 events to this client's connection task.
-    pub event_tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// Signaled when client processes GetKeyboardMapping after MappingNotify.
-    pub mapping_ack: tokio::sync::Notify,
+    pub event_tx: mpsc::UnboundedSender<EventData>,
+    /// Incremented each time client processes GetKeyboardMapping. Used to
+    /// synchronize MappingNotify → GetKeyboardMapping round-trip without fixed sleep.
+    pub mapping_gen: std::sync::atomic::AtomicU32,
 }
 
 impl ClientConnection {
@@ -121,7 +163,7 @@ where
     let resource_id_base = server.alloc_resource_id_base();
     let resource_id_mask = 0x001FFFFF; // 21 bits for resource IDs within this base
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EventData>();
 
     let conn = Arc::new(ClientConnection {
         id: conn_id,
@@ -130,7 +172,7 @@ where
         byte_order,
         sequence_number: AtomicU16::new(1),
         event_tx,
-        mapping_ack: tokio::sync::Notify::new(),
+        mapping_gen: std::sync::atomic::AtomicU32::new(0),
     });
 
     // Register the connection
@@ -243,8 +285,8 @@ where
                 // is always ready and events in event_rx never get selected.
                 while let Ok(mut event_data) = event_rx.try_recv() {
                     let cur_seq = conn.current_request_sequence();
-                    set_event_sequence(&conn, &mut event_data, cur_seq);
-                    if stream.write_all(&event_data).await.is_err() { break; }
+                    set_event_sequence(&conn, event_data.as_mut_slice(), cur_seq);
+                    if stream.write_all(event_data.as_slice()).await.is_err() { break; }
                 }
             }
 
@@ -255,23 +297,25 @@ where
                 // Events queued via event_tx may have stale seq numbers that
                 // would violate xcb's monotonic sequence requirement.
                 let cur_seq = conn.current_request_sequence();
-                set_event_sequence(&conn, &mut event_data, cur_seq);
-                if event_data[0] == 2 || event_data[0] == 3 || event_data[0] == 4 || event_data[0] == 5 || event_data[0] == 34 {
-                    let detail = event_data[1];
-                    info!("Writing event to conn {}: type={} detail={} seq={}", conn_id, event_data[0], detail, cur_seq);
+                set_event_sequence(&conn, event_data.as_mut_slice(), cur_seq);
+                let evs = event_data.as_slice();
+                if evs[0] == 2 || evs[0] == 3 || evs[0] == 4 || evs[0] == 5 || evs[0] == 34 {
+                    let detail = evs[1];
+                    info!("Writing event to conn {}: type={} detail={} seq={}", conn_id, evs[0], detail, cur_seq);
                 }
-                match stream.write_all(&event_data).await {
+                match stream.write_all(event_data.as_slice()).await {
                     Ok(()) => {
                         // Drain any additional queued events before going back to select
                         // This prevents event backlog from starving the read branch
                         let mut extra = 0;
                         while let Ok(mut more) = event_rx.try_recv() {
                             let cur_seq = conn.current_request_sequence();
-                            set_event_sequence(&conn, &mut more, cur_seq);
-                            if more[0] == 2 || more[0] == 3 || more[0] == 4 || more[0] == 5 || more[0] == 34 {
-                                info!("Writing event (drain) to conn {}: type={} detail={} seq={}", conn_id, more[0], more[1], cur_seq);
+                            set_event_sequence(&conn, more.as_mut_slice(), cur_seq);
+                            let ms = more.as_slice();
+                            if ms[0] == 2 || ms[0] == 3 || ms[0] == 4 || ms[0] == 5 || ms[0] == 34 {
+                                info!("Writing event (drain) to conn {}: type={} detail={} seq={}", conn_id, ms[0], ms[1], cur_seq);
                             }
-                            if stream.write_all(&more).await.is_err() { break; }
+                            if stream.write_all(more.as_slice()).await.is_err() { break; }
                             extra += 1;
                             if extra >= 16 { break; } // cap to avoid starving reads
                         }
@@ -1085,14 +1129,15 @@ async fn handle_change_window_attributes<S: AsyncRead + AsyncWrite + Unpin>(
                 w.cursor = cursor_id;
                 offset += 4;
 
-                // Look up cursor glyph code and send to display thread
+                // Look up pre-computed macOS cursor type
                 let cursor_type = if cursor_id == 0 {
                     0 // None/default = arrow
                 } else if let Some(cres) = server.resources.get(&cursor_id) {
                     if let super::resources::Resource::Cursor(cursor) = cres.value() {
-                        crate::cursor::x11_cursor_glyph_to_macos(cursor.source_char) as u8
+                        cursor.macos_type
                     } else { 0 }
                 } else { 0 };
+                debug!("ChangeWindowAttributes cursor: win=0x{:08x} cursor_id=0x{:08X} → macos_type={}", wid, cursor_id, cursor_type);
 
                 // Find native window and send cursor update
                 let native = w.native_window.clone();
@@ -1378,6 +1423,20 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
             let _ = server.display_cmd_tx.send(
                 crate::display::DisplayCommand::ShowWindow { handle, visible },
             );
+
+            // Auto-focus visible windows (transient dialogs, popups) so keyboard
+            // input routes to them when macOS makes them the key window.
+            if visible {
+                let old_focus = server.focus_window.load(std::sync::atomic::Ordering::Relaxed);
+                if old_focus != wid {
+                    server.focus_window.store(wid, std::sync::atomic::Ordering::Relaxed);
+                    if old_focus > 1 {
+                        crate::server::send_focus_event(server, 10, old_focus); // FocusOut
+                    }
+                    crate::server::send_focus_event(server, 9, wid); // FocusIn
+                    info!("MapWindow 0x{:08X}: auto-focused (visible window)", wid);
+                }
+            }
         }
     }
 
@@ -1401,7 +1460,7 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
     if width > 0 && height > 0 {
         let mut expose = super::events::build_expose_event(conn, wid, 0, 0, width, height, 0);
         set_event_sequence(conn, &mut expose, seq);
-        let _ = conn.event_tx.send(expose);
+        let _ = conn.event_tx.send(expose.into());
     }
 
     // Also send Expose to any mapped child windows via event_tx
@@ -1421,7 +1480,7 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
             if cw > 0 && ch > 0 {
                 let mut child_expose = super::events::build_expose_event(conn, child_id, 0, 0, cw, ch, 0);
                 set_event_sequence(conn, &mut child_expose, seq);
-                let _ = conn.event_tx.send(child_expose);
+                let _ = conn.event_tx.send(child_expose.into());
             }
         }
     }
@@ -1453,6 +1512,16 @@ async fn handle_unmap_window<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
+
+    // If unmapping the currently focused window, revert focus to PointerRoot
+    // so key events route to whatever window the pointer is over.
+    let current_focus = server.focus_window.load(std::sync::atomic::Ordering::Relaxed);
+    if current_focus == wid {
+        server.focus_window.store(1, std::sync::atomic::Ordering::Relaxed); // PointerRoot
+        crate::server::send_focus_event(server, 10, wid); // FocusOut
+        info!("UnmapWindow 0x{:08X}: reverted focus to PointerRoot", wid);
+    }
+
     Ok(())
 }
 
@@ -1570,11 +1639,11 @@ async fn handle_configure_window<S: AsyncRead + AsyncWrite + Unpin>(
                     conn, child_id, child_id, 0, 0, 0, width, height, child_border, false,
                 );
                 set_event_sequence(conn, &mut child_config, seq);
-                let _ = conn.event_tx.send(child_config);
+                let _ = conn.event_tx.send(child_config.into());
 
                 let mut child_expose = super::events::build_expose_event(conn, child_id, 0, 0, width, height, 0);
                 set_event_sequence(conn, &mut child_expose, seq);
-                let _ = conn.event_tx.send(child_expose);
+                let _ = conn.event_tx.send(child_expose.into());
             }
         }
     }
@@ -3647,8 +3716,8 @@ async fn handle_get_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     stream.write_all(&reply).await?;
-    // Signal that client has fetched the updated keymap
-    conn.mapping_ack.notify_one();
+    // Increment generation so send_ime_text knows client has fetched updated keymap
+    conn.mapping_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -3965,13 +4034,13 @@ async fn handle_list_fonts<S: AsyncRead + AsyncWrite + Unpin>(
     let pattern_lower = pattern.to_lowercase();
     info!("ListFonts: pattern='{}' max_names={}", pattern, max_names);
 
-    // Collect matching font names
+    // Collect matching font names (use pre-lowercased names to avoid per-name allocation)
     let mut matched: Vec<&str> = Vec::new();
-    for name in &server.font_names {
+    for (name, name_lower) in server.font_names.iter().zip(server.font_names_lower.iter()) {
         if matched.len() >= max_names {
             break;
         }
-        if x11_font_pattern_match(&pattern_lower, &name.to_lowercase()) {
+        if x11_font_pattern_match(&pattern_lower, name_lower) {
             matched.push(name);
         }
     }
@@ -4004,33 +4073,31 @@ async fn handle_list_fonts<S: AsyncRead + AsyncWrite + Unpin>(
 /// X11 font pattern matching: '*' matches any sequence, '?' matches any single character.
 /// Case-insensitive (caller should lowercase both strings).
 fn x11_font_pattern_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    fn matches(p: &[char], t: &[char]) -> bool {
-        let (mut pi, mut ti) = (0, 0);
-        let (mut star_pi, mut star_ti) = (usize::MAX, 0);
-        while ti < t.len() {
-            if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-                pi += 1;
-                ti += 1;
-            } else if pi < p.len() && p[pi] == '*' {
-                star_pi = pi;
-                star_ti = ti;
-                pi += 1;
-            } else if star_pi != usize::MAX {
-                pi = star_pi + 1;
-                star_ti += 1;
-                ti = star_ti;
-            } else {
-                return false;
-            }
-        }
-        while pi < p.len() && p[pi] == '*' {
+    // XLFD names are ASCII-only, so byte-level matching is safe and avoids Vec<char> allocation
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
             pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
-        pi == p.len()
     }
-    matches(&p, &t)
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 // --- Pointer, Selection, and Input handlers ---
@@ -4175,7 +4242,7 @@ async fn handle_convert_selection<S: AsyncRead + AsyncWrite + Unpin>(
         for entry in server.connections.iter() {
             let target_conn = entry.value();
             if (owner & !target_conn.resource_id_mask) == (target_conn.resource_id_base & !target_conn.resource_id_mask) {
-                let _ = target_conn.event_tx.send(event.to_vec());
+                let _ = target_conn.event_tx.send(event.into());
                 sent = true;
                 info!("ConvertSelection: sent SelectionRequest to conn {} (owner=0x{:08x})", target_conn.id, owner);
                 break;
@@ -4217,7 +4284,7 @@ fn send_selection_notify(
             write_u32_at(c, &mut event, 12, selection);
             write_u32_at(c, &mut event, 16, target);
             write_u32_at(c, &mut event, 20, property);
-            let _ = c.event_tx.send(event.to_vec());
+            let _ = c.event_tx.send(event.into());
             break;
         }
     }
@@ -4287,7 +4354,7 @@ async fn handle_send_event<S: AsyncRead + AsyncWrite + Unpin>(
         if target_conn.resource_id_base <= target_window
             && target_window < target_conn.resource_id_base + 0x00200000
         {
-            let _ = target_conn.event_tx.send(synthetic_event.to_vec());
+            let _ = target_conn.event_tx.send(synthetic_event.into());
             break;
         }
     }
@@ -4541,7 +4608,7 @@ async fn handle_warp_pointer<S: AsyncRead + AsyncWrite + Unpin>(
                                .set_i16(26, wy)
                                .set_u16(28, 0)
                                .set_u8(30, 1);
-                            let _ = conn.event_tx.send(evt.build());
+                            let _ = conn.event_tx.send(evt.build().into());
                         }
                     }
                 }
@@ -4843,15 +4910,21 @@ async fn handle_create_cursor<S: AsyncRead + AsyncWrite + Unpin>(
     // data[4..8] = cursor ID, [8..12] = source pixmap, [12..16] = mask pixmap
     // [16..18] = fore-red, [18..20] = fore-green, [20..22] = fore-blue
     // [22..24] = back-red, [24..26] = back-green, [26..28] = back-blue
-    // [28..30] = x, [30..32] = y
+    // [28..30] = x (hotspot), [30..32] = y (hotspot)
     if data.len() < 32 { return Ok(()); }
     let cid = read_u32(conn, &data[4..8]);
+    let source_pixmap = read_u32(conn, &data[8..12]);
     let fore_red = read_u16(conn, &data[16..18]);
     let fore_green = read_u16(conn, &data[18..20]);
     let fore_blue = read_u16(conn, &data[20..22]);
     let back_red = read_u16(conn, &data[22..24]);
     let back_green = read_u16(conn, &data[24..26]);
     let back_blue = read_u16(conn, &data[26..28]);
+    let hotspot_x = read_u16(conn, &data[28..30]);
+    let hotspot_y = read_u16(conn, &data[30..32]);
+
+    // Infer macOS cursor type from source pixmap dimensions + hotspot
+    let macos_type = infer_pixmap_cursor_type(server, source_pixmap, hotspot_x, hotspot_y);
 
     let cursor = super::resources::CursorState {
         id: cid,
@@ -4865,10 +4938,65 @@ async fn handle_create_cursor<S: AsyncRead + AsyncWrite + Unpin>(
         back_red,
         back_green,
         back_blue,
+        macos_type,
     };
     server.resources.insert(cid, super::resources::Resource::Cursor(Arc::new(cursor)));
-    debug!("CreateCursor: id=0x{:08X}", cid);
+    debug!("CreateCursor: id=0x{:08X} pixmap=0x{:08X} hotspot=({},{}) macos_type={}", cid, source_pixmap, hotspot_x, hotspot_y, macos_type);
     Ok(())
+}
+
+/// Infer macOS cursor type from pixmap cursor dimensions + hotspot.
+/// Heuristic based on cursor image shape and hotspot position.
+fn infer_pixmap_cursor_type(server: &Arc<XServer>, source_pixmap: u32, hotspot_x: u16, hotspot_y: u16) -> u8 {
+    // Get pixmap dimensions
+    let (w, h) = if let Some(res) = server.resources.get(&source_pixmap) {
+        if let super::resources::Resource::Pixmap(pix) = res.value() {
+            let p = pix.read();
+            (p.width as i32, p.height as i32)
+        } else { return 0; }
+    } else { return 0; };
+
+    let hx = hotspot_x as i32;
+    let hy = hotspot_y as i32;
+    let cx = w / 2;
+    let cy = h / 2;
+
+    // IBeam: typically narrow and tall (width < height/2), hotspot near center
+    if w > 0 && h > 0 && w * 3 < h && (hx - cx).abs() <= 2 {
+        return 1; // IBeam
+    }
+
+    // Hotspot near center → resize or move cursor
+    let center_threshold = w.max(h) / 4;
+    let hotspot_centered = (hx - cx).abs() <= center_threshold && (hy - cy).abs() <= center_threshold;
+
+    if hotspot_centered && w > 2 && h > 2 {
+        // Wide cursor with centered hotspot → horizontal resize
+        if w > h + h / 3 {
+            return 6; // ResizeLeftRight
+        }
+        // Tall cursor with centered hotspot → vertical resize
+        if h > w + w / 3 {
+            return 7; // ResizeUpDown
+        }
+        // Square with centered hotspot: could be crosshair, move, or resize
+        // Check if it's a move/fleur cursor (centered hotspot, square-ish)
+        if (w - h).abs() <= 4 && w >= 16 {
+            return 4; // OpenHand (move)
+        }
+        return 2; // Crosshair (generic centered)
+    }
+
+    // Hotspot at top-left quadrant → arrow or hand
+    if hx < cx && hy < cy {
+        // Hand cursor: hotspot slightly offset from top-left corner
+        if hx > 2 && hy <= 4 && w >= 16 {
+            return 3; // PointingHand
+        }
+        return 0; // Arrow
+    }
+
+    0 // Default: Arrow
 }
 
 async fn handle_create_glyph_cursor<S: AsyncRead + AsyncWrite + Unpin>(
@@ -4878,15 +5006,16 @@ async fn handle_create_glyph_cursor<S: AsyncRead + AsyncWrite + Unpin>(
     _stream: &mut S,
 ) -> Result<(), ServerError> {
     // CreateGlyphCursor: opcode 94
-    // data[4..8] = cursor ID, [8..12] = source font, [12..14] = source char
-    // [14..18] = mask font, [18..20] = mask char
+    // X11 protocol layout:
+    // data[4..8] = cursor ID, [8..12] = source font, [12..16] = mask font
+    // [16..18] = source char, [18..20] = mask char
     // [20..22] = fore-red, [22..24] = fore-green, [24..26] = fore-blue
     // [26..28] = back-red, [28..30] = back-green, [30..32] = back-blue
     if data.len() < 32 { return Ok(()); }
     let cid = read_u32(conn, &data[4..8]);
     let source_font = read_u32(conn, &data[8..12]);
-    let source_char = read_u16(conn, &data[12..14]);
-    let mask_font = read_u32(conn, &data[14..18]);
+    let mask_font = read_u32(conn, &data[12..16]);
+    let source_char = read_u16(conn, &data[16..18]);
     let mask_char = read_u16(conn, &data[18..20]);
     let fore_red = read_u16(conn, &data[20..22]);
     let fore_green = read_u16(conn, &data[22..24]);
@@ -4895,6 +5024,7 @@ async fn handle_create_glyph_cursor<S: AsyncRead + AsyncWrite + Unpin>(
     let back_green = read_u16(conn, &data[28..30]);
     let back_blue = read_u16(conn, &data[30..32]);
 
+    let macos_type = crate::cursor::x11_cursor_glyph_to_macos(source_char) as u8;
     let cursor = super::resources::CursorState {
         id: cid,
         source_font,
@@ -4907,9 +5037,10 @@ async fn handle_create_glyph_cursor<S: AsyncRead + AsyncWrite + Unpin>(
         back_red,
         back_green,
         back_blue,
+        macos_type,
     };
     server.resources.insert(cid, super::resources::Resource::Cursor(Arc::new(cursor)));
-    debug!("CreateGlyphCursor: id=0x{:08X} font=0x{:08X} char={}", cid, source_font, source_char);
+    debug!("CreateGlyphCursor: id=0x{:08X} font=0x{:08X} char={} macos_type={}", cid, source_font, source_char, macos_type);
     Ok(())
 }
 
