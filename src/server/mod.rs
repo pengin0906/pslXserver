@@ -602,12 +602,20 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     }
                 } else {
                     // Non-XIM clients (xterm, VS Code): inline preedit via BS + KeyPress
-                    // Always full erase + resend — simple and reliable
-                    if preedit_char_count > 0 {
-                        send_backspaces(&server, target, preedit_char_count);
-                    }
-                    if !text.is_empty() {
-                        send_ime_text(&server, target, &text).await;
+                    // Incremental: if new text extends old, only send the appended suffix
+                    if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
+                        let suffix = &text[preedit_text.len()..];
+                        if !suffix.is_empty() {
+                            send_ime_text(&server, target, suffix).await;
+                        }
+                    } else {
+                        // Full erase + resend (conversion, deletion, or first char)
+                        if preedit_char_count > 0 {
+                            send_backspaces(&server, target, preedit_char_count);
+                        }
+                        if !text.is_empty() {
+                            send_ime_text(&server, target, &text).await;
+                        }
                     }
                     preedit_char_count = new_count;
                 }
