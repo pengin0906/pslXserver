@@ -572,12 +572,18 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     server.xim.send_commit(&server, target, &text);
                     info!("ImeCommit via XIM: '{}' to window 0x{:08x}", text, target);
                 } else {
-                    // Fallback: erase inline preedit, then send committed text
-                    // Use char count — each BS KeyPress erases 1 character in the shell
-                    if preedit_char_count > 0 {
-                        send_backspaces(&server, target, preedit_char_count);
+                    // Incremental commit: if committed text extends preedit, send suffix only
+                    if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
+                        let suffix = &text[preedit_text.len()..];
+                        if !suffix.is_empty() {
+                            send_ime_text(&server, target, suffix).await;
+                        }
+                    } else {
+                        if preedit_char_count > 0 {
+                            send_backspaces(&server, target, preedit_char_count);
+                        }
+                        send_ime_text(&server, target, &text).await;
                     }
-                    send_ime_text(&server, target, &text).await;
                 }
                 preedit_text.clear();
                 preedit_char_count = 0;
