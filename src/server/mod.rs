@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crossbeam_channel::{Receiver, Sender};
 use dashmap::DashMap;
 use log::info;
+use unicode_width::UnicodeWidthChar;
 use thiserror::Error;
 use tokio::net::UnixListener;
 
@@ -572,9 +573,9 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     info!("ImeCommit via XIM: '{}' to window 0x{:08x}", text, target);
                 } else {
                     // Fallback: erase inline preedit, then send committed text
-                    // Use col count — xterm BS erases 1 display column, not 1 character
-                    if preedit_col_count > 0 {
-                        send_backspaces(&server, target, preedit_col_count);
+                    // Use char count — each BS KeyPress erases 1 character in the shell
+                    if preedit_char_count > 0 {
+                        send_backspaces(&server, target, preedit_char_count);
                     }
                     send_ime_text(&server, target, &text).await;
                 }
@@ -601,24 +602,12 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     }
                 } else {
                     // Non-XIM clients (xterm, VS Code): inline preedit via BS + KeyPress
-                    // Incremental update: if new text extends old, only send appended chars
-                    let is_incremental = !preedit_text.is_empty() && text.starts_with(&*preedit_text);
-                    if is_incremental {
-                        let suffix = &text[preedit_text.len()..];
-                        info!("ImePreeditDraw: INCREMENTAL old='{}' col={} suffix='{}'",
-                            preedit_text, preedit_col_count, suffix);
-                        if !suffix.is_empty() {
-                            send_ime_text(&server, target, suffix).await;
-                        }
-                    } else {
-                        info!("ImePreeditDraw: FULL ERASE old='{}' col={} new='{}'",
-                            preedit_text, preedit_col_count, text);
-                        if preedit_col_count > 0 {
-                            send_backspaces(&server, target, preedit_col_count);
-                        }
-                        if !text.is_empty() {
-                            send_ime_text(&server, target, &text).await;
-                        }
+                    // Always full erase + resend — simple and reliable
+                    if preedit_char_count > 0 {
+                        send_backspaces(&server, target, preedit_char_count);
+                    }
+                    if !text.is_empty() {
+                        send_ime_text(&server, target, &text).await;
                     }
                     preedit_char_count = new_count;
                 }
@@ -1060,16 +1049,11 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
             mapping_notify[6] = total_virtual as u8; // count
             let _ = c.event_tx.send(mapping_notify.to_vec());
         }
-        // Wait for the target client to fetch updated keymap (GetKeyboardMapping round-trip).
-        // This is critical for remote connections where network latency exceeds 50ms.
-        let ack_timeout = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            conn.mapping_ack.notified(),
-        );
-        match ack_timeout.await {
-            Ok(()) => info!("send_ime_text: client {} acknowledged keymap update", conn_id),
-            Err(_) => info!("send_ime_text: keymap ack timeout (500ms) for client {}", conn_id),
-        }
+        // Give the client time to process MappingNotify and fetch the new keymap
+        // via GetKeyboardMapping round-trip before we send KeyPress events.
+        // Note: mapping_ack (Notify) approach doesn't work — startup GetKeyboardMapping
+        // stores a spurious permit that causes false acks on the first MappingNotify.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     // Send KeyPress + KeyRelease for each character
@@ -1091,23 +1075,9 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
 }
 
 /// Compute the display column width of a preedit string.
-/// Wide (CJK) characters occupy 2 columns; narrow chars occupy 1.
-#[allow(dead_code)]
+/// Uses the unicode-width crate for correct East Asian Width handling.
 fn preedit_display_cols(text: &str) -> usize {
-    text.chars().map(|c| {
-        let cp = c as u32;
-        let wide = matches!(cp,
-            0x1100..=0x115F | 0x2329 | 0x232A |
-            0x2E80..=0x303E | 0x3040..=0x33FF |
-            0x3400..=0x4DBF | 0x4E00..=0xA4C6 |
-            0xA960..=0xA97C | 0xAC00..=0xD7A3 |
-            0xF900..=0xFAFF | 0xFE10..=0xFE19 |
-            0xFE30..=0xFE6B | 0xFF01..=0xFF60 |
-            0xFFE0..=0xFFE6 | 0x1B000..=0x1B001 |
-            0x20000..=0x2FFFD | 0x30000..=0x3FFFD
-        );
-        if wide { 2 } else { 1 }
-    }).sum()
+    text.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
 /// Send `count` BackSpace key events to erase preedit text.
