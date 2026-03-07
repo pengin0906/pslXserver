@@ -1031,9 +1031,9 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     info!("send_ime_text: window=0x{:08x} text='{}'", window, text);
 
     let focus = server.focus_window.load(Ordering::Relaxed);
-    let target = if focus > 1 {
-        focus
-    } else if focus == 1 {
+    let target = if focus >= 1 {
+        // Always find the deepest child under the pointer — focus may be set
+        // to a top-level window, but KEY_PRESS mask is on the child (e.g. vt100)
         find_deepest_child(server, window)
     } else {
         info!("send_ime_text: focus=None, discarding");
