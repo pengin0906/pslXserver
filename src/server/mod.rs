@@ -642,6 +642,19 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 preedit_col_count = preedit_display_cols(&text);
                 preedit_text = text;
             }
+            DisplayEvent::ImeReplace { window, erase_chars, text } => {
+                // Reconversion: erase original committed text, then insert converted text.
+                let focus = server.focus_window.load(Ordering::Relaxed);
+                let target = if focus > 1 { focus } else { window };
+                if erase_chars > 0 {
+                    send_backspaces(&server, target, erase_chars);
+                }
+                send_ime_text(&server, target, &text).await;
+                preedit_text.clear();
+                preedit_char_count = 0;
+                preedit_col_count = 0;
+                preedit_injected = false;
+            }
             DisplayEvent::ImePreeditDone { window } => {
                 let focus = server.focus_window.load(Ordering::Relaxed);
                 let target = if focus > 1 { focus } else { window };

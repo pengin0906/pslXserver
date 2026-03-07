@@ -368,7 +368,7 @@ unsafe extern "C" fn view_key_down(this: *mut AnyObject, _sel: Sel, event: *mut 
     }
 }
 
-unsafe extern "C" fn insert_text_replacement(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, _range: NSRange) {
+unsafe extern "C" fn insert_text_replacement(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, repl_range: NSRange) {
     if this.is_null() { return; }
 
     crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -406,7 +406,7 @@ unsafe extern "C" fn insert_text_replacement(this: *mut AnyObject, _sel: Sel, te
         return;
     }
 
-    // Non-ASCII or multi-char: send via ImeCommit
+    // Non-ASCII or multi-char: send via ImeCommit / ImeReplace
     let flag_ivar = (*this).class().instance_variable(c"textInserted").unwrap();
     *flag_ivar.load_mut::<u8>(&mut *this) = 1;
     // Suppress next keyUp — ImeCommit already sends KeyPress+KeyRelease
@@ -415,11 +415,40 @@ unsafe extern "C" fn insert_text_replacement(this: *mut AnyObject, _sel: Sel, te
     let ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
     let x11_id = *ivar.load::<u32>(&*this) as crate::display::Xid;
 
-    debug!("IME insertText: '{}' for window 0x{:08x}", rust_str, x11_id);
-    send_display_event(DisplayEvent::ImeCommit {
-        window: x11_id,
-        text: rust_str,
-    });
+    let reconverting = crate::display::RECONVERTING.swap(false, std::sync::atomic::Ordering::Relaxed);
+
+    if reconverting && repl_range.length > 0 {
+        // Reconversion: erase original text and insert converted text
+        let erase_chars = repl_range.length;
+        info!("IME reconversion: erase {} chars, insert '{}'", erase_chars, rust_str);
+        // Update last commit for potential chained reconversion
+        {
+            let mut lct = crate::display::LAST_COMMIT_TEXT.lock().unwrap();
+            *lct = rust_str.clone();
+        }
+        crate::display::LAST_COMMIT_CHAR_COUNT.store(rust_str.chars().count(), std::sync::atomic::Ordering::Relaxed);
+        send_display_event(DisplayEvent::ImeReplace {
+            window: x11_id,
+            erase_chars,
+            text: rust_str,
+        });
+    } else {
+        // Normal commit: save meaningful multi-char CJK text for potential reconversion.
+        // Skip ASCII-only or single-char (spaces, punctuation) — not useful to reconvert.
+        let has_cjk = rust_str.chars().any(|c| c > '\u{2E7F}');
+        if has_cjk {
+            let char_count = rust_str.chars().count();
+            let mut lct = crate::display::LAST_COMMIT_TEXT.lock().unwrap();
+            *lct = rust_str.clone();
+            drop(lct);
+            crate::display::LAST_COMMIT_CHAR_COUNT.store(char_count, std::sync::atomic::Ordering::Relaxed);
+        }
+        debug!("IME insertText: '{}' for window 0x{:08x}", rust_str, x11_id);
+        send_display_event(DisplayEvent::ImeCommit {
+            window: x11_id,
+            text: rust_str,
+        });
+    }
 }
 
 /// insertText: (single-arg, NSResponder version) — called by interpretKeyEvents: when no
@@ -451,10 +480,18 @@ unsafe extern "C" fn marked_range(_this: *mut AnyObject, _sel: Sel) -> NSRange {
 }
 
 unsafe extern "C" fn selected_range(_this: *mut AnyObject, _sel: Sel) -> NSRange {
+    // Return last commit range so macOS IME can offer reconversion.
+    // Only when not currently composing (reconversion applies to already-committed text).
+    if !crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) {
+        let n = crate::display::LAST_COMMIT_CHAR_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            return NSRange { location: 0, length: n };
+        }
+    }
     NSRange { location: 0, length: 0 }
 }
 
-unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, _sel_range: NSRange, _repl_range: NSRange) {
+unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, _sel_range: NSRange, repl_range: NSRange) {
     if this.is_null() { return; }
     let flag_ivar = (*this).class().instance_variable(c"textInserted").unwrap();
     *flag_ivar.load_mut::<u8>(&mut *this) = 1;
@@ -485,16 +522,27 @@ unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut
         crate::display::IME_COMPOSING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // replacementRange.length > 0 means macOS IME is reconverting existing committed text.
+    // Suppress preedit injection so the original text in xterm isn't disturbed.
+    if repl_range.length > 0 {
+        crate::display::RECONVERTING.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     if let Some(s) = preedit_str {
         if !s.is_empty() {
             let x11_id_ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
             let x11_id = *x11_id_ivar.load::<u32>(&*this) as crate::display::Xid;
-            info!("IME setMarkedText: preedit='{}' (sent to X11)", s);
-            send_display_event(DisplayEvent::ImePreeditDraw {
-                window: x11_id,
-                text: s,
-                cursor_pos: 0,
-            });
+            if crate::display::RECONVERTING.load(std::sync::atomic::Ordering::Relaxed) {
+                // During reconversion the original text stays in xterm; floating window only.
+                info!("IME setMarkedText (reconversion): preedit='{}' — floating only", s);
+            } else {
+                info!("IME setMarkedText: preedit='{}' (sent to X11)", s);
+                send_display_event(DisplayEvent::ImePreeditDraw {
+                    window: x11_id,
+                    text: s,
+                    cursor_pos: 0,
+                });
+            }
         }
     }
 }
@@ -509,8 +557,24 @@ unsafe extern "C" fn valid_attributes(_this: *mut AnyObject, _sel: Sel) -> *mut 
     msg_send![objc2::class!(NSArray), array]
 }
 
-unsafe extern "C" fn attributed_substring(_this: *mut AnyObject, _sel: Sel, _range: NSRange, _actual: *mut NSRange) -> *mut AnyObject {
-    std::ptr::null_mut()
+unsafe extern "C" fn attributed_substring(_this: *mut AnyObject, _sel: Sel, _range: NSRange, actual: *mut NSRange) -> *mut AnyObject {
+    let text = crate::display::LAST_COMMIT_TEXT.lock().unwrap().clone();
+    if text.is_empty() {
+        return std::ptr::null_mut();
+    }
+    // Just return the text; reconversion detection happens in setMarkedText: (repl_range.length > 0)
+    let c_str = match std::ffi::CString::new(text.as_str()) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let ns_str: *mut AnyObject = msg_send![objc2::class!(NSString), stringWithUTF8String: c_str.as_ptr()];
+    if ns_str.is_null() { return std::ptr::null_mut(); }
+    if !actual.is_null() {
+        *actual = NSRange { location: 0, length: crate::display::LAST_COMMIT_CHAR_COUNT.load(std::sync::atomic::Ordering::Relaxed) };
+    }
+    let attr_str: *mut AnyObject = msg_send![objc2::class!(NSAttributedString), alloc];
+    let attr_str: *mut AnyObject = msg_send![attr_str, initWithString: ns_str];
+    attr_str
 }
 
 unsafe extern "C" fn char_index_for_point(_this: *mut AnyObject, _sel: Sel, _point: NSPoint) -> usize {

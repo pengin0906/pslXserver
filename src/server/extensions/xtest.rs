@@ -78,13 +78,13 @@ pub async fn handle_xtest_request<S: AsyncRead + AsyncWrite + Unpin>(
                 2 => { // KeyPress
                     debug!("XTEST FakeInput: KeyPress keycode={}", detail);
                     if let Some(evt_tx) = server.connections.get(&conn.id) {
-                        let _ = evt_tx.event_tx.send(build_key_event(conn, 2, target, detail, 0, seq));
+                        let _ = evt_tx.event_tx.send(build_key_event(conn, 2, target, detail, 0, seq).into());
                     }
                 }
                 3 => { // KeyRelease
                     debug!("XTEST FakeInput: KeyRelease keycode={}", detail);
                     if let Some(evt_tx) = server.connections.get(&conn.id) {
-                        let _ = evt_tx.event_tx.send(build_key_event(conn, 3, target, detail, 0, seq));
+                        let _ = evt_tx.event_tx.send(build_key_event(conn, 3, target, detail, 0, seq).into());
                     }
                 }
                 4 | 5 => { // ButtonPress / ButtonRelease
@@ -115,35 +115,34 @@ pub async fn handle_xtest_request<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Build a 32-byte key event for FakeInput
-fn build_key_event(conn: &Arc<ClientConnection>, event_type: u8, window: u32, keycode: u8, state: u16, seq: u16) -> Vec<u8> {
-    use crate::server::connection::write_u16_to;
-    use crate::server::connection::write_u32_to;
+fn build_key_event(conn: &Arc<ClientConnection>, event_type: u8, window: u32, keycode: u8, state: u16, _seq: u16) -> [u8; 32] {
+    use crate::server::connection::ByteOrder;
 
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u32;
 
-    let mut evt = vec![0u8; 32];
+    let mut evt = [0u8; 32];
     evt[0] = event_type;
     evt[1] = keycode;
     // sequence at [2..4] will be stamped on write
-    let mut tmp = Vec::new();
-    write_u32_to(conn, &mut tmp, time);
-    evt[4..8].copy_from_slice(&tmp);
-    tmp.clear();
-    write_u32_to(conn, &mut tmp, window); // root
-    evt[8..12].copy_from_slice(&tmp);
-    tmp.clear();
-    write_u32_to(conn, &mut tmp, window); // event window
-    evt[12..16].copy_from_slice(&tmp);
-    tmp.clear();
-    write_u32_to(conn, &mut tmp, window); // child
-    evt[16..20].copy_from_slice(&tmp);
-    // root_x, root_y, event_x, event_y at offsets 20-27 = 0
-    tmp.clear();
-    write_u16_to(conn, &mut tmp, state);
-    evt[28..30].copy_from_slice(&tmp);
+    match conn.byte_order {
+        ByteOrder::LittleEndian => {
+            evt[4..8].copy_from_slice(&time.to_le_bytes());
+            evt[8..12].copy_from_slice(&window.to_le_bytes()); // root
+            evt[12..16].copy_from_slice(&window.to_le_bytes()); // event window
+            evt[16..20].copy_from_slice(&window.to_le_bytes()); // child
+            evt[28..30].copy_from_slice(&state.to_le_bytes());
+        }
+        ByteOrder::BigEndian => {
+            evt[4..8].copy_from_slice(&time.to_be_bytes());
+            evt[8..12].copy_from_slice(&window.to_be_bytes());
+            evt[12..16].copy_from_slice(&window.to_be_bytes());
+            evt[16..20].copy_from_slice(&window.to_be_bytes());
+            evt[28..30].copy_from_slice(&state.to_be_bytes());
+        }
+    }
     evt[30] = 1; // same_screen = true
     evt
 }

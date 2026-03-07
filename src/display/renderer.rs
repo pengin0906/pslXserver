@@ -103,28 +103,32 @@ pub fn render_to_buffer(
                 let alpha: u32 = 77; // ~30%
                 let inv_alpha: u32 = 255 - alpha;
                 for py in y0..y1 {
-                    for px in x0..x1 {
-                        let off = (py * stride + px * 4) as usize;
-                        if off + 3 >= buffer.len() { continue; }
-                        let db = buffer[off] as u32;
-                        let dg = buffer[off + 1] as u32;
-                        let dr = buffer[off + 2] as u32;
-                        buffer[off]     = ((hb * alpha + db * inv_alpha) / 255) as u8;
-                        buffer[off + 1] = ((hg * alpha + dg * inv_alpha) / 255) as u8;
-                        buffer[off + 2] = ((hr * alpha + dr * inv_alpha) / 255) as u8;
-                        buffer[off + 3] = 255;
+                    let row_off = (py * stride) as usize;
+                    let off_start = row_off + (x0 as usize) * 4;
+                    let off_end = row_off + (x1 as usize) * 4;
+                    if off_end > buffer.len() { break; }
+                    for chunk in buffer[off_start..off_end].chunks_exact_mut(4) {
+                        let db = chunk[0] as u32;
+                        let dg = chunk[1] as u32;
+                        let dr = chunk[2] as u32;
+                        chunk[0] = ((hb * alpha + db * inv_alpha) / 255) as u8;
+                        chunk[1] = ((hg * alpha + dg * inv_alpha) / 255) as u8;
+                        chunk[2] = ((hr * alpha + dr * inv_alpha) / 255) as u8;
+                        chunk[3] = 255;
                     }
                 }
             } else {
                 // All other GC functions: per-pixel ROP
                 let src = (*color & 0x00FFFFFF) | 0xFF000000;
                 for py in y0..y1 {
-                    for px in x0..x1 {
-                        let off = (py * stride + px * 4) as usize;
-                        if off + 4 > buffer.len() { continue; }
-                        let dst = u32::from_ne_bytes([buffer[off], buffer[off+1], buffer[off+2], buffer[off+3]]);
+                    let row_off = (py * stride) as usize;
+                    let off_start = row_off + (x0 as usize) * 4;
+                    let off_end = row_off + (x1 as usize) * 4;
+                    if off_end > buffer.len() { break; }
+                    for chunk in buffer[off_start..off_end].chunks_exact_mut(4) {
+                        let dst = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                         let result = apply_rop(*gc_function, src, dst, 0x00FFFFFF);
-                        buffer[off..off + 4].copy_from_slice(&result.to_ne_bytes());
+                        chunk.copy_from_slice(&result.to_ne_bytes());
                     }
                 }
             }
@@ -833,9 +837,14 @@ impl GlyphCache {
         let tmp_stride = w * 4;
         let tmp_size = tmp_stride * h;
 
-        // Reuse tmp_buf
-        self.tmp_buf.resize(tmp_size, 0);
-        self.tmp_buf.fill(0);
+        // Reuse tmp_buf — clear + resize is faster than resize + fill
+        // because resize(n, 0) only zero-fills new elements, not existing ones
+        if self.tmp_buf.len() == tmp_size {
+            self.tmp_buf.fill(0);
+        } else {
+            self.tmp_buf.clear();
+            self.tmp_buf.resize(tmp_size, 0);
+        }
 
         extern "C" {
             fn CGBitmapContextCreate(

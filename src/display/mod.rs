@@ -22,6 +22,13 @@ pub static IME_CONVERTING: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// Flag: suppress ConfigureNotify/Expose from setFrameSize when resize is initiated by X11 ConfigureWindow.
 /// Set by MoveResizeWindow handler before calling setFrame:display, cleared by setFrameSize or after.
 pub static SUPPRESS_RESIZE_EVENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Last non-ASCII text committed via IME — stored for macOS reconversion (selectedRange/attributedSubstring).
+pub static LAST_COMMIT_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Char count of last IME commit in UTF-16 units (≈ char count for BMP).
+pub static LAST_COMMIT_CHAR_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Flag: macOS IME is performing reconversion (attributedSubstring was called with non-empty result).
+/// Prevents preedit injection into X11 app during reconversion; cleared on insertText: or cancel.
+pub static RECONVERTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Shared render mailbox: native_window_id -> pending render commands.
 /// Protocol handlers append commands; display thread drains each frame.
@@ -223,6 +230,12 @@ pub enum DisplayEvent {
     /// IME committed text (from macOS insertText:).
     ImeCommit {
         window: Xid,
+        text: String,
+    },
+    /// IME reconversion: erase `erase_chars` chars before cursor, then insert text.
+    ImeReplace {
+        window: Xid,
+        erase_chars: usize,
         text: String,
     },
     /// IME preedit started.

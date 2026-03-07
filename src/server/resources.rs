@@ -305,6 +305,8 @@ pub struct CursorState {
     pub back_red: u16,
     pub back_green: u16,
     pub back_blue: u16,
+    /// Pre-computed macOS cursor type (MacOSCursorType as u8).
+    pub macos_type: u8,
 }
 
 #[cfg(test)]
