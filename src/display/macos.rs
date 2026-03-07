@@ -37,6 +37,8 @@ extern "C" {
         context: *mut c_void,
     ) -> *mut c_void;
     fn CFRunLoopAddTimer(rl: *mut c_void, timer: *mut c_void, mode: *const c_void);
+    fn CFRunLoopGetMain() -> *mut c_void;
+    fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
     static kCFRunLoopCommonModes: *const c_void;
     static kCFRunLoopDefaultMode: *const c_void;
 
@@ -54,7 +56,27 @@ extern "C" {
     static kCFTypeDictionaryValueCallBacks: c_void;
 }
 
-// IOSurface property keys
+// --- CoreGraphics CGEventTap FFI ---
+extern "C" {
+    // CGEventTapCreate: returns CFMachPortRef (opaque), NULL on failure.
+    // kCGSessionEventTap=1, kCGHeadInsertEventTap=0, kCGEventTapOptionListenOnly=1
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> *mut c_void,
+        user_info: *mut c_void,
+    ) -> *mut c_void;
+    // CFMachPortCreateRunLoopSource: wraps a CFMachPortRef (CGEventTap) as a CFRunLoopSource.
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const c_void,
+        port: *mut c_void,
+        order: i32,
+    ) -> *mut c_void;
+}
+
+// --- IOSurface property keys
 extern "C" {
     static kIOSurfaceWidth: *const c_void;
     static kIOSurfaceHeight: *const c_void;
@@ -341,22 +363,16 @@ unsafe extern "C" fn update_tracking_areas(this: *mut AnyObject, _sel: Sel) {
     let _: () = msg_send![this, addTrackingArea: ta];
 }
 
-/// mouseEntered: — NSTrackingArea callback (NSTrackingActiveAlways), fires even when
-/// pslXserver is backgrounded. This IS a real user-event context, so activate_app()
-/// is respected by macOS Sequoia here (unlike timer-based calls which are ignored).
+/// mouseEntered: — NSTrackingArea callback (NSTrackingActiveAlways).
+/// When pslXserver IS active: handle normal focus-follows-mouse between X11 windows.
+/// When pslXserver is NOT active: do NOT call activate_app and do NOT set
+/// LAST_ENTER_WINDOW_X11 — let the NSEvent global monitor handle activation.
+/// Reason: activateIgnoringOtherApps is ignored by Sequoia from NSTrackingArea context,
+/// and setting LAST_ENTER_WINDOW_X11 here would prevent the global monitor from firing.
 unsafe extern "C" fn mouse_entered(this: *mut AnyObject, _sel: Sel, _event: *mut AnyObject) {
     let ns_window: *mut AnyObject = msg_send![this, window];
     if ns_window.is_null() { return; }
 
-    // Suppress button polling + NSEvent button handler for the next several frames
-    // to prevent spurious ButtonPress events that macOS synthesizes on activation.
-    SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
-
-    // Activate app + bring window to front. Correct order: activate FIRST, then
-    // makeKeyAndOrderFront (per AppKit docs and the ar.al activation ordering fix).
-    activate_app(ns_window);
-
-    // Find X11 window id for this NSWindow.
     let x11_id = WINDOWS.with(|w| {
         let ws = w.borrow();
         for (_id, info) in ws.iter() {
@@ -365,11 +381,23 @@ unsafe extern "C" fn mouse_entered(this: *mut AnyObject, _sel: Sel, _event: *mut
         }
         0
     });
-    if x11_id != 0 {
-        // Update LAST_ENTER_WINDOW_X11 so check_enter_notify() doesn't re-send FocusIn.
+    if x11_id == 0 { return; }
+
+    let mtm = MainThreadMarker::new().unwrap();
+    let app = NSApplication::sharedApplication(mtm);
+    let is_active: bool = msg_send![&*app, isActive];
+
+    if is_active {
+        // Normal case: pslXserver already has focus, user moved to a different X11 window.
         LAST_ENTER_WINDOW_X11.with(|le| le.set(x11_id));
-        info!("mouseEntered → activate + FocusIn x11=0x{:08x}", x11_id);
+        info!("mouseEntered (active) → FocusIn x11=0x{:08x}", x11_id);
         send_display_event(DisplayEvent::FocusIn { window: x11_id });
+    } else {
+        // Backgrounded: DON'T set LAST_ENTER_WINDOW_X11 here.
+        // The global monitor will see the next mouse-moved event, find LAST=0 ≠ entered_xid,
+        // and call activate_app in a user-event context that Sequoia actually respects.
+        SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
+        info!("mouseEntered (backgrounded) x11=0x{:08x} — deferring to global monitor", x11_id);
     }
 }
 
@@ -1187,24 +1215,72 @@ fn check_window_resizes() {
 /// Activate pslXserver and bring the given window to front.
 /// MUST be called from a real user-event handler (mouseEntered:, mouseDown:, etc.)
 /// macOS Sequoia ignores activation calls from timer/background contexts.
-///
-/// Key insights (from ar.al article + XQuartz set_front_process):
-/// 1. setActivationPolicy:Regular must be asserted each time (CLI launch may reset it)
-/// 2. activateIgnoringOtherApps:YES is async (goes to WindowServer) — same as XQuartz
-/// 3. makeKeyAndOrderFront: must run AFTER activate takes effect — use dispatch_async
-///    to defer to the next run loop iteration (avoids race with terminal's activation)
+/// CGEventTap callback — fires on main thread for every mouse event at WindowServer level.
+/// Unlike NSEvent global monitor, this fires even when Finder (or any app that doesn't
+/// use acceptsMouseMovedEvents) is the active app.
+unsafe extern "C" fn cg_mouse_tap_callback(
+    _proxy: *mut c_void,
+    _event_type: u32,
+    event: *mut c_void,
+    _user_info: *mut c_void,
+) -> *mut c_void {
+    // Only act when we're in the background.
+    let mtm = match MainThreadMarker::new() {
+        Some(m) => m,
+        None => return event,
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let is_active: bool = msg_send![&*app, isActive];
+    if is_active { return event; }
+
+    let mouse_loc: NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
+    let (entered_xid, entered_nswin): (crate::display::Xid, *mut AnyObject) = WINDOWS.with(|w| {
+        let ws = w.borrow();
+        let mut best: Option<(crate::display::Xid, isize, *mut AnyObject)> = None;
+        for (_id, info) in ws.iter() {
+            if !info.visible { continue; }
+            let frame: NSRect = msg_send![&*info.window, frame];
+            let win_x = mouse_loc.x - frame.origin.x;
+            let win_y = mouse_loc.y - frame.origin.y;
+            if win_x < 0.0 || win_y < 0.0
+                || win_x >= frame.size.width
+                || win_y >= frame.size.height { continue; }
+            let win_num: isize = msg_send![&*info.window, windowNumber];
+            let ptr = &*info.window as *const NSWindow as *mut AnyObject;
+            if best.is_none() || win_num > best.as_ref().unwrap().1 {
+                best = Some((info.x11_id, win_num, ptr));
+            }
+        }
+        best.map(|(xid, _, p)| (xid, p)).unwrap_or((0, std::ptr::null_mut()))
+    });
+
+    LAST_ENTER_WINDOW_X11.with(|le| {
+        if entered_nswin.is_null() {
+            // Mouse left all our windows — reset so next entry fires again.
+            if le.get() != 0 { le.set(0); }
+            return;
+        }
+        if le.get() == entered_xid { return; }
+        le.set(entered_xid);
+        info!("CGEventTap: cursor entered x11=0x{:08x} while backgrounded — activating", entered_xid);
+        SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
+        activate_app(entered_nswin);
+        send_display_event(DisplayEvent::FocusIn { window: entered_xid });
+    });
+
+    event // passive listener: return event unchanged
+}
+
+/// Activate pslXserver and bring the given NSWindow to key.
+/// Must be called from a user-event context (CGEventTap or NSEvent global monitor handler).
+/// activateIgnoringOtherApps:YES is deprecated but still respected by Sequoia in user-event context.
 unsafe fn activate_app(ns_window: *mut AnyObject) {
     let mtm = MainThreadMarker::new().unwrap();
     let app = NSApplication::sharedApplication(mtm);
-    // Re-assert Regular policy — CLI-launched processes may have it reset
+    // Re-assert Regular policy each time — CLI-launched processes may have it reset.
     let _: bool = msg_send![&*app, setActivationPolicy: 0i64];
-    // Activate (same as XQuartz set_front_process: [NSApp activateIgnoringOtherApps:YES])
     let _: () = msg_send![&*app, activateIgnoringOtherApps: objc2::runtime::Bool::YES];
-    let is_active: bool = msg_send![&*app, isActive];
-    info!("activate_app: isActive={}", is_active);
-    // Schedule makeKeyAndOrderFront: for the NEXT timer tick (process_commands).
-    // activateIgnoringOtherApps is async (WindowServer RPC); calling makeKeyAndOrderFront
-    // immediately races with the activation completing. Deferring by one frame lets it settle.
+    // Schedule makeKeyAndOrderFront: for the NEXT timer tick so activation settles first.
     if !ns_window.is_null() {
         PENDING_KEY_WINDOW.with(|p| p.set(ns_window));
     }
@@ -1264,6 +1340,8 @@ fn check_key_window() {
     let app = NSApplication::sharedApplication(mtm);
     let key_win: *mut AnyObject = unsafe { msg_send![&*app, keyWindow] };
     if key_win.is_null() {
+        // Backgrounded — no key window. Reset tracker so next click/activation fires FocusIn.
+        LAST_KEY_WINDOW_X11.with(|lkw| lkw.set(0));
         return;
     }
 
@@ -2202,17 +2280,15 @@ pub fn run_cocoa_app(
             });
             if entered_nswin.is_null() { return; }
 
-            // Cursor is inside one of our windows while we're backgrounded.
-            // Only act once per window-enter (use LAST_ENTER_WINDOW_X11 as dedup).
-            LAST_ENTER_WINDOW_X11.with(|le| {
-                if le.get() == entered_xid { return; }
-                le.set(entered_xid);
-                info!("GlobalMonitor: cursor entered x11=0x{:08x} while backgrounded — activating", entered_xid);
-                // Activate in event-handler context (macOS Sequoia respects this)
-                SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
-                activate_app(entered_nswin);
-                send_display_event(DisplayEvent::FocusIn { window: entered_xid });
-            });
+            // Cursor is over one of our windows while backgrounded — activate.
+            // No dedup on xid: user may cmd-tab while mouse is over our window,
+            // leaving LAST_ENTER_WINDOW_X11 already set to entered_xid.
+            // The is_active guard above prevents redundant calls once we're active.
+            info!("GlobalMonitor: cursor over x11=0x{:08x} while backgrounded — activating", entered_xid);
+            SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
+            LAST_ENTER_WINDOW_X11.with(|le| le.set(entered_xid));
+            activate_app(entered_nswin);
+            send_display_event(DisplayEvent::FocusIn { window: entered_xid });
         });
         let ns_event_cls = objc2::class!(NSEvent);
         // NSEventMaskMouseMoved(32) | NSEventMaskLeftMouseDragged(64) | NSEventMaskRightMouseDragged(128)
@@ -2228,6 +2304,33 @@ pub fn run_cocoa_app(
         info!("Installed NSEvent global monitor for mouse-enter focus (monitor={:?})", _monitor);
         // Leak the block — the monitor runs forever (app lifetime)
         std::mem::forget(handler);
+    }
+
+    // CGEventTap: WindowServer-level mouse monitor.
+    // Fires for ALL mouse events regardless of which app is active (including Finder).
+    // Added to the main run loop so the callback executes on the main thread —
+    // this is a user-event context that macOS Sequoia respects for activation.
+    // kCGSessionEventTap=1, kCGHeadInsertEventTap=0, kCGEventTapOptionListenOnly=1
+    // Without Accessibility permission, creates a passive (observe-only) tap — still works.
+    unsafe {
+        let mouse_mask: u64 = (1u64 << 5) | (1u64 << 6) | (1u64 << 7) | (1u64 << 27);
+        let tap = CGEventTapCreate(
+            1, // kCGSessionEventTap
+            0, // kCGHeadInsertEventTap
+            1, // kCGEventTapOptionListenOnly
+            mouse_mask,
+            cg_mouse_tap_callback,
+            std::ptr::null_mut(),
+        );
+        if !tap.is_null() {
+            let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
+            if !source.is_null() {
+                CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+                info!("Installed CGEventTap for focus-follows-mouse (tap={:?})", tap);
+            }
+        } else {
+            info!("CGEventTap creation failed (Accessibility not granted) — relying on NSEvent global monitor");
+        }
     }
 
     // Detect backing scale factor and cache screen height
