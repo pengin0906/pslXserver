@@ -914,8 +914,12 @@ fn send_key_event(
     // focus_window: 0=None, 1=PointerRoot, else=specific window ID.
     let focus = server.focus_window.load(Ordering::Relaxed);
     let target = if focus > 1 {
-        // Explicit focus window set by SetInputFocus
-        focus
+        // Explicit focus window set by SetInputFocus (or by macOS FocusIn).
+        // Still use find_deepest_child so key events reach the child window
+        // that actually selected KEY_PRESS (e.g. xterm's vt100 child).
+        let deepest = find_deepest_child(server, window);
+        // Only use deepest if it's a descendant of (or equal to) focus window
+        if deepest != 0 { deepest } else { focus }
     } else if focus == 1 {
         // PointerRoot: find the deepest child under the pointer in the event window
         find_deepest_child(server, window)
