@@ -4334,6 +4334,9 @@ async fn handle_send_event<S: AsyncRead + AsyncWrite + Unpin>(
         let msg_type = read_u32(conn, &event_data[8..12]);
         let msg_window = read_u32(conn, &event_data[4..8]);
 
+        info!("SendEvent: ClientMessage event_type={} format={} window=0x{:08x} msg_type={} (xim_xconnect={} xim_protocol={} xim_moredata={})",
+            event_type, format, msg_window, msg_type,
+            server.xim.atoms.xim_xconnect, server.xim.atoms.xim_protocol, server.xim.atoms.xim_moredata);
         if msg_type == server.xim.atoms.xim_xconnect {
             // XIM transport handshake — the client_comm_window is in data[12..16] (format=32)
             let client_comm_window = if format == 32 {
@@ -4346,9 +4349,30 @@ async fn handle_send_event<S: AsyncRead + AsyncWrite + Unpin>(
             server.xim.handle_xconnect(client_comm_window, conn, server);
             return Ok(());
         } else if msg_type == server.xim.atoms.xim_protocol || msg_type == server.xim.atoms.xim_moredata {
-            // XIM protocol message
-            let xim_data = &event_data[12..32]; // 20 bytes of data
-            server.xim.handle_protocol_message(msg_window, msg_type, xim_data, conn, server);
+            // XIM protocol message — route by conn_id since xterm sets window=server_comm_window (root)
+            if format == 32 {
+                // format=32: data.l[0]=byte_count, data.l[1]=property_atom
+                // The XIM data was stored as a property on the window; fetch it.
+                let byte_count = read_u32(conn, &event_data[12..16]) as usize;
+                let prop_atom = read_u32(conn, &event_data[16..20]);
+                debug!("XIM format=32 transport: byte_count={} prop_atom={} window=0x{:08x}", byte_count, prop_atom, msg_window);
+                // Read property from msg_window (root = 0x00000001)
+                let prop_data = if let Some(res) = server.resources.get(&msg_window) {
+                    if let super::resources::Resource::Window(ref w) = res.value() {
+                        let w = w.read();
+                        w.get_property(prop_atom).map(|p| p.data[..std::cmp::min(byte_count, p.data.len())].to_vec())
+                    } else { None }
+                } else { None };
+                if let Some(data_vec) = prop_data {
+                    server.xim.handle_protocol_message_by_conn(conn.id, &data_vec, conn, server);
+                } else {
+                    warn!("XIM format=32: property atom={} not found on window 0x{:08x}", prop_atom, msg_window);
+                }
+            } else {
+                // format=8: data embedded directly (up to 20 bytes)
+                let xim_data = &event_data[12..32];
+                server.xim.handle_protocol_message_by_conn(conn.id, xim_data, conn, server);
+            }
             return Ok(());
         }
     }

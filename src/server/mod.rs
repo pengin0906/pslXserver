@@ -491,7 +491,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                         );
                     }
                 }
-                eprintln!("BTN_PRESS: src=0x{:08x} target=0x{:08x} btn={} ({},{}) root=({},{}) state=0x{:04x} grab=0x{:08x}", window, target, button, cx, cy, root_x, root_y, state, grab_window);
+
                 send_button_event(&server, protocol::event_type::BUTTON_PRESS,
                     target, button, cx, cy, root_x, root_y, state, time);
             }
@@ -502,7 +502,6 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 } else {
                     find_child_at_point(&server, window, x, y)
                 };
-                eprintln!("BTN_RELEASE: src=0x{:08x} target=0x{:08x} btn={} ({},{}) root=({},{}) state=0x{:04x}", window, target, button, cx, cy, root_x, root_y, state);
                 send_button_event(&server, protocol::event_type::BUTTON_RELEASE,
                     target, button, cx, cy, root_x, root_y, state, time);
                 // Release implicit grab when all buttons are released
@@ -766,6 +765,19 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     info!("ClipboardCopyRequest: no PRIMARY owner");
                 }
             }
+            DisplayEvent::FocusIn { window } => {
+                // macOS window became key — update X11 focus to match
+                let old_focus = server.focus_window.load(Ordering::Relaxed);
+                let new_focus = find_toplevel(&server, window);
+                if new_focus > 1 && new_focus != old_focus {
+                    if old_focus > 1 {
+                        send_focus_event(&server, protocol::event_type::FOCUS_OUT, old_focus);
+                    }
+                    server.focus_window.store(new_focus, Ordering::Relaxed);
+                    send_focus_event(&server, protocol::event_type::FOCUS_IN, new_focus);
+                    info!("FocusIn from macOS: focus_window -> 0x{:08x}", new_focus);
+                }
+            }
             _ => {
                 log::debug!("Unhandled display event: {:?}", evt);
             }
@@ -800,7 +812,6 @@ fn send_button_event(
                 let w = win.read();
                 for &(conn_id, emask) in &w.event_selections {
                     if (emask & mask_bit) != 0 {
-                        eprintln!("  BTN_DELIVER: conn={} win=0x{:08x} from=0x{:08x} type={}", conn_id, current, window, event_type);
                         if let Some(conn_ref) = server.connections.get(&conn_id) {
                             let conn = conn_ref.value();
                             let mut evt = events::EventBuilder::new(conn, event_type);
@@ -828,7 +839,6 @@ fn send_button_event(
             } else { break; }
         } else { break; }
     }
-    eprintln!("  BTN_NOT_DELIVERED: mask=0x{:08x} last_win=0x{:08x} orig_win=0x{:08x}", mask_bit, current, window);
 }
 
 fn send_motion_event(
@@ -1313,9 +1323,7 @@ fn find_child_at_point(server: &XServer, window: Xid, x: i16, y: i16) -> (Xid, i
             } else { Vec::new() }
         } else { Vec::new() };
 
-        if depth == 0 && !children.is_empty() {
-            eprintln!("  find_child_at_point: win=0x{:08x} ({},{}) children={:?}", current, cx, cy, children.iter().map(|c| format!("0x{:08x}", c)).collect::<Vec<_>>());
-        }
+
 
         let mut found = None;
         // Check children in reverse order (top-most first)

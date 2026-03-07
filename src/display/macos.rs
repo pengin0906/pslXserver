@@ -153,6 +153,10 @@ thread_local! {
     static SCROLL_ACCUM_X: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     /// Accumulated pinch-to-zoom magnification delta.
     static MAGNIFY_ACCUM: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// Implicit pointer grab: window that received the most recent ButtonPress.
+    /// While any button is down, MotionNotify goes here (not to cursor-under window).
+    /// Cleared when all buttons are released.
+    static GRAB_WINDOW: std::cell::Cell<Option<crate::display::Xid>> = const { std::cell::Cell::new(None) };
 }
 
 fn get_scale_factor() -> f64 {
@@ -1192,6 +1196,8 @@ fn process_commands() {
                     if let Some((x11_id, win_x, win_y, _)) = best {
                         if now == 1 {
                             let btn_mask: u16 = match x11_button { 1=>0x100, 2=>0x200, 3=>0x400, _=>0 };
+                            // Implicit grab: record window for this press
+                            GRAB_WINDOW.with(|gw| gw.set(Some(x11_id)));
                             send_display_event(DisplayEvent::ButtonPress {
                                 window: x11_id, button: x11_button,
                                 x: win_x, y: win_y, root_x: rx, root_y: ry,
@@ -1203,6 +1209,10 @@ fn process_commands() {
                                 x: win_x, y: win_y, root_x: rx, root_y: ry,
                                 state: btn_state, time,
                             });
+                            // Release grab when all buttons are up
+                            if cur_buttons == 0 {
+                                GRAB_WINDOW.with(|gw| gw.set(None));
+                            }
                         }
                     }
                 });
@@ -1221,9 +1231,28 @@ fn process_commands() {
                 let uptime: f64 = msg_send![pi, systemUptime];
                 (uptime * 1000.0) as u32
             };
-            // Send MotionNotify only to the frontmost visible window under cursor
+            // Send MotionNotify: during implicit grab (button held), send to grab window.
+            // Otherwise send to the frontmost visible window under cursor.
+            let grab_xid = GRAB_WINDOW.with(|gw| gw.get());
             WINDOWS.with(|w| {
                 let ws = w.borrow();
+                // If grab is active, find the grabbed window by x11_id and compute coords
+                if let Some(gxid) = grab_xid {
+                    if let Some((_wid, info)) = ws.iter().find(|(_, i)| i.x11_id == gxid) {
+                        let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
+                        let content_h = if let Some(view) = info.window.contentView() {
+                            let bounds: NSRect = unsafe { msg_send![&*view, bounds] };
+                            bounds.size.height
+                        } else { frame.size.height };
+                        let win_x = (mouse_loc.x - frame.origin.x) as i16;
+                        let win_y = (frame.origin.y + content_h - mouse_loc.y) as i16;
+                        send_display_event(DisplayEvent::MotionNotify {
+                            window: gxid, x: win_x, y: win_y,
+                            root_x: rx, root_y: ry, state: btn_state, time,
+                        });
+                        return;
+                    }
+                }
                 let mut best: Option<(crate::display::Xid, i16, i16, isize)> = None;
                 for (_id, info) in ws.iter() {
                     if !info.visible { continue; }
@@ -1557,6 +1586,9 @@ fn handle_command(cmd: DisplayCommand) {
                         let app = NSApplication::sharedApplication(mtm);
                         unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
                         info.window.makeKeyAndOrderFront(None);
+                        // Update X11 focus to match macOS key window
+                        let x11_id = info.x11_id;
+                        send_display_event(DisplayEvent::FocusIn { window: x11_id });
                         flush_window(info);
                     } else {
                         info!("ShowWindow: id={} x11=0x{:08X} - hidden (render-only)", handle.id, info.x11_id);
