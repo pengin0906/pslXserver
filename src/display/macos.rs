@@ -157,6 +157,13 @@ thread_local! {
     /// While any button is down, MotionNotify goes here (not to cursor-under window).
     /// Cleared when all buttons are released.
     static GRAB_WINDOW: std::cell::Cell<Option<crate::display::Xid>> = const { std::cell::Cell::new(None) };
+    /// X11 window id of the last NSWindow that was the macOS keyWindow.
+    /// Used to detect key window changes (e.g. after title bar drag) and re-send FocusIn.
+    static LAST_KEY_WINDOW_X11: std::cell::Cell<crate::display::Xid> = const { std::cell::Cell::new(0) };
+    /// X11 window id of the window the mouse cursor is currently inside.
+    /// Used for proactive FocusIn on EnterNotify — sent every frame even when
+    /// pslXserver is not the active macOS app.
+    static LAST_ENTER_WINDOW_X11: std::cell::Cell<crate::display::Xid> = const { std::cell::Cell::new(0) };
 }
 
 fn get_scale_factor() -> f64 {
@@ -217,6 +224,9 @@ fn get_input_view_class() -> &'static AnyClass {
             // acceptsFirstResponder -> YES
             class_addMethod(raw_cls, objc2::sel!(acceptsFirstResponder),
                 accepts_first_responder as *const std::ffi::c_void, c"B@:".as_ptr() as _);
+            // acceptsFirstMouse: -> YES (first click on inactive window is delivered, not consumed)
+            class_addMethod(raw_cls, objc2::sel!(acceptsFirstMouse:),
+                accepts_first_mouse as *const std::ffi::c_void, c"B@:@".as_ptr() as _);
             // keyDown:
             class_addMethod(raw_cls, objc2::sel!(keyDown:),
                 view_key_down as *const std::ffi::c_void, c"v@:@".as_ptr() as _);
@@ -279,6 +289,14 @@ fn get_input_view_class() -> &'static AnyClass {
 /// macOS automatically changes the cursor when the mouse enters these rects.
 
 unsafe extern "C" fn accepts_first_responder(_this: *mut AnyObject, _sel: Sel) -> Bool {
+    Bool::YES
+}
+
+/// acceptsFirstMouse: — return YES so the first click on an inactive window is delivered
+/// to this view (not consumed by macOS just to activate the app).
+/// Without this, clicking xterm content only activates pslXserver but the click itself
+/// is swallowed by macOS → our mouseDown handler is never called → no ButtonPress/FocusIn.
+unsafe extern "C" fn accepts_first_mouse(_this: *mut AnyObject, _sel: Sel, _event: *mut AnyObject) -> Bool {
     Bool::YES
 }
 
@@ -1092,6 +1110,104 @@ fn check_window_resizes() {
     }
 }
 
+/// Poll mouse position each frame; implement X11 focus-follows-pointer in macOS terms.
+/// When cursor enters one of our windows:
+///   1. Make the NSWindow key + activate pslXserver (macOS side: delivers KeyPress to PSLXInputView)
+///   2. Send X11 FocusIn to the X11 client (X11 side: xterm sets ICFocus and accepts keyboard)
+/// This harmonizes X11's focus-follows-mouse with macOS's click-to-focus model.
+fn check_enter_notify() {
+    let mouse_loc: NSPoint = unsafe { msg_send![objc2::class!(NSEvent), mouseLocation] };
+
+    // Find the frontmost visible window under the cursor, and collect its NSWindow ptr.
+    let (entered_xid, entered_nswin) = WINDOWS.with(|w| {
+        let ws = w.borrow();
+        let mut best: Option<(crate::display::Xid, isize, *mut AnyObject)> = None;
+        for (_id, info) in ws.iter() {
+            if !info.visible { continue; }
+            let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
+            let content_h = if let Some(view) = info.window.contentView() {
+                let bounds: NSRect = unsafe { msg_send![&*view, bounds] };
+                bounds.size.height
+            } else { frame.size.height };
+            // win_y: distance from top of content area (macOS Y is bottom-up)
+            let win_x = (mouse_loc.x - frame.origin.x) as i16;
+            let win_y = (frame.origin.y + content_h - mouse_loc.y) as i16;
+            if win_x < 0 || win_y < 0
+                || (win_x as f64) >= frame.size.width
+                || (win_y as f64) >= content_h { continue; }
+            let win_num: isize = unsafe { msg_send![&*info.window, windowNumber] };
+            let win_ptr = &*info.window as *const NSWindow as *mut AnyObject;
+            if best.is_none() || win_num > best.unwrap().1 {
+                best = Some((info.x11_id, win_num, win_ptr));
+            }
+        }
+        best.map(|(xid, _, ptr)| (xid, ptr)).unwrap_or((0, std::ptr::null_mut()))
+    });
+
+    LAST_ENTER_WINDOW_X11.with(|le| {
+        if le.get() == entered_xid { return; }
+        le.set(entered_xid);
+        if entered_xid == 0 { return; }
+
+        info!("EnterNotify → makeKey + FocusIn x11=0x{:08x}", entered_xid);
+
+        // macOS side: make this window key and activate pslXserver.
+        // This is the "focus follows mouse" harmonization — without it, PSLXInputView
+        // never receives keyDown: events because macOS only delivers keys to the key window
+        // of the active (frontmost) application.
+        unsafe {
+            // Activate pslXserver (bring to foreground for keyboard purposes)
+            let mtm = MainThreadMarker::new().unwrap();
+            let app = NSApplication::sharedApplication(mtm);
+            let _: () = msg_send![&*app, activateIgnoringOtherApps: objc2::runtime::Bool::YES];
+            // Make the specific window key (without raising it above other apps' windows)
+            if !entered_nswin.is_null() {
+                let _: () = msg_send![entered_nswin, makeKeyWindow];
+            }
+        }
+
+        // X11 side: send FocusIn so xterm sets ICFocus and accepts keyboard input.
+        send_display_event(DisplayEvent::FocusIn { window: entered_xid });
+    });
+}
+
+/// Poll NSApp.keyWindow each frame; send FocusIn when it switches to one of our windows.
+/// This catches focus gained via title bar drag or other system-level window activation
+/// that bypasses our NSEvent mouse-down handler.
+fn check_key_window() {
+    let mtm = MainThreadMarker::new().unwrap();
+    let app = NSApplication::sharedApplication(mtm);
+    let key_win: *mut AnyObject = unsafe { msg_send![&*app, keyWindow] };
+    if key_win.is_null() {
+        return;
+    }
+
+    // Find the X11 window id for the current key NSWindow.
+    let x11_id: crate::display::Xid = WINDOWS.with(|w| {
+        let ws = w.borrow();
+        for info in ws.values() {
+            // Compare raw NSWindow pointer identity.
+            let win_ptr = &*info.window as *const NSWindow as *const AnyObject as *mut AnyObject;
+            if win_ptr == key_win {
+                return info.x11_id;
+            }
+        }
+        0
+    });
+
+    if x11_id == 0 {
+        return;
+    }
+
+    LAST_KEY_WINDOW_X11.with(|lkw| {
+        if lkw.get() != x11_id {
+            lkw.set(x11_id);
+            info!("Key window changed → FocusIn x11=0x{:08x}", x11_id);
+            send_display_event(DisplayEvent::FocusIn { window: x11_id });
+        }
+    });
+}
+
 /// Drop redundant full-window PutImage commands. When Electron sends many
 /// full-screen frames in a single batch, only the last full-screen PutImage
 /// matters since it overwrites the entire surface. Non-PutImage commands and
@@ -1340,6 +1456,14 @@ fn process_commands() {
 
     // 1.6. Detect window resizes — compare content view size to stored IOSurface size
     check_window_resizes();
+
+    // 1.7. Send FocusIn when macOS key window changes (e.g. after title bar drag)
+    check_key_window();
+
+    // 1.8. Send FocusIn when mouse enters one of our windows (proactive EnterNotify).
+    // Runs every frame so xterm gets FocusIn as soon as cursor enters, without
+    // needing to click or drag — works even when pslXserver is not the active app.
+    check_enter_notify();
 
     // 2. Drain render mailbox + render — targeted get_mut per window (avoids iter_mut's 16-shard scan)
     RENDER_MAILBOX.with(|mb| {
@@ -2142,6 +2266,11 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
         let ts: f64 = msg_send![event, timestamp];
         (ts * 1000.0) as u32
     };
+
+    // When user clicks on a window, update X11 focus to that window
+    if event_type == NS_LEFT_MOUSE_DOWN || event_type == NS_RIGHT_MOUSE_DOWN || event_type == NS_OTHER_MOUSE_DOWN {
+        send_display_event(DisplayEvent::FocusIn { window: x11_id });
+    }
 
     match event_type {
         NS_LEFT_MOUSE_DOWN | NS_RIGHT_MOUSE_DOWN | NS_OTHER_MOUSE_DOWN => {
