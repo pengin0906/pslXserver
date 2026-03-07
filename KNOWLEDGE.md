@@ -78,6 +78,15 @@
 - **virtual_keysymsリセット廃止**: ImeCommit/ImePreeditDoneでのtruncate(86)を削除。漢字スロットを積み上げたまま保持し、同じ漢字は既存スロット再利用→MappingNotify不送信→遅延ゼロ。スロット溢れ(119個超)時のみsend_ime_text内でtruncate(86)してリセット
 - **Chrome/xtermプリエディット分離**: window_is_xterm()でxterm判定。xtermのみ仮想キーコードによるインラインプリエディット挿入、Chrome等は挿入しない（ChromeのURL補完がBackSpaceを横取りするため）
 
+## 修正履歴 (2026-03-07 後半)
+- **zsh マウスクリックカーソル移動 (9955wx)**: `~/.zshrc`にX10マウスモード(`?9h`)を実装
+  - `?9h` = プレスイベントのみ（スクロール・リリースなし）→ トラックパッドスクロールで暴走しない
+  - `bindkey $'\e[M'` でX10マウスプレフィックスをzleウィジェットに紐付け
+  - `read -rs -k 1` で3バイト読み取り（btn+32, col+32, row+32）
+  - `print -Pn "$PROMPT"` でプロンプト展開 → ANSI除去 → 実表示幅を算出
+  - CJK文字を幅2として列→文字インデックス変換（`$(( #ch ))`でUnicodeコードポイント取得）
+  - Shift+クリックはxtermが横取り→テキスト選択は壊れない
+
 ## 既知の問題
 - XI2拡張が不完全（Chrome/Electronクラッシュ原因、現在無効化中）
 - SHAPE拡張未実装（xeyes/xlogoが矩形ウィンドウのまま）
