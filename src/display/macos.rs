@@ -1234,24 +1234,25 @@ unsafe extern "C" fn cg_mouse_tap_callback(
     if is_active { return event; }
 
     let mouse_loc: NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
+    // Use windowNumberAtPoint to find the TOPMOST window at the cursor,
+    // including windows from OTHER apps. Only activate if the topmost
+    // window is ours — prevents raising windows hidden behind other apps.
+    let topmost_win_num: isize = msg_send![objc2::class!(NSWindow),
+        windowNumberAtPoint: mouse_loc
+        belowWindowWithWindowNumber: 0isize];
     let (entered_xid, entered_nswin): (crate::display::Xid, *mut AnyObject) = WINDOWS.with(|w| {
         let ws = w.borrow();
-        let mut best: Option<(crate::display::Xid, isize, *mut AnyObject)> = None;
         for (_id, info) in ws.iter() {
             if !info.visible { continue; }
-            let frame: NSRect = msg_send![&*info.window, frame];
-            let win_x = mouse_loc.x - frame.origin.x;
-            let win_y = mouse_loc.y - frame.origin.y;
-            if win_x < 0.0 || win_y < 0.0
-                || win_x >= frame.size.width
-                || win_y >= frame.size.height { continue; }
+            let is_mini: bool = msg_send![&*info.window, isMiniaturized];
+            if is_mini { continue; }
             let win_num: isize = msg_send![&*info.window, windowNumber];
-            let ptr = &*info.window as *const NSWindow as *mut AnyObject;
-            if best.is_none() || win_num > best.as_ref().unwrap().1 {
-                best = Some((info.x11_id, win_num, ptr));
+            if win_num == topmost_win_num {
+                let ptr = &*info.window as *const NSWindow as *mut AnyObject;
+                return (info.x11_id, ptr);
             }
         }
-        best.map(|(xid, _, p)| (xid, p)).unwrap_or((0, std::ptr::null_mut()))
+        (0, std::ptr::null_mut())
     });
 
     // kCGEventLeftMouseDown=1, kCGEventRightMouseDown=3: activation click.
@@ -1309,29 +1310,25 @@ unsafe fn activate_app(ns_window: *mut AnyObject) {
 fn check_enter_notify() {
     let mouse_loc: NSPoint = unsafe { msg_send![objc2::class!(NSEvent), mouseLocation] };
 
-    // Find the frontmost visible window under the cursor, and collect its NSWindow ptr.
+    // Use windowNumberAtPoint to find the TOPMOST window at the cursor.
+    // Only match if it's one of ours — prevents stealing focus from other apps.
+    let topmost_win_num: isize = unsafe {
+        msg_send![objc2::class!(NSWindow),
+            windowNumberAtPoint: mouse_loc
+            belowWindowWithWindowNumber: 0isize]
+    };
     let entered_xid = WINDOWS.with(|w| {
         let ws = w.borrow();
-        let mut best: Option<(crate::display::Xid, isize)> = None;
         for (_id, info) in ws.iter() {
             if !info.visible { continue; }
-            let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
-            let content_h = if let Some(view) = info.window.contentView() {
-                let bounds: NSRect = unsafe { msg_send![&*view, bounds] };
-                bounds.size.height
-            } else { frame.size.height };
-            // win_y: distance from top of content area (macOS Y is bottom-up)
-            let win_x = (mouse_loc.x - frame.origin.x) as i16;
-            let win_y = (frame.origin.y + content_h - mouse_loc.y) as i16;
-            if win_x < 0 || win_y < 0
-                || (win_x as f64) >= frame.size.width
-                || (win_y as f64) >= content_h { continue; }
+            let is_mini: bool = unsafe { msg_send![&*info.window, isMiniaturized] };
+            if is_mini { continue; }
             let win_num: isize = unsafe { msg_send![&*info.window, windowNumber] };
-            if best.is_none() || win_num > best.unwrap().1 {
-                best = Some((info.x11_id, win_num));
+            if win_num == topmost_win_num {
+                return info.x11_id;
             }
         }
-        best.map(|(xid, _)| xid).unwrap_or(0)
+        0
     });
 
     LAST_ENTER_WINDOW_X11.with(|le| {
@@ -2272,26 +2269,24 @@ pub fn run_cocoa_app(
             let is_active: bool = msg_send![&*app, isActive];
             if is_active { return; } // Already active — nothing to do
 
-            // Check if cursor is inside one of our windows.
+            // Check if cursor is on the TOPMOST window and it's ours.
             let mouse_loc: NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
+            let topmost_win_num: isize = msg_send![objc2::class!(NSWindow),
+                windowNumberAtPoint: mouse_loc
+                belowWindowWithWindowNumber: 0isize];
             let (entered_xid, entered_nswin): (crate::display::Xid, *mut AnyObject) = WINDOWS.with(|w| {
                 let ws = w.borrow();
-                let mut best: Option<(crate::display::Xid, isize, *mut AnyObject)> = None;
                 for (_id, info) in ws.iter() {
                     if !info.visible { continue; }
-                    let frame: NSRect = msg_send![&*info.window, frame];
-                    let win_x = mouse_loc.x - frame.origin.x;
-                    let win_y = mouse_loc.y - frame.origin.y;
-                    if win_x < 0.0 || win_y < 0.0
-                        || win_x >= frame.size.width
-                        || win_y >= frame.size.height { continue; }
+                    let is_mini: bool = msg_send![&*info.window, isMiniaturized];
+                    if is_mini { continue; }
                     let win_num: isize = msg_send![&*info.window, windowNumber];
-                    let ptr = &*info.window as *const NSWindow as *mut AnyObject;
-                    if best.is_none() || win_num > best.as_ref().unwrap().1 {
-                        best = Some((info.x11_id, win_num, ptr));
+                    if win_num == topmost_win_num {
+                        let ptr = &*info.window as *const NSWindow as *mut AnyObject;
+                        return (info.x11_id, ptr);
                     }
                 }
-                best.map(|(xid, _, p)| (xid, p)).unwrap_or((0, std::ptr::null_mut()))
+                (0, std::ptr::null_mut())
             });
             if entered_nswin.is_null() { return; }
 

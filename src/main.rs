@@ -28,8 +28,12 @@ struct Cli {
     screen: Option<String>,
 
     /// Log level (error, warn, info, debug, trace)
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = "warn")]
     log_level: String,
+
+    /// Listen on this port for zstd-compressed TCP connections (e.g., 6100)
+    #[arg(long)]
+    compress_port: Option<u16>,
 }
 
 fn main() {
@@ -68,6 +72,7 @@ fn main() {
 
     let display_num = cli.display;
     let listen_tcp = cli.tcp;
+    let compress_port = cli.compress_port;
 
     // Spawn tokio runtime on a background thread
     // macOS requires the main thread for Cocoa/AppKit
@@ -78,7 +83,7 @@ fn main() {
             .expect("Failed to create tokio runtime");
 
         rt.block_on(async {
-            if let Err(e) = server::run_server(display_num, listen_tcp, evt_rx, cmd_tx, screen_width, screen_height, render_mailbox).await {
+            if let Err(e) = server::run_server(display_num, listen_tcp, compress_port, evt_rx, cmd_tx, screen_width, screen_height, render_mailbox).await {
                 log::error!("X11 server error: {}", e);
             }
         });

@@ -173,23 +173,28 @@ pub fn render_to_buffer(
             if *format == 2 && (*depth == 24 || *depth == 32) {
                 let src_stride = src_w * 4;
                 if *gc_function == 3 {
-                    // Fast path: GXcopy — direct memcpy + alpha fix in single pass
+                    // Fast path: GXcopy — bulk memcpy per row then fix alpha.
+                    // memcpy is SIMD-optimized by the OS; touching pixels individually is 5-10x slower.
+                    let copy_w = src_w.min(width.saturating_sub(dst_x)) as usize;
+                    let row_bytes = copy_w * 4;
                     for row in 0..src_h {
                         let dy = dst_y + row;
                         if dy >= height { break; }
                         let src_off = (row * src_stride) as usize;
                         let dst_off = (dy * stride + dst_x * 4) as usize;
-                        let copy_w = src_w.min(width.saturating_sub(dst_x)) as usize;
-                        let src_end = src_off + copy_w * 4;
-                        let dst_end = dst_off + copy_w * 4;
-                        if src_end <= data.len() && dst_end <= buffer.len() {
-                            // Single-pass copy + alpha fix for both 24-bit and 32-bit depth.
-                            // Avoids double-touching cache lines (no separate copy then fix).
-                            let src_slice = &data[src_off..src_end];
-                            let dst_slice = &mut buffer[dst_off..dst_end];
-                            for (dst_chunk, src_chunk) in dst_slice.chunks_exact_mut(4).zip(src_slice.chunks_exact(4)) {
-                                let p = u32::from_ne_bytes([src_chunk[0], src_chunk[1], src_chunk[2], src_chunk[3]]) | 0xFF000000;
-                                dst_chunk.copy_from_slice(&p.to_ne_bytes());
+                        if src_off + row_bytes <= data.len() && dst_off + row_bytes <= buffer.len() {
+                            buffer[dst_off..dst_off + row_bytes]
+                                .copy_from_slice(&data[src_off..src_off + row_bytes]);
+                            // Set alpha to 0xFF for each pixel (IOSurface requires opaque alpha).
+                            // Process as u32 slices for auto-vectorization.
+                            let dst_pixels = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    buffer[dst_off..].as_mut_ptr() as *mut u32,
+                                    copy_w,
+                                )
+                            };
+                            for p in dst_pixels.iter_mut() {
+                                *p |= 0xFF000000;
                             }
                         }
                     }

@@ -93,6 +93,74 @@ impl std::fmt::Debug for ClientConnection {
     }
 }
 
+/// Handle a zstd-compressed X11 connection using frame protocol:
+/// [4-byte LE length][zstd-compressed data]
+/// Decompresses incoming frames and compresses outgoing data,
+/// then delegates to handle_connection via a duplex pipe.
+pub async fn handle_compressed_connection(
+    server: Arc<XServer>,
+    mut stream: tokio::net::TcpStream,
+    conn_id: u32,
+) -> Result<(), ServerError> {
+    let (duplex_server, duplex_client) = tokio::io::duplex(32 * 1024 * 1024);
+    let (mut duplex_read, mut duplex_write) = tokio::io::split(duplex_server);
+    let (mut tcp_read, mut tcp_write) = tokio::io::split(stream);
+
+    // Task: TCP(compressed frames) -> decompress -> duplex_write (plain X11 to handle_connection)
+    let decomp_task = tokio::spawn(async move {
+        let mut header_buf = [0u8; 4];
+        loop {
+            if tokio::io::AsyncReadExt::read_exact(&mut tcp_read, &mut header_buf).await.is_err() { break; }
+            let frame_len = u32::from_le_bytes(header_buf) as usize;
+            if frame_len == 0 { continue; }
+            let mut compressed = vec![0u8; frame_len];
+            if tokio::io::AsyncReadExt::read_exact(&mut tcp_read, &mut compressed).await.is_err() { break; }
+            // Decompress (single-shot, each frame is independent zstd frame)
+            match zstd_decompress(&compressed) {
+                Some(plain) => {
+                    if tokio::io::AsyncWriteExt::write_all(&mut duplex_write, &plain).await.is_err() { break; }
+                }
+                None => {
+                    log::error!("zstd decompression failed for {} byte frame", frame_len);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Task: duplex_read (plain X11 from handle_connection) -> compress -> TCP(compressed frames)
+    let comp_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        loop {
+            let n = match tokio::io::AsyncReadExt::read(&mut duplex_read, &mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let compressed = zstd_compress(&buf[..n]);
+            let header = (compressed.len() as u32).to_le_bytes();
+            if tokio::io::AsyncWriteExt::write_all(&mut tcp_write, &header).await.is_err() { break; }
+            if tokio::io::AsyncWriteExt::write_all(&mut tcp_write, &compressed).await.is_err() { break; }
+            if tokio::io::AsyncWriteExt::flush(&mut tcp_write).await.is_err() { break; }
+        }
+    });
+
+    // Run handle_connection on the plain duplex pipe
+    let result = handle_connection(server, duplex_client, conn_id).await;
+
+    decomp_task.abort();
+    comp_task.abort();
+    result
+}
+
+fn zstd_decompress(data: &[u8]) -> Option<Vec<u8>> {
+    zstd::bulk::decompress(data, 32 * 1024 * 1024).ok()
+}
+
+fn zstd_compress(data: &[u8]) -> Vec<u8> {
+    zstd::bulk::compress(data, 1).unwrap_or_else(|_| data.to_vec())
+}
+
 /// Handle a new X11 client connection.
 pub async fn handle_connection<S>(
     server: Arc<XServer>,
@@ -185,8 +253,8 @@ where
     info!("Connection {} setup complete (resource base: 0x{:08X})", conn_id, resource_id_base);
 
     // Phase 2: Main request processing loop (with event multiplexing)
-    let mut buf = vec![0u8; 65536];
-    let mut pending = BytesMut::with_capacity(65536);
+    let mut buf = vec![0u8; 32 * 1024 * 1024]; // 32MB read buffer
+    let mut pending = BytesMut::with_capacity(32 * 1024 * 1024);
     let mut err_buf = [0u8; 32];
 
     loop {

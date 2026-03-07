@@ -295,6 +295,7 @@ impl XServer {
 pub async fn run_server(
     display_number: u32,
     listen_tcp: bool,
+    compress_port: Option<u16>,
     evt_rx: Receiver<DisplayEvent>,
     cmd_tx: Sender<DisplayCommand>,
     screen_width: u16,
@@ -371,6 +372,15 @@ pub async fn run_server(
                 match tcp_listener.accept().await {
                     Ok((stream, addr)) => {
                         let _ = stream.set_nodelay(true);
+                        // Enlarge TCP receive buffer for large PutImage transfers (4MB)
+                        unsafe {
+                            use std::os::unix::io::AsRawFd;
+                            let fd = stream.as_raw_fd();
+                            let buf_size: i32 = 32 * 1024 * 1024;
+                            // SOL_SOCKET=0xffff, SO_RCVBUF=0x1002 on macOS
+                            extern "C" { fn setsockopt(socket: i32, level: i32, option_name: i32, option_value: *const std::ffi::c_void, option_len: u32) -> i32; }
+                            setsockopt(fd, 0xffff, 0x1002, &buf_size as *const _ as *const std::ffi::c_void, 4);
+                        }
                         let server = Arc::clone(&server_clone);
                         let conn_id = server.next_conn_id();
                         info!("New X11 TCP client connection (id={}) from {}", conn_id, addr);
@@ -382,6 +392,41 @@ pub async fn run_server(
                         });
                     }
                     Err(e) => log::error!("TCP accept error: {}", e),
+                }
+            }
+        });
+    }
+
+    // Optional zstd-compressed TCP listener
+    if let Some(cport) = compress_port {
+        let tcp_listener = tokio::net::TcpListener::bind(("0.0.0.0", cport)).await?;
+        info!("Listening for zstd-compressed connections on TCP port {}", cport);
+
+        let server_clone = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop {
+                match tcp_listener.accept().await {
+                    Ok((stream, addr)) => {
+                        let _ = stream.set_nodelay(true);
+                        // Large receive buffer
+                        unsafe {
+                            use std::os::unix::io::AsRawFd;
+                            let fd = stream.as_raw_fd();
+                            let buf_size: i32 = 32 * 1024 * 1024;
+                            extern "C" { fn setsockopt(socket: i32, level: i32, option_name: i32, option_value: *const std::ffi::c_void, option_len: u32) -> i32; }
+                            setsockopt(fd, 0xffff, 0x1002, &buf_size as *const _ as *const std::ffi::c_void, 4);
+                        }
+                        let server = Arc::clone(&server_clone);
+                        let conn_id = server.next_conn_id();
+                        info!("New zstd-compressed client (id={}) from {}", conn_id, addr);
+                        tokio::spawn(async move {
+                            if let Err(e) = connection::handle_compressed_connection(server, stream, conn_id).await {
+                                log::error!("Compressed connection {} error: {}", conn_id, e);
+                            }
+                            info!("Compressed connection {} closed", conn_id);
+                        });
+                    }
+                    Err(e) => log::error!("Compressed TCP accept error: {}", e),
                 }
             }
         });
