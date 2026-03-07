@@ -1220,7 +1220,7 @@ fn check_window_resizes() {
 /// use acceptsMouseMovedEvents) is the active app.
 unsafe extern "C" fn cg_mouse_tap_callback(
     _proxy: *mut c_void,
-    _event_type: u32,
+    event_type: u32,
     event: *mut c_void,
     _user_info: *mut c_void,
 ) -> *mut c_void {
@@ -1254,6 +1254,21 @@ unsafe extern "C" fn cg_mouse_tap_callback(
         best.map(|(xid, _, p)| (xid, p)).unwrap_or((0, std::ptr::null_mut()))
     });
 
+    // kCGEventLeftMouseDown=1, kCGEventRightMouseDown=3: activation click.
+    // Suppress the resulting ButtonPress so it doesn't cause a spurious newline in xterm.
+    let is_mouse_down = event_type == 1 || event_type == 3;
+    if is_mouse_down {
+        if !entered_nswin.is_null() {
+            info!("CGEventTap: mouseDown on x11=0x{:08x} while backgrounded — suppressing ButtonPress", entered_xid);
+            SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
+            LAST_ENTER_WINDOW_X11.with(|le| le.set(entered_xid));
+            activate_app(entered_nswin);
+            send_display_event(DisplayEvent::FocusIn { window: entered_xid });
+        }
+        return event;
+    }
+
+    // Mouse moved/dragged: focus-follows-mouse activation.
     LAST_ENTER_WINDOW_X11.with(|le| {
         if entered_nswin.is_null() {
             // Mouse left all our windows — reset so next entry fires again.
@@ -2313,7 +2328,9 @@ pub fn run_cocoa_app(
     // kCGSessionEventTap=1, kCGHeadInsertEventTap=0, kCGEventTapOptionListenOnly=1
     // Without Accessibility permission, creates a passive (observe-only) tap — still works.
     unsafe {
-        let mouse_mask: u64 = (1u64 << 5) | (1u64 << 6) | (1u64 << 7) | (1u64 << 27);
+        // bit 1=LeftMouseDown, 3=RightMouseDown (catch activation click to suppress ButtonPress),
+        // 5=MouseMoved, 6=LeftMouseDragged, 7=RightMouseDragged, 27=OtherMouseDragged
+        let mouse_mask: u64 = (1u64 << 1) | (1u64 << 3) | (1u64 << 5) | (1u64 << 6) | (1u64 << 7) | (1u64 << 27);
         let tap = CGEventTapCreate(
             1, // kCGSessionEventTap
             0, // kCGHeadInsertEventTap
