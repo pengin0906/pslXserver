@@ -341,12 +341,27 @@ unsafe extern "C" fn view_key_down(this: *mut AnyObject, _sel: Sel, event: *mut 
         crate::display::IME_CONVERTING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // JIS IME toggle keys (英数=102, かな=104): bypass interpretKeyEvents so macOS IME
+    // state is not disturbed. Send raw X11 KeyPress and let macOS handle input source switch.
+    if keycode == 102 || keycode == 104 {
+        let state = get_modifier_state(&*event);
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32;
+        let x11_id_ivar = (*this).class().instance_variable(c"x11WindowId").unwrap();
+        let x11_id = *x11_id_ivar.load::<u32>(&*this) as crate::display::Xid;
+        send_display_event(DisplayEvent::KeyPress { window: x11_id, keycode: (keycode as u32 + 8) as u8, state, time });
+        return;
+    }
+
     // Route key event through input method system
     let array: *mut AnyObject = msg_send![objc2::class!(NSArray), arrayWithObject: event];
     let _: () = msg_send![&*this, interpretKeyEvents: array];
 
     // If insertText:/setMarkedText: was NOT called, this is a non-text key (arrows, backspace, etc.)
-    // Send it as a raw KeyPress event — but NOT during IME composition
+    // Send it as a raw KeyPress event using the physical keycode — but NOT during IME composition.
+    // GetKeyboardMapping uses UCKeyTranslate-derived mapping so all layouts (JIS etc.) work correctly.
     let inserted = *flag_ivar.load::<u8>(&*this);
     if inserted == 0 && !crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) {
         let keycode: u16 = msg_send![&*event, keyCode];
@@ -397,11 +412,9 @@ unsafe extern "C" fn insert_text_replacement(this: *mut AnyObject, _sel: Sel, te
     if rust_str.is_empty() { return; }
 
     // For single ASCII chars, let the raw KeyPress path in view_key_down handle it.
-    // This gives VS Code/Chromium the proper macOS keycode they expect.
-    // Only use ImeCommit for non-ASCII text (CJK, multi-char, etc.)
+    // UCKeyTranslate-based GetKeyboardMapping ensures correct keysyms for physical keycodes.
     let is_single_ascii = rust_str.len() == 1 && rust_str.as_bytes()[0] < 0x80;
     if is_single_ascii {
-        // Don't set textInserted — view_key_down's raw KeyPress fallback will fire
         debug!("insertText: single ASCII '{}' — letting raw KeyPress handle it", rust_str);
         return;
     }
@@ -1141,8 +1154,8 @@ fn process_commands() {
                 let uptime: f64 = msg_send![pi, systemUptime];
                 (uptime * 1000.0) as u32
             };
-            // Compute button state once from cur_buttons
-            let btn_state = buttons_to_x11_state(cur_buttons);
+            // Compute button state once from cur_buttons + current keyboard modifiers
+            let btn_state = buttons_to_x11_state(cur_buttons) | get_keyboard_modifiers();
             // Check each of the first 3 buttons (left, right, middle)
             for btn_idx in 0u64..3 {
                 let was = (prev_buttons >> btn_idx) & 1;
@@ -1990,6 +2003,11 @@ pub fn run_cocoa_app(
         CGColorSpaceRelease(cs);
     }
 
+    // Build keyboard layout map from macOS UCKeyTranslate (supports JIS, US, UK, etc.)
+    let kmap = build_keyboard_map();
+    let _ = crate::display::KEYBOARD_MAP.set(kmap);
+    info!("Keyboard layout map built via UCKeyTranslate");
+
     info!("Cocoa application initialized with display command polling");
 
     unsafe {
@@ -2356,6 +2374,99 @@ fn get_event_location(event: &AnyObject, x11_id: crate::display::Xid, win_width:
     }
 }
 
+/// Build a keyboard map from the current macOS keyboard layout using UCKeyTranslate.
+/// Returns an array of 128 entries (indexed by macOS keycode):
+/// each entry is (normal_keysym, shifted_keysym) in X11 keysym encoding.
+/// This correctly handles JIS, US, UK, AZERTY and all other layouts.
+pub fn build_keyboard_map() -> Box<[(u32, u32); 128]> {
+    use std::ffi::c_void;
+    extern "C" {
+        fn TISCopyCurrentKeyboardLayoutInputSource() -> *mut c_void;
+        fn TISGetInputSourceProperty(source: *mut c_void, property_key: *const c_void) -> *mut c_void;
+        fn CFDataGetBytePtr(data: *mut c_void) -> *const u8;
+        fn CFRelease(cf: *const c_void);
+        fn UCKeyTranslate(
+            key_layout_ptr: *const u8,
+            virtual_key_code: u16,
+            key_action: u16,
+            modifier_key_state: u32,
+            keyboard_type: u32,
+            key_translate_options: u32,
+            dead_key_state: *mut u32,
+            max_string_length: usize,
+            actual_string_length: *mut usize,
+            unicode_string: *mut u16,
+        ) -> i32;
+        fn LMGetKbdType() -> u8;
+        static kTISPropertyUnicodeKeyLayoutData: *const c_void;
+    }
+
+    let mut map = Box::new([(0u32, 0u32); 128]);
+
+    unsafe {
+        let source = TISCopyCurrentKeyboardLayoutInputSource();
+        if source.is_null() {
+            log::warn!("build_keyboard_map: TISCopyCurrentKeyboardLayoutInputSource returned null");
+            return map;
+        }
+
+        let layout_data = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData);
+        if layout_data.is_null() {
+            log::warn!("build_keyboard_map: no UnicodeKeyLayoutData (maybe input source is not a keyboard layout)");
+            CFRelease(source);
+            return map;
+        }
+
+        let layout_ptr = CFDataGetBytePtr(layout_data as *mut c_void);
+        if layout_ptr.is_null() {
+            CFRelease(source);
+            return map;
+        }
+
+        let kbd_type = LMGetKbdType() as u32;
+        // kUCKeyActionDisplay = 3: returns the character displayed on the key cap, avoids dead-key composition
+        let key_action = 3u16;
+
+        for keycode in 0u16..128 {
+            let translate = |modifier: u32| -> u32 {
+                let mut dead: u32 = 0;
+                let mut buf = [0u16; 4];
+                let mut actual_len: usize = 0;
+                let status = UCKeyTranslate(
+                    layout_ptr, keycode, key_action, modifier,
+                    kbd_type, 0, &mut dead, 4, &mut actual_len, buf.as_mut_ptr(),
+                );
+                if status != 0 || actual_len == 0 { return 0; }
+                unicode_to_x11_keysym(buf[0] as u32)
+            };
+
+            let normal  = translate(0);          // no modifier
+            let shifted  = translate(2);         // shiftKey >> 8 = 512 >> 8 = 2
+            map[keycode as usize] = (normal, shifted);
+        }
+
+        CFRelease(source);
+    }
+
+    info!("build_keyboard_map: built layout for {} keycodes", 128);
+    map
+}
+
+/// Convert a Unicode codepoint returned by UCKeyTranslate to an X11 keysym.
+fn unicode_to_x11_keysym(cp: u32) -> u32 {
+    if cp == 0 { return 0; }
+    // Skip control characters and non-printable ranges
+    if cp < 0x20 { return 0; }
+    // Skip DEL and C1 control characters
+    if cp >= 0x7F && cp < 0xA0 { return 0; }
+    // Skip Unicode private-use area (returned by UCKeyTranslate for special keys like arrows)
+    if cp >= 0xE000 && cp <= 0xF8FF { return 0; }
+    // Latin-1 (0x20-0xFF): X11 keysym == Unicode codepoint
+    if cp <= 0xFF { return cp; }
+    // Unicode BMP and beyond: X11 keysym = 0x01000000 | codepoint
+    0x01000000 | cp
+}
+
 fn get_modifier_state(event: &AnyObject) -> u16 {
     let flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let mut state = 0u16;
@@ -2386,6 +2497,18 @@ fn buttons_to_x11_state(pressed: u64) -> u16 {
 fn get_mouse_button_state() -> u16 {
     let pressed: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
     buttons_to_x11_state(pressed)
+}
+
+/// Get keyboard modifier state without an NSEvent (for polling path).
+fn get_keyboard_modifiers() -> u16 {
+    let flags: u64 = unsafe { msg_send![objc2::class!(NSEvent), modifierFlags] };
+    let mut state = 0u16;
+    if flags & (1 << 16) != 0 { state |= 2; }   // CapsLock → LockMask
+    if flags & (1 << 17) != 0 { state |= 1; }   // Shift → ShiftMask
+    if flags & (1 << 18) != 0 { state |= 4; }   // Control → ControlMask
+    if flags & (1 << 19) != 0 { state |= 8; }   // Option → Mod1Mask
+    if flags & (1 << 20) != 0 { state |= 64; }  // Command → Mod4Mask
+    state
 }
 
 fn send_display_event(evt: DisplayEvent) {

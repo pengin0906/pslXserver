@@ -370,6 +370,7 @@ pub async fn run_server(
             loop {
                 match tcp_listener.accept().await {
                     Ok((stream, addr)) => {
+                        let _ = stream.set_nodelay(true);
                         let server = Arc::clone(&server_clone);
                         let conn_id = server.next_conn_id();
                         info!("New X11 TCP client connection (id={}) from {}", conn_id, addr);

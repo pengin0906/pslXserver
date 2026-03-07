@@ -3732,8 +3732,29 @@ async fn handle_change_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Map macOS virtual keycode to X11 keysym (normal, shifted).
-/// macOS keycodes: https://developer.apple.com/documentation/carbon/1543661-summary_of_virtual_key_codes
+/// Consults the UCKeyTranslate-derived KEYBOARD_MAP first (correct for JIS/all layouts),
+/// falling back to the static table for special keys (arrows, F-keys, etc.).
 pub(crate) fn macos_keycode_to_keysym(mac_key: u32) -> (u32, u32) {
+    // Special keys (function keys, modifiers, arrows, JIS IME keys like 英数/かな) must use
+    // the static table — UCKeyTranslate returns garbage for these on JIS keyboards.
+    let static_entry = macos_keycode_to_keysym_static(mac_key);
+    if static_entry.0 >= 0xFF00 {
+        return static_entry;
+    }
+    // For printable keys, prefer UCKeyTranslate map (handles JIS/UK/AZERTY layout differences).
+    if let Some(map) = crate::display::KEYBOARD_MAP.get() {
+        if (mac_key as usize) < 128 {
+            let entry = map[mac_key as usize];
+            if entry != (0, 0) {
+                return entry;
+            }
+        }
+    }
+    // Fallback to static table.
+    static_entry
+}
+
+fn macos_keycode_to_keysym_static(mac_key: u32) -> (u32, u32) {
     match mac_key {
         // Letters (macOS layout: ANSI US)
         0  => (0x0061, 0x0041), // a A

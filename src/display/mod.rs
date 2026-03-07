@@ -30,6 +30,11 @@ pub static LAST_COMMIT_CHAR_COUNT: std::sync::atomic::AtomicUsize = std::sync::a
 /// Prevents preedit injection into X11 app during reconversion; cleared on insertText: or cancel.
 pub static RECONVERTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Keyboard layout map built from macOS UCKeyTranslate at startup.
+/// Index is macOS keycode (0-127), value is (normal_keysym, shifted_keysym).
+/// Used by GetKeyboardMapping to return correct keysyms for all layouts (JIS, US, UK, etc.).
+pub static KEYBOARD_MAP: std::sync::OnceLock<Box<[(u32, u32); 128]>> = std::sync::OnceLock::new();
+
 /// Shared render mailbox: native_window_id -> pending render commands.
 /// Protocol handlers append commands; display thread drains each frame.
 pub type RenderMailbox = std::sync::Arc<dashmap::DashMap<u64, Vec<RenderCommand>>>;
