@@ -164,6 +164,14 @@ thread_local! {
     /// Used for proactive FocusIn on EnterNotify — sent every frame even when
     /// pslXserver is not the active macOS app.
     static LAST_ENTER_WINDOW_X11: std::cell::Cell<crate::display::Xid> = const { std::cell::Cell::new(0) };
+    /// Frames remaining to suppress button polling after app activation.
+    /// activateIgnoringOtherApps:YES causes macOS to synthesize button events;
+    /// suppressing button detection for a few frames prevents spurious ButtonPress.
+    static SUPPRESS_BUTTON_FRAMES: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// NSWindow pointer to call makeKeyAndOrderFront: on the next timer tick.
+    /// Set by activate_app() after calling activateIgnoringOtherApps:YES.
+    /// Consumed by process_commands() so makeKeyAndOrderFront runs after activation settles.
+    static PENDING_KEY_WINDOW: std::cell::Cell<*mut AnyObject> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
 fn get_scale_factor() -> f64 {
@@ -275,6 +283,13 @@ fn get_input_view_class() -> &'static AnyClass {
             // updateLayer: no-op — we set layer.contents directly from flush_window
             class_addMethod(raw_cls, objc2::sel!(updateLayer),
                 update_layer_noop as *const std::ffi::c_void, c"v@:".as_ptr() as _);
+            // updateTrackingAreas: refresh NSTrackingArea on resize
+            class_addMethod(raw_cls, objc2::sel!(updateTrackingAreas),
+                update_tracking_areas as *const std::ffi::c_void, c"v@:".as_ptr() as _);
+            // mouseEntered: — called by NSTrackingArea (NSTrackingActiveAlways) even
+            // when pslXserver is backgrounded; activates window without spurious clicks.
+            class_addMethod(raw_cls, objc2::sel!(mouseEntered:),
+                mouse_entered as *const std::ffi::c_void, c"v@:@".as_ptr() as _);
 
             CLASS = raw_cls as *const AnyClass;
         }
@@ -298,6 +313,64 @@ unsafe extern "C" fn accepts_first_responder(_this: *mut AnyObject, _sel: Sel) -
 /// is swallowed by macOS → our mouseDown handler is never called → no ButtonPress/FocusIn.
 unsafe extern "C" fn accepts_first_mouse(_this: *mut AnyObject, _sel: Sel, _event: *mut AnyObject) -> Bool {
     Bool::YES
+}
+
+/// updateTrackingAreas — replace the NSTrackingArea each time the view is resized.
+/// NSTrackingActiveAlways: tracking fires even when pslXserver is NOT the active app.
+/// NSTrackingMouseEnteredAndExited (0x01) + NSTrackingActiveAlways (0x80) + NSTrackingInVisibleRect (0x200)
+unsafe extern "C" fn update_tracking_areas(this: *mut AnyObject, _sel: Sel) {
+    // Remove all existing tracking areas
+    let areas: *mut AnyObject = msg_send![this, trackingAreas];
+    let count: usize = msg_send![areas, count];
+    // Iterate in reverse to avoid index shifting
+    let old: Vec<*mut AnyObject> = (0..count)
+        .map(|i| { let a: *mut AnyObject = msg_send![areas, objectAtIndex: i]; a })
+        .collect();
+    for area in old {
+        let _: () = msg_send![this, removeTrackingArea: area];
+    }
+    // Add a new tracking area covering the entire visible rect
+    let bounds: NSRect = msg_send![this, bounds];
+    let options: u32 = 0x01 | 0x80 | 0x200; // MouseEnteredAndExited | ActiveAlways | InVisibleRect
+    let ta_cls = objc2::class!(NSTrackingArea);
+    let ta: *mut AnyObject = msg_send![ta_cls, alloc];
+    let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds
+                                                options: options
+                                                  owner: this
+                                               userInfo: std::ptr::null::<AnyObject>()];
+    let _: () = msg_send![this, addTrackingArea: ta];
+}
+
+/// mouseEntered: — NSTrackingArea callback (NSTrackingActiveAlways), fires even when
+/// pslXserver is backgrounded. This IS a real user-event context, so activate_app()
+/// is respected by macOS Sequoia here (unlike timer-based calls which are ignored).
+unsafe extern "C" fn mouse_entered(this: *mut AnyObject, _sel: Sel, _event: *mut AnyObject) {
+    let ns_window: *mut AnyObject = msg_send![this, window];
+    if ns_window.is_null() { return; }
+
+    // Suppress button polling + NSEvent button handler for the next several frames
+    // to prevent spurious ButtonPress events that macOS synthesizes on activation.
+    SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
+
+    // Activate app + bring window to front. Correct order: activate FIRST, then
+    // makeKeyAndOrderFront (per AppKit docs and the ar.al activation ordering fix).
+    activate_app(ns_window);
+
+    // Find X11 window id for this NSWindow.
+    let x11_id = WINDOWS.with(|w| {
+        let ws = w.borrow();
+        for (_id, info) in ws.iter() {
+            let win_ptr = &*info.window as *const NSWindow as *const AnyObject as *mut AnyObject;
+            if win_ptr == ns_window { return info.x11_id; }
+        }
+        0
+    });
+    if x11_id != 0 {
+        // Update LAST_ENTER_WINDOW_X11 so check_enter_notify() doesn't re-send FocusIn.
+        LAST_ENTER_WINDOW_X11.with(|le| le.set(x11_id));
+        info!("mouseEntered → activate + FocusIn x11=0x{:08x}", x11_id);
+        send_display_event(DisplayEvent::FocusIn { window: x11_id });
+    }
 }
 
 /// Tell AppKit we manage layer contents ourselves — prevents drawRect from clearing layer.
@@ -1110,6 +1183,33 @@ fn check_window_resizes() {
     }
 }
 
+/// Activate pslXserver so PSLXInputView receives keyDown: events.
+/// Activate pslXserver and bring the given window to front.
+/// MUST be called from a real user-event handler (mouseEntered:, mouseDown:, etc.)
+/// macOS Sequoia ignores activation calls from timer/background contexts.
+///
+/// Key insights (from ar.al article + XQuartz set_front_process):
+/// 1. setActivationPolicy:Regular must be asserted each time (CLI launch may reset it)
+/// 2. activateIgnoringOtherApps:YES is async (goes to WindowServer) — same as XQuartz
+/// 3. makeKeyAndOrderFront: must run AFTER activate takes effect — use dispatch_async
+///    to defer to the next run loop iteration (avoids race with terminal's activation)
+unsafe fn activate_app(ns_window: *mut AnyObject) {
+    let mtm = MainThreadMarker::new().unwrap();
+    let app = NSApplication::sharedApplication(mtm);
+    // Re-assert Regular policy — CLI-launched processes may have it reset
+    let _: bool = msg_send![&*app, setActivationPolicy: 0i64];
+    // Activate (same as XQuartz set_front_process: [NSApp activateIgnoringOtherApps:YES])
+    let _: () = msg_send![&*app, activateIgnoringOtherApps: objc2::runtime::Bool::YES];
+    let is_active: bool = msg_send![&*app, isActive];
+    info!("activate_app: isActive={}", is_active);
+    // Schedule makeKeyAndOrderFront: for the NEXT timer tick (process_commands).
+    // activateIgnoringOtherApps is async (WindowServer RPC); calling makeKeyAndOrderFront
+    // immediately races with the activation completing. Deferring by one frame lets it settle.
+    if !ns_window.is_null() {
+        PENDING_KEY_WINDOW.with(|p| p.set(ns_window));
+    }
+}
+
 /// Poll mouse position each frame; implement X11 focus-follows-pointer in macOS terms.
 /// When cursor enters one of our windows:
 ///   1. Make the NSWindow key + activate pslXserver (macOS side: delivers KeyPress to PSLXInputView)
@@ -1119,9 +1219,9 @@ fn check_enter_notify() {
     let mouse_loc: NSPoint = unsafe { msg_send![objc2::class!(NSEvent), mouseLocation] };
 
     // Find the frontmost visible window under the cursor, and collect its NSWindow ptr.
-    let (entered_xid, entered_nswin) = WINDOWS.with(|w| {
+    let entered_xid = WINDOWS.with(|w| {
         let ws = w.borrow();
-        let mut best: Option<(crate::display::Xid, isize, *mut AnyObject)> = None;
+        let mut best: Option<(crate::display::Xid, isize)> = None;
         for (_id, info) in ws.iter() {
             if !info.visible { continue; }
             let frame: NSRect = unsafe { msg_send![&*info.window, frame] };
@@ -1136,12 +1236,11 @@ fn check_enter_notify() {
                 || (win_x as f64) >= frame.size.width
                 || (win_y as f64) >= content_h { continue; }
             let win_num: isize = unsafe { msg_send![&*info.window, windowNumber] };
-            let win_ptr = &*info.window as *const NSWindow as *mut AnyObject;
             if best.is_none() || win_num > best.unwrap().1 {
-                best = Some((info.x11_id, win_num, win_ptr));
+                best = Some((info.x11_id, win_num));
             }
         }
-        best.map(|(xid, _, ptr)| (xid, ptr)).unwrap_or((0, std::ptr::null_mut()))
+        best.map(|(xid, _)| xid).unwrap_or(0)
     });
 
     LAST_ENTER_WINDOW_X11.with(|le| {
@@ -1149,24 +1248,10 @@ fn check_enter_notify() {
         le.set(entered_xid);
         if entered_xid == 0 { return; }
 
-        info!("EnterNotify → makeKey + FocusIn x11=0x{:08x}", entered_xid);
-
-        // macOS side: make this window key and activate pslXserver.
-        // This is the "focus follows mouse" harmonization — without it, PSLXInputView
-        // never receives keyDown: events because macOS only delivers keys to the key window
-        // of the active (frontmost) application.
-        unsafe {
-            // Activate pslXserver (bring to foreground for keyboard purposes)
-            let mtm = MainThreadMarker::new().unwrap();
-            let app = NSApplication::sharedApplication(mtm);
-            let _: () = msg_send![&*app, activateIgnoringOtherApps: objc2::runtime::Bool::YES];
-            // Make the specific window key (without raising it above other apps' windows)
-            if !entered_nswin.is_null() {
-                let _: () = msg_send![entered_nswin, makeKeyWindow];
-            }
-        }
-
-        // X11 side: send FocusIn so xterm sets ICFocus and accepts keyboard input.
+        // Only send X11 FocusIn from timer — macOS activation must come from
+        // a real user-event handler (mouseEntered:), not a 60fps timer loop.
+        // macOS Sequoia ignores activateIgnoringOtherApps from timer contexts.
+        info!("EnterNotify → FocusIn x11=0x{:08x}", entered_xid);
         send_display_event(DisplayEvent::FocusIn { window: entered_xid });
     });
 }
@@ -1266,8 +1351,15 @@ fn process_commands() {
         let cur_buttons: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
         let prev_buttons = LAST_BUTTONS.with(|lb| lb.get());
 
-        // Detect button edges and send ButtonPress/ButtonRelease
-        if cur_buttons != prev_buttons {
+        // Detect button edges and send ButtonPress/ButtonRelease.
+        // Skip for a few frames after activateIgnoringOtherApps: to avoid spurious clicks.
+        if SUPPRESS_BUTTON_FRAMES.with(|s| {
+            let v = s.get();
+            if v > 0 { s.set(v - 1); }
+            v > 0
+        }) {
+            LAST_BUTTONS.with(|lb| lb.set(cur_buttons)); // sync state silently
+        } else if cur_buttons != prev_buttons {
             LAST_BUTTONS.with(|lb| lb.set(cur_buttons));
             let time = unsafe {
                 let pi: *mut AnyObject = msg_send![objc2::class!(NSProcessInfo), processInfo];
@@ -1456,6 +1548,20 @@ fn process_commands() {
 
     // 1.6. Detect window resizes — compare content view size to stored IOSurface size
     check_window_resizes();
+
+    // 1.6b. Execute deferred makeKeyAndOrderFront: from previous activate_app() call.
+    // activate_app() calls activateIgnoringOtherApps (async WindowServer RPC), then sets
+    // PENDING_KEY_WINDOW. We call makeKeyAndOrderFront one timer tick later so activation
+    // has settled before we attempt to make the window key.
+    PENDING_KEY_WINDOW.with(|p| {
+        let win = p.get();
+        if !win.is_null() {
+            p.set(std::ptr::null_mut());
+            unsafe {
+                let _: () = msg_send![win, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+            }
+        }
+    });
 
     // 1.7. Send FocusIn when macOS key window changes (e.g. after title bar drag)
     check_key_window();
@@ -1689,6 +1795,9 @@ fn handle_command(cmd: DisplayCommand) {
 
                     // Make the custom view the first responder for keyboard events
                     let _: () = msg_send![&*window, makeFirstResponder: &*view];
+                    // Ensure tracking area is set up now (AppKit may call updateTrackingAreas
+                    // lazily; we call it explicitly so mouseEntered: fires from the start)
+                    let _: () = msg_send![&*view, updateTrackingAreas];
                 }
             }
 
@@ -2055,6 +2164,72 @@ pub fn run_cocoa_app(
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopCommonModes);
     }
 
+    // Install NSEvent global monitor for mouse-moved events.
+    // NSTrackingArea (NSTrackingActiveAlways) does NOT fire mouseEntered: for
+    // background apps on macOS Sequoia. Global monitors fire even when backgrounded
+    // because they receive copies of events sent to OTHER apps.
+    // We use this to detect cursor entering our windows and activate.
+    // NSEventMaskMouseMoved = 1 << 5 = 32, NSEventMaskLeftMouseDragged = 1<<6
+    unsafe {
+        use block2::RcBlock;
+        let handler = RcBlock::new(move |_event: *mut AnyObject| {
+            // Only fire when pslXserver is NOT the active app.
+            let mtm = MainThreadMarker::new().unwrap();
+            let app = NSApplication::sharedApplication(mtm);
+            let is_active: bool = msg_send![&*app, isActive];
+            if is_active { return; } // Already active — nothing to do
+
+            // Check if cursor is inside one of our windows.
+            let mouse_loc: NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
+            let (entered_xid, entered_nswin): (crate::display::Xid, *mut AnyObject) = WINDOWS.with(|w| {
+                let ws = w.borrow();
+                let mut best: Option<(crate::display::Xid, isize, *mut AnyObject)> = None;
+                for (_id, info) in ws.iter() {
+                    if !info.visible { continue; }
+                    let frame: NSRect = msg_send![&*info.window, frame];
+                    let win_x = mouse_loc.x - frame.origin.x;
+                    let win_y = mouse_loc.y - frame.origin.y;
+                    if win_x < 0.0 || win_y < 0.0
+                        || win_x >= frame.size.width
+                        || win_y >= frame.size.height { continue; }
+                    let win_num: isize = msg_send![&*info.window, windowNumber];
+                    let ptr = &*info.window as *const NSWindow as *mut AnyObject;
+                    if best.is_none() || win_num > best.as_ref().unwrap().1 {
+                        best = Some((info.x11_id, win_num, ptr));
+                    }
+                }
+                best.map(|(xid, _, p)| (xid, p)).unwrap_or((0, std::ptr::null_mut()))
+            });
+            if entered_nswin.is_null() { return; }
+
+            // Cursor is inside one of our windows while we're backgrounded.
+            // Only act once per window-enter (use LAST_ENTER_WINDOW_X11 as dedup).
+            LAST_ENTER_WINDOW_X11.with(|le| {
+                if le.get() == entered_xid { return; }
+                le.set(entered_xid);
+                info!("GlobalMonitor: cursor entered x11=0x{:08x} while backgrounded — activating", entered_xid);
+                // Activate in event-handler context (macOS Sequoia respects this)
+                SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
+                activate_app(entered_nswin);
+                send_display_event(DisplayEvent::FocusIn { window: entered_xid });
+            });
+        });
+        let ns_event_cls = objc2::class!(NSEvent);
+        // NSEventMaskMouseMoved(32) | NSEventMaskLeftMouseDragged(64) | NSEventMaskRightMouseDragged(128)
+        // NSEventTypeOtherMouseDragged = 27 → 1<<27 = 134217728
+        // NOTE: no keyboard masks — those require Accessibility permission
+        let mask: u64 = (1 << 5) | (1 << 6) | (1 << 7) | (1 << 27);
+        let block_ptr = block2::RcBlock::as_ptr(&handler);
+        let _monitor: *mut AnyObject = msg_send![
+            ns_event_cls,
+            addGlobalMonitorForEventsMatchingMask: mask
+            handler: block_ptr
+        ];
+        info!("Installed NSEvent global monitor for mouse-enter focus (monitor={:?})", _monitor);
+        // Leak the block — the monitor runs forever (app lifetime)
+        std::mem::forget(handler);
+    }
+
     // Detect backing scale factor and cache screen height
     unsafe {
         let screen: *mut AnyObject = msg_send![objc2::class!(NSScreen), mainScreen];
@@ -2279,6 +2454,13 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
                 NS_RIGHT_MOUSE_DOWN => 3,
                 _ => 2,
             };
+            // Suppress spurious button events from app activation (SUPPRESS_BUTTON_FRAMES set
+            // by mouseEntered: before calling activateIgnoringOtherApps:).
+            if SUPPRESS_BUTTON_FRAMES.with(|s| s.get()) > 0 {
+                let cur: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
+                LAST_BUTTONS.with(|lb| lb.set(cur));
+                // fall through to sync LAST_BUTTONS at end of arm
+            } else {
             // Check if polling already detected this press (avoid duplicate ButtonPress)
             let btn_bit: u64 = match button { 1 => 1, 3 => 2, 2 => 4, _ => 0 };
             let prev = LAST_BUTTONS.with(|lb| lb.get());
@@ -2302,6 +2484,7 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
             // Always sync LAST_BUTTONS so the polling path doesn't re-fire
             let cur: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
             LAST_BUTTONS.with(|lb| lb.set(cur));
+            } // end else (not suppressed)
         }
         NS_LEFT_MOUSE_UP | NS_RIGHT_MOUSE_UP | NS_OTHER_MOUSE_UP => {
             let button: u8 = match event_type {
