@@ -117,6 +117,8 @@ struct WindowInfo {
     x11_y: i16,
     background_pixel: u32,
     visible: bool,
+    /// CALayer sublayer for this window (each X11 window gets its own layer)
+    ca_layer: *mut AnyObject,
 }
 
 impl Drop for WindowInfo {
@@ -126,6 +128,12 @@ impl Drop for WindowInfo {
         }
         if !self.display_surface.is_null() {
             unsafe { CFRelease(self.display_surface as *const c_void); }
+        }
+        if !self.ca_layer.is_null() {
+            unsafe {
+                let _: () = msg_send![self.ca_layer, removeFromSuperlayer];
+                CFRelease(self.ca_layer as *const c_void);
+            }
         }
     }
 }
@@ -386,8 +394,14 @@ fn get_first_touch(touches: *mut AnyObject) -> *mut AnyObject {
 }
 
 fn touch_location_in_view(touch: *mut AnyObject, view: *mut AnyObject) -> (i16, i16) {
+    use objc2::encode::{Encode, Encoding};
+
     #[repr(C)]
+    #[derive(Copy, Clone)]
     struct CGPoint { x: f64, y: f64 }
+    unsafe impl Encode for CGPoint {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
 
     unsafe {
         let point: CGPoint = msg_send![&*touch, locationInView: &*view];
@@ -537,24 +551,134 @@ fn ca_transaction_flush() {
     }
 }
 
-/// Set display_surface as CALayer contents for the main view.
-fn flush_to_screen(surface: *mut c_void) {
-    if surface.is_null() { return; }
-    MAIN_VIEW.with(|mv| {
-        let mv = mv.borrow();
-        if let Some(view) = *mv {
-            unsafe {
-                let layer: *mut AnyObject = msg_send![view, layer];
-                if !layer.is_null() {
-                    let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
-                    let _: () = msg_send![ca_cls, begin];
-                    let _: () = msg_send![ca_cls, setDisableActions: true];
-                    let _: () = msg_send![layer, setContents: surface as *mut AnyObject];
-                    let _: () = msg_send![ca_cls, commit];
+// CoreGraphics FFI for CGImage creation from IOSurface
+extern "C" {
+    fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+    fn CGColorSpaceRelease(cs: *mut c_void);
+    fn CGDataProviderCreateWithData(
+        info: *mut c_void,
+        data: *const c_void,
+        size: usize,
+        release_callback: *const c_void,
+    ) -> *mut c_void;
+    fn CGDataProviderRelease(provider: *mut c_void);
+    fn CGImageCreate(
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bits_per_pixel: usize,
+        bytes_per_row: usize,
+        space: *mut c_void,
+        bitmap_info: u32,
+        provider: *mut c_void,
+        decode: *const f64,
+        should_interpolate: bool,
+        intent: u32,
+    ) -> *mut c_void;
+    fn CGImageRelease(image: *mut c_void);
+}
+
+extern "C" {
+    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *mut c_void;
+    fn CGDataProviderCreateWithCFData(data: *mut c_void) -> *mut c_void;
+}
+
+/// Create a CGImage from an IOSurface and set it on the window's own CALayer.
+fn flush_window_to_layer(layer: *mut AnyObject, surface: *mut c_void) {
+    if surface.is_null() || layer.is_null() { return; }
+    unsafe {
+        let width = IOSurfaceGetWidth(surface);
+        let height = IOSurfaceGetHeight(surface);
+        let bytes_per_row = IOSurfaceGetBytesPerRow(surface);
+
+        // Lock surface read-only and copy data
+        IOSurfaceLock(surface, 1, std::ptr::null_mut());
+        let base = IOSurfaceGetBaseAddress(surface) as *const u8;
+        let data_len = bytes_per_row * height;
+
+        // Copy pixel data into CFData (owns the memory)
+        let cf_data = CFDataCreate(std::ptr::null(), base, data_len as isize);
+        IOSurfaceUnlock(surface, 1, std::ptr::null_mut());
+
+        if cf_data.is_null() { return; }
+
+        let colorspace = CGColorSpaceCreateDeviceRGB();
+        let provider = CGDataProviderCreateWithCFData(cf_data);
+        CFRelease(cf_data);
+
+        // kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst = 0x2006
+        let bitmap_info: u32 = 0x2006;
+        let image = CGImageCreate(
+            width, height, 8, 32, bytes_per_row,
+            colorspace, bitmap_info,
+            provider,
+            std::ptr::null(), false, 0,
+        );
+
+        CGDataProviderRelease(provider);
+        CGColorSpaceRelease(colorspace);
+
+        if !image.is_null() {
+            let _: () = msg_send![layer, setContents: image as *mut AnyObject];
+            CGImageRelease(image);
+        }
+    }
+}
+
+/// Create a CALayer sublayer for a window and add it to the main view's layer.
+fn create_window_layer(x: i16, y: i16, width: u16, height: u16) -> *mut AnyObject {
+    unsafe {
+        let layer: *mut AnyObject = msg_send![objc2::class!(CALayer), alloc];
+        let layer: *mut AnyObject = msg_send![layer, init];
+
+        // Use CGRect for setFrame:
+        use objc2::encode::{Encode, Encoding};
+
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct CGPoint { x: f64, y: f64 }
+        unsafe impl Encode for CGPoint {
+            const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+        }
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct CGSize { w: f64, h: f64 }
+        unsafe impl Encode for CGSize {
+            const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+        }
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct CGRect { origin: CGPoint, size: CGSize }
+        unsafe impl Encode for CGRect {
+            const ENCODING: Encoding = Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
+        }
+
+        let frame = CGRect {
+            origin: CGPoint { x: x as f64, y: y as f64 },
+            size: CGSize { w: width as f64, h: height as f64 },
+        };
+        let _: () = msg_send![layer, setFrame: frame];
+
+        let gravity = NSString::from_str("topLeft");
+        let _: () = msg_send![layer, setContentsGravity: &*gravity];
+        let _: () = msg_send![layer, setContentsScale: 1.0_f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+
+        // Add to main view's layer
+        MAIN_VIEW.with(|mv| {
+            let mv = mv.borrow();
+            if let Some(view) = *mv {
+                let parent_layer: *mut AnyObject = msg_send![view, layer];
+                if !parent_layer.is_null() {
+                    let _: () = msg_send![parent_layer, addSublayer: layer];
                 }
             }
-        }
-    });
+        });
+
+        // Retain for storage
+        let _: *mut AnyObject = msg_send![layer, retain];
+        layer
+    }
 }
 
 // --- Timer callback (60fps render loop) ---
@@ -644,7 +768,7 @@ fn process_commands() {
 
                         // For visible windows, push to screen
                         if info.visible {
-                            flush_to_screen(info.display_surface);
+                            flush_window_to_layer(info.ca_layer, info.display_surface);
                         }
                     }
                 }
@@ -686,12 +810,15 @@ fn handle_command(cmd: DisplayCommand) {
                 }
             }
 
+            let ca_layer = create_window_layer(x, y, width, height);
+
             WINDOWS.with(|w| {
                 w.borrow_mut().insert(id, WindowInfo {
                     surface, display_surface, width, height, x11_id,
                     x11_x: x, x11_y: y,
                     background_pixel: 0xFFFFFFFF,
                     visible: false,
+                    ca_layer,
                 });
             });
 
@@ -703,10 +830,13 @@ fn handle_command(cmd: DisplayCommand) {
             WINDOWS.with(|w| {
                 if let Some(info) = w.borrow_mut().get_mut(&handle.id) {
                     info.visible = visible;
+                    unsafe {
+                        let _: () = msg_send![info.ca_layer, setHidden: !visible];
+                    }
                     if visible {
                         info!("ShowWindow: id={} x11=0x{:08X} - visible on iOS", handle.id, info.x11_id);
                         let x11_id = info.x11_id;
-                        flush_to_screen(info.display_surface);
+                        flush_window_to_layer(info.ca_layer, info.display_surface);
                         send_display_event(DisplayEvent::FocusIn { window: x11_id });
                     }
                 }
@@ -1012,14 +1142,34 @@ unsafe extern "C" fn scene_will_connect(
     let window: *mut AnyObject = msg_send![window, initWithWindowScene: &*scene];
 
     // Get screen bounds
-    let screen: *mut AnyObject = msg_send![objc2::class!(UIScreen), mainScreen];
+    use objc2::encode::{Encode, Encoding};
+
     #[repr(C)]
     #[derive(Copy, Clone)]
-    struct CGRect { x: f64, y: f64, w: f64, h: f64 }
+    struct CGPoint { x: f64, y: f64 }
+    unsafe impl Encode for CGPoint {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGSize { width: f64, height: f64 }
+    unsafe impl Encode for CGSize {
+        const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGRect { origin: CGPoint, size: CGSize }
+    unsafe impl Encode for CGRect {
+        const ENCODING: Encoding = Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
+    }
+
+    let screen: *mut AnyObject = msg_send![objc2::class!(UIScreen), mainScreen];
     let bounds: CGRect = msg_send![screen, bounds];
-    SCREEN_WIDTH.with(|sw| sw.set(bounds.w));
-    SCREEN_HEIGHT.with(|sh| sh.set(bounds.h));
-    info!("iOS screen: {}x{}", bounds.w, bounds.h);
+    SCREEN_WIDTH.with(|sw| sw.set(bounds.size.width));
+    SCREEN_HEIGHT.with(|sh| sh.set(bounds.size.height));
+    info!("iOS screen: {}x{}", bounds.size.width, bounds.size.height);
 
     // Create our custom PSLXView covering the full screen
     let view_cls = get_pslx_view_class();

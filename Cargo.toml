@@ -5,6 +5,9 @@ edition = "2021"
 description = "Native macOS X11 Server in Rust — XQuartz alternative with proper IME support"
 license = "MIT"
 
+[lib]
+crate-type = ["lib", "staticlib"]
+
 [dependencies]
 # X11 protocol types with server-side request parsing
 x11rb-protocol = { version = "0.13", features = [

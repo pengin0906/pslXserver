@@ -18,7 +18,7 @@ pub mod font;
 pub extern "C" fn pslx_start(display_num: u32, tcp_port: u16) {
     use log::info;
 
-    std::env::set_var("RUST_LOG", "warn");
+    std::env::set_var("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
     env_logger::init();
 
     info!("pslXserver (iOS) starting on display :{}", display_num);

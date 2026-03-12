@@ -15,11 +15,12 @@
 		A1000006 /* CoreText.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000006; };
 		A1000007 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000007; };
 		A1000008 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000008; };
+		A1000009 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A200000C; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A2000001 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
-		A2000002 /* libpslXserver.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpslXserver.a; path = "../../target/aarch64-apple-ios/release/libpslXserver.a"; sourceTree = "<group>"; };
+		A2000002 /* libpslXserver.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpslXserver.a; path = "../../target/aarch64-apple-ios-sim/release/libpslXserver.a"; sourceTree = "<group>"; };
 		A2000003 /* IOSurface.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOSurface.framework; path = System/Library/Frameworks/IOSurface.framework; sourceTree = SDKROOT; };
 		A2000004 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
 		A2000005 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
@@ -29,6 +30,7 @@
 		A2000009 /* pslXserver-iOS-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "pslXserver-iOS-Bridging-Header.h"; sourceTree = "<group>"; };
 		A200000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A200000B /* pslXserver-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "pslXserver-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A200000C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -64,6 +66,7 @@
 				A2000001,
 				A2000009,
 				A200000A,
+				A200000C,
 			);
 			path = "pslXserver-iOS";
 			sourceTree = "<group>";
@@ -90,6 +93,7 @@
 			buildConfigurationList = A6000003;
 			buildPhases = (
 				A7000001,
+				A3000003,
 				A3000001,
 				A3000002,
 			);
@@ -147,9 +151,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "cd \"${SRCROOT}/..\"\n~/.cargo/bin/cargo build --release --target aarch64-apple-ios --lib\n";
+			shellScript = "cd \"${SRCROOT}/..\"\nif [ \"$PLATFORM_NAME\" = \"iphonesimulator\" ]; then\n  RUST_TARGET=aarch64-apple-ios-sim\nelse\n  RUST_TARGET=aarch64-apple-ios\nfi\n~/.cargo/bin/cargo build --release --target $RUST_TARGET --lib\n";
 		};
 /* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A3000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000009,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		A3000002 /* Sources */ = {
@@ -198,6 +213,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(SRCROOT)/../target/aarch64-apple-ios/release",
+					"$(SRCROOT)/../target/aarch64-apple-ios-sim/release",
 				);
 				OTHER_LDFLAGS = (
 					"-lresolv",
