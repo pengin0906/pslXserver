@@ -1,13 +1,8 @@
 #![allow(dead_code)]
 
-mod display;
-mod input;
-mod server;
-mod util;
-mod wm;
-mod clipboard;
-mod cursor;
-mod font;
+// Use the library crate's modules (defined in lib.rs)
+use pslXserver::display;
+use pslXserver::server;
 
 use clap::Parser;
 use log::info;
@@ -89,18 +84,19 @@ fn main() {
         });
     });
 
-    // Run Cocoa application on the main thread (macOS requirement)
+    // Run UI application on the main thread (Apple platform requirement)
     #[cfg(target_os = "macos")]
     display::macos::run_cocoa_app(cmd_rx, evt_tx, render_mailbox_display);
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "ios")]
+    display::ios::run_ios_app(cmd_rx, evt_tx, render_mailbox_display);
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
-        log::warn!("Non-macOS platform: running in headless mode (no display backend)");
-        // On non-macOS, just run the server without display
-        // Useful for protocol testing
+        log::warn!("Non-Apple platform: running in headless mode (no display backend)");
         tokio_handle.join().expect("Tokio thread panicked");
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     tokio_handle.join().expect("Tokio thread panicked");
 }

@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "ios")]
+pub mod ios;
 pub mod hidpi;
 pub mod renderer;
 

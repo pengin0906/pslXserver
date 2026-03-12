@@ -72,3 +72,39 @@ block2 = "0.6"
 core-foundation = "0.10"
 core-graphics = "0.24"
 core-text = "20"
+
+# iOS dependencies
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSArray",
+    "NSDictionary",
+    "NSData",
+    "NSNotification",
+    "NSRunLoop",
+    "NSThread",
+    "NSAttributedString",
+] }
+objc2-ui-kit = { version = "0.3", features = [
+    "UIApplication",
+    "UIWindow",
+    "UIView",
+    "UIViewController",
+    "UIScreen",
+    "UITouch",
+    "UIEvent",
+    "UIResponder",
+    "UIColor",
+    "UITextField",
+    "UITextInput",
+    "UIPasteboard",
+    "UIScene",
+    "UIWindowScene",
+    "UISceneSession",
+] }
+block2 = "0.6"
+core-foundation = "0.10"
+core-graphics = "0.24"
+core-text = "20"
+

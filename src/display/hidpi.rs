@@ -20,7 +20,13 @@ pub fn detect_scale_factor() -> f64 {
         2.0 // Default to 2x for modern Macs
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "ios")]
+    {
+        // iOS Retina displays are typically 2x or 3x
+        2.0
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         1.0
     }
@@ -42,7 +48,14 @@ pub fn get_screen_dimensions_pixels() -> (u16, u16) {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "ios")]
+    {
+        // Return logical screen size (points); will be set properly at runtime
+        // Default to iPhone 15 Pro dimensions
+        (393, 852)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         (1920, 1080)
     }
