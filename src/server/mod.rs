@@ -832,7 +832,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
     }
 }
 
-fn send_button_event(
+pub fn send_button_event(
     server: &XServer, event_type: u8,
     window: Xid, button: u8,
     x: i16, y: i16, root_x: i16, root_y: i16,
@@ -890,7 +890,7 @@ fn send_button_event(
     debug!("  BTN_NOT_DELIVERED: mask=0x{:08x} last_win=0x{:08x} orig_win=0x{:08x}", mask_bit, current, window);
 }
 
-fn send_motion_event(
+pub fn send_motion_event(
     server: &XServer, window: Xid,
     x: i16, y: i16, root_x: i16, root_y: i16,
     state: u16, time: u32,
@@ -946,7 +946,7 @@ fn send_motion_event(
     }
 }
 
-fn send_key_event(
+pub fn send_key_event(
     server: &XServer, event_type: u8,
     window: Xid, keycode: u8, state: u16, time: u32,
 ) {
@@ -1201,9 +1201,10 @@ fn send_backspaces(server: &XServer, window: Xid, count: usize) {
     const BACKSPACE_KEYCODE: u8 = 59; // macOS 51 + 8
 
     let focus = server.focus_window.load(Ordering::Relaxed);
-    let target = if focus > 1 {
-        focus
-    } else if focus == 1 {
+    let target = if focus >= 1 {
+        // Always find deepest child — focus may be a top-level window, but
+        // KEY_PRESS mask is on the child (e.g. xterm's vt100 widget).
+        // Must match send_ime_text's target computation.
         find_deepest_child(server, window)
     } else {
         return;

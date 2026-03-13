@@ -18,8 +18,15 @@ pub mod font;
 pub extern "C" fn pslx_start(display_num: u32, tcp_port: u16) {
     use log::info;
 
+    // Redirect env_logger to a file for iOS debugging (line-buffered for immediate flush)
     std::env::set_var("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
-    env_logger::init();
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).append(true).open("/tmp/pslx_server.log")
+        .expect("Failed to open log file");
+    let line_buffered = std::io::LineWriter::new(log_file);
+    env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Pipe(Box::new(line_buffered)))
+        .init();
 
     info!("pslXserver (iOS) starting on display :{}", display_num);
 

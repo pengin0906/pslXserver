@@ -2840,7 +2840,7 @@ fn get_event_location(event: &AnyObject, x11_id: crate::display::Xid, win_width:
 pub fn build_keyboard_map() -> Box<[(u32, u32); 128]> {
     use std::ffi::c_void;
     extern "C" {
-        fn TISCopyCurrentKeyboardLayoutInputSource() -> *mut c_void;
+        fn TISCopyCurrentASCIICapableKeyboardLayoutInputSource() -> *mut c_void;
         fn TISGetInputSourceProperty(source: *mut c_void, property_key: *const c_void) -> *mut c_void;
         fn CFDataGetBytePtr(data: *mut c_void) -> *const u8;
         fn CFRelease(cf: *const c_void);
@@ -2863,9 +2863,9 @@ pub fn build_keyboard_map() -> Box<[(u32, u32); 128]> {
     let mut map = Box::new([(0u32, 0u32); 128]);
 
     unsafe {
-        let source = TISCopyCurrentKeyboardLayoutInputSource();
+        let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource();
         if source.is_null() {
-            log::warn!("build_keyboard_map: TISCopyCurrentKeyboardLayoutInputSource returned null");
+            log::warn!("build_keyboard_map: TISCopyCurrentASCIICapableKeyboardLayoutInputSource returned null");
             return map;
         }
 

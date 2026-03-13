@@ -119,5 +119,79 @@ DISPLAY=:0 LANG=en_US.UTF-8 XMODIFIERS=@im=none xterm -u8 2>&1 | head -3
 - この問題はpslXserver固有ではなくHomebrew libX11のバグ
 
 
+---
 
-作業履歴をコピペしてジミニアジャとGPTのレベルの高いモードで相談してみろ
+## 自動テスト（XTest + python-xlib + Selenium）
+
+### 方針
+- **画面文字化け・入力テストはClaudeが自力で行う。ユーザーの手を借りない。**
+- XTEST拡張でX11側からキー入力・マウス操作を注入
+- python-xlibでX11プロトコルレベルのテスト
+- CGEvent(pyobjc-framework-Quartz)でmacOS IMEパイプライン経由のテスト
+- Seleniumは将来的にGTK/Electron UIのテストに使用
+
+### インストール済みツール
+```bash
+pip3 install python-xlib pyobjc-framework-Quartz selenium
+brew install xdotool  # ※ EWMH未対応のためSEGVする場合あり、python-xlibを優先
+```
+
+### テスト方法
+
+#### 1. ASCII入力テスト（XTEST経由）
+python-xlibのxtest拡張でKeyPress/KeyReleaseを注入し、xtermに文字が正しく入力されるか確認。
+```python
+from Xlib import X, display
+from Xlib.ext import xtest
+d = display.Display(":0")
+# キーコード取得 → xtest.fake_input(d, X.KeyPress, keycode) → sync
+```
+
+#### 2. Unicode/CJK入力テスト（ChangeKeyboardMapping経由）
+Unicode keysym `0x01000000 | codepoint` を仮想キーコードに割当て、KeyPressで送信。
+```python
+unicode_keysym = 0x01000000 | ord('漢')
+d.change_keyboard_mapping(200, [(unicode_keysym,)])
+d.sync()
+xtest.fake_input(d, X.KeyPress, 200)
+```
+
+#### 3. インラインIMEシミュレーション（XTEST経由）
+プリエディット→変換→確定の全フローをBS消去+再送信で再現。
+- `test_inline_ime.py`: かんじ→漢字、にほんご→日本語、わたしはにほんじんです→私は日本人です
+
+#### 4. 実macOS IMEテスト（CGEvent経由）
+CGEventCreateKeyboardEventでmacOSレベルのキーストロークを送信。
+かなキー(104)→ローマ字/かな入力→スペース変換→Enter確定の実IMEパイプラインをテスト。
+```python
+from Quartz import CGEventCreateKeyboardEvent, CGEventPost, kCGHIDEventTap
+event = CGEventCreateKeyboardEvent(None, keycode, True)
+CGEventPost(kCGHIDEventTap, event)
+```
+- `test_real_ime.py` / `test_real_ime2.py`: 実IMEテスト
+- `test_simple_ime.py`: 簡易2文字かな入力テスト
+
+#### 5. スクリーンショット検証
+各テストステップでscreencaptureを実行し、目視確認可能な証拠を保存。
+```python
+subprocess.run(["screencapture", "-x", "/tmp/pslx_step1.png"])
+```
+
+### テストスクリプト一覧
+| スクリプト | 内容 |
+|---|---|
+| `test_xtest.py` | XTEST拡張の基本動作確認 |
+| `test_keyboard.py` | ASCII全キー入力テスト |
+| `test_kanji.py` | CJK文字入力（Unicode keysym経由） |
+| `test_inline_ime.py` | IMEインラインシミュレーション |
+| `test_real_ime.py` | 実macOS IMEテスト（CGEvent） |
+| `test_real_ime2.py` | 実IMEテスト（ステップ毎スクリーンショット） |
+| `test_simple_ime.py` | 簡易IMEテスト（2文字） |
+| `test_bs_cjk.py` | CJK文字のBS消去テスト |
+| `test_ime.py` | ASCII入力+BSテスト |
+
+### 注意事項
+- xdotoolはEWMH(`_NET_ACTIVE_WINDOW`)未対応のためSEGVする。python-xlibを使うこと
+- CGEventテストはpslXserverがフォアグラウンドでないと動作しない
+- ユーザーのIMEは`Kotoeri.KanaTyping`（かな入力モード）。ローマ字入力前提のテストは不正確になる
+- テスト実行前に`pslXserver`を起動し、xtermを立ち上げておくこと
