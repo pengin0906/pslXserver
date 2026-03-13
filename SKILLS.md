@@ -195,3 +195,78 @@ subprocess.run(["screencapture", "-x", "/tmp/pslx_step1.png"])
 - CGEventテストはpslXserverがフォアグラウンドでないと動作しない
 - ユーザーのIMEは`Kotoeri.KanaTyping`（かな入力モード）。ローマ字入力前提のテストは不正確になる
 - テスト実行前に`pslXserver`を起動し、xtermを立ち上げておくこと
+
+---
+
+## UIバグのセルフデバッグ・修正手順
+
+### 方針
+- **画面表示・入力のバグはClaudeが自力で発見・修正・検証する。ユーザーの手を借りない。**
+- スクリーンショットで目視確認し、テストスクリプトで再現・修正確認を行う
+
+### セルフデバッグの全体フロー
+
+```
+1. バグ報告/発見
+    ↓
+2. スクリーンショットで現状確認
+    screencapture -x /tmp/pslx_before.png
+    ↓
+3. テストスクリプトでバグを再現
+    python3 test_keyboard.py / test_inline_ime.py / etc.
+    ↓
+4. ログ確認（RUST_LOG=debug で再起動して再現）
+    ↓
+5. 原因特定 → コード修正
+    ↓
+6. cargo build --release
+    ↓
+7. pslXserver再起動 + xterm再起動
+    ↓
+8. 同じテストスクリプトで修正確認
+    ↓
+9. スクリーンショットで目視確認
+    screencapture -x /tmp/pslx_after.png
+    ↓
+10. コミット＆プッシュ＆メモ更新
+```
+
+### 実績: 自力で修正したUIバグ (2026-03-13)
+
+#### バグ1: 英数入力がひらがなになる
+- **発見方法**: xtermでASCIIキー入力 → ひらがなが表示される
+- **再現**: `test_keyboard.py`でXTEST経由ASCII入力 → 文字化け確認
+- **原因調査**: `build_keyboard_map()`の`TISCopyCurrentKeyboardLayoutInputSource`がIMEアクティブ時に日本語レイアウトを返す
+- **修正**: `TISCopyCurrentASCIICapableKeyboardLayoutInputSource`に変更（常にASCIIレイアウト取得）
+- **検証**: `test_keyboard.py`再実行 → ASCII正常表示確認
+
+#### バグ2: IMEプリエディットが蓄積する（文字がどんどん進む）
+- **発見方法**: CGEventでかな入力 → プリエディット文字が消えずに蓄積
+- **再現**: `test_simple_ime.py`でかな入力→変換→確定 → BS消去が効かず文字が増える
+- **原因調査**: `send_backspaces()`が`focus`(トップレベルウィンドウ)からKEY_PRESSマスクを探索 → xtermのvt100子ウィンドウにマスクがあるため発見できずBSイベント未配信
+- **修正**: `find_deepest_child()`で最深子ウィンドウから探索開始（`send_ime_text()`と同じロジック）
+- **検証**: `test_simple_ime.py`再実行 → ちに→血に の変換でBS消去が正常動作
+
+#### バグ3: XTESTイベントが正しいウィンドウに届かない
+- **発見方法**: python-xlibの`xtest.fake_input`でKeyPress送信 → xtermに文字が表示されない
+- **原因調査**: FakeInputが呼び出し元コネクション(テストスクリプト)にイベント送信していた
+- **修正**: `send_key_event`/`send_button_event`/`send_motion_event`を使用し、フォーカスウィンドウのオーナーコネクションに配信
+- **検証**: `test_keyboard.py`再実行 → 全ASCII文字がxtermに正常入力
+
+### デバッグツール早見表
+
+| ツール | 用途 | コマンド例 |
+|---|---|---|
+| screencapture | 画面キャプチャ | `screencapture -x /tmp/pslx_debug.png` |
+| RUST_LOG=debug | 詳細ログ | pslXserver起動時に環境変数設定 |
+| test_keyboard.py | ASCII入力テスト | `DISPLAY=:0 python3 test_keyboard.py` |
+| test_inline_ime.py | IMEシミュレーション | `DISPLAY=:0 python3 test_inline_ime.py` |
+| test_simple_ime.py | 簡易IMEテスト | CGEvent経由（macOSフォアグラウンド必須） |
+| test_real_ime2.py | 実IMEフルテスト | CGEvent経由（ステップ毎スクショ） |
+| git diff | 変更箇所確認 | `git diff src/server/mod.rs` |
+
+### 重要な教訓
+- **`send_backspaces`と`send_ime_text`は同じターゲット計算を使え**: 両方とも`find_deepest_child()`。片方だけ変えると、テキスト挿入はできるがBS消去が壊れる（逆も然り）
+- **IMEアクティブ時のキーボードレイアウト取得**: `TISCopyCurrentASCIICapableKeyboardLayoutInputSource`を使う。`TISCopyCurrentKeyboardLayoutInputSource`はIMEの状態に依存する
+- **XTESTイベントの配信先**: テストクライアントのコネクションではなく、フォーカスウィンドウのオーナーコネクションに送る
+- **バグの原因調査**: まず`git diff`で前回コミットからの変更点を確認。変更箇所が原因であることが多い
