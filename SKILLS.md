@@ -35,8 +35,8 @@
 # Docker/Linux
 xterm -u8
 
-# macOS (Homebrew)
-LANG=en_US.UTF-8 XMODIFIERS=@im=none xterm -u8 -fn "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso10646-1"
+# macOS (Homebrew) — フォント指定不要（サーバー側でiso10646をデフォルト広告）
+LANG=en_US.UTF-8 XMODIFIERS=@im=none xterm -u8
 ```
 
 ### Chrome
@@ -121,14 +121,15 @@ DISPLAY=:0 LANG=en_US.UTF-8 XMODIFIERS=@im=none xterm -u8 2>&1 | head -3
 
 ---
 
-## 自動テスト（XTest + python-xlib + Selenium）
+## 自動テスト（XTest + python-xlib + Selenium/Appium）
 
 ### 方針
-- **画面文字化け・入力テストはClaudeが自力で行う。ユーザーの手を借りない。**
+- **人間の手を一切煩わせません。全テストはClaudeが自動で実行・検証する。**
 - XTEST拡張でX11側からキー入力・マウス操作を注入
 - python-xlibでX11プロトコルレベルのテスト
 - CGEvent(pyobjc-framework-Quartz)でmacOS IMEパイプライン経由のテスト
-- Seleniumは将来的にGTK/Electron UIのテストに使用
+- **Selenium（Appium）を使ってiOSシミュレーターでテスト**
+- Seleniumを使ってXウィンドウやXTermも、たまにはXTESTも使う
 
 ### インストール済みツール
 ```bash
@@ -190,11 +191,65 @@ subprocess.run(["screencapture", "-x", "/tmp/pslx_step1.png"])
 | `test_bs_cjk.py` | CJK文字のBS消去テスト |
 | `test_ime.py` | ASCII入力+BSテスト |
 
+### 6. iOSシミュレーターテスト（XTEST + xcrun simctl）
+
+#### 動作確認済み手順 (2026-03-14)
+AppiumではなくXTEST + `xcrun simctl io screenshot`を使う方法が安定して動作。
+
+```bash
+# シミュレーターUDID
+SIMULATOR=FBB5C54D-DB2C-4E6C-BFCB-0147CEDB3BFB
+
+# 1. pslXserver-iOS をビルド・インストール・起動
+~/.cargo/bin/cargo build --release --target aarch64-apple-ios-sim --lib
+xcodebuild -project ios-app/pslXserver-iOS.xcodeproj -scheme pslXserver-iOS \
+  -configuration Release \
+  -destination "platform=iOS Simulator,id=$SIMULATOR" \
+  -derivedDataPath /tmp/pslXserver-sim-build \
+  CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build
+xcrun simctl terminate $SIMULATOR com.pslx.pslXserver-iOS
+xcrun simctl install $SIMULATOR /tmp/pslXserver-sim-build/Build/Products/Release-iphonesimulator/pslXserver-iOS.app
+xcrun simctl launch $SIMULATOR com.pslx.pslXserver-iOS
+
+# 2. xterm接続 (DISPLAY=127.0.0.1:1)
+LANG=en_US.UTF-8 XMODIFIERS=@im=none DISPLAY=127.0.0.1:1 \
+  /opt/homebrew/bin/xterm -u8 \
+  -fn "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso10646-1" &
+
+# 3. テスト実行
+python3 test_ios_sim.py
+
+# 4. スクリーンショット取得
+xcrun simctl io $SIMULATOR screenshot /tmp/ipad_test.png
+```
+
+#### test_ios_sim.py テスト内容
+| テスト | 内容 |
+|---|---|
+| Basic ASCII input | XTEST経由でASCIIキー入力 → xterm表示確認 |
+| Special keys | BackSpace等の特殊キー |
+| Unicode/CJK input | ChangeKeyboardMapping+XTESTでCJK文字 |
+| Window visibility | render_debug.txtでウィンドウ状態確認 |
+
+#### シミュレーター描画アーキテクチャ
+- X11座標系とUIKit点座標は1:1マッピング（contentsScale=1.0）
+- IOSurface直接CALayerにセット（ゼロコピー、macOSと同じ）
+- スクリーンショットはlandscapeアプリをportraitで撮影するため、top-left(0,0)が画像の左下に見える
+- デバッグファイル: `/tmp/pslx_render_debug.txt`（アプリが書き込む）
+
+#### Appiumによる代替テスト（参考）
+```bash
+~/.local/bin/appium --port 4723 &
+pip3 install Appium-Python-Client --break-system-packages
+```
+XCUITestドライバ経由でUIKit操作可能だが、XTESTの方がX11レベルで直接テストできて確実。
+
 ### 注意事項
 - xdotoolはEWMH(`_NET_ACTIVE_WINDOW`)未対応のためSEGVする。python-xlibを使うこと
 - CGEventテストはpslXserverがフォアグラウンドでないと動作しない
 - ユーザーのIMEは`Kotoeri.KanaTyping`（かな入力モード）。ローマ字入力前提のテストは不正確になる
 - テスト実行前に`pslXserver`を起動し、xtermを立ち上げておくこと
+- iOSシミュレーター: XTESTはTCP経由(DISPLAY=127.0.0.1:1)で動作確認済み
 
 ---
 

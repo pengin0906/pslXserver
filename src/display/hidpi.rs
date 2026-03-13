@@ -70,6 +70,10 @@ pub fn get_screen_dimensions_pixels() -> (u16, u16) {
                 msg_send![objc2::class!(UIScreen), mainScreen];
             if !screen.is_null() {
                 let bounds: CGRect = msg_send![screen, bounds];
+                // Use points (not physical pixels) as X11 screen dimensions.
+                // Since we set contentsScale=1.0 on CALayer, 1 X11 pixel = 1 UIKit point.
+                // This makes xterm create a window sized in points, which displays at
+                // the correct visual size on screen without any scaling mismatch.
                 let w = bounds.size[0] as u16;
                 let h = bounds.size[1] as u16;
                 if w > 0 && h > 0 {
@@ -78,7 +82,7 @@ pub fn get_screen_dimensions_pixels() -> (u16, u16) {
             }
         }
         // Fallback: iPad Pro 13" dimensions in points
-        (1024, 1366)
+        (1366, 1024)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]

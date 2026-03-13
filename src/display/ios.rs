@@ -9,6 +9,14 @@ use std::ffi::c_void;
 
 use crossbeam_channel::{Receiver, Sender};
 use log::{debug, info, warn};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+/// Stores the X11 keycode (mac_kc + 8) of the most recent key handled by pressesBegan.
+/// When insertText: sees a matching keycode, it skips the event (already sent by pressesBegan).
+/// 0 = no pending hardware key. This is a one-shot: insertText: swaps it to 0 on read.
+/// This approach allows Japanese romaji input from software keyboard: pressesBegan is NOT called
+/// for software keyboard romaji letters, so LAST_HW_KEYCODE stays 0 and insertText: sends them.
+static LAST_HW_KEYCODE: AtomicU8 = AtomicU8::new(0);
 
 use objc2::msg_send;
 use objc2::rc::Retained;
@@ -18,12 +26,9 @@ use objc2_foundation::{MainThreadMarker, NSString};
 use crate::display::{DisplayCommand, DisplayEvent, NativeWindowHandle};
 use crate::display::renderer::render_to_buffer;
 
-/// Write debug message to /tmp/pslx_ios.log (visible from host for simulator debugging).
+/// Log message using info! macro (visible via devicectl --console on real device, /tmp on simulator).
 fn ios_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/pslx_ios.log") {
-        let _ = writeln!(f, "{}", msg);
-    }
+    info!("[ios] {}", msg);
 }
 
 // --- IOSurface FFI (same as macOS) ---
@@ -175,6 +180,8 @@ thread_local! {
     static CASCADE_OFFSET: std::cell::Cell<i16> = const { std::cell::Cell::new(0) };
     /// Implicit pointer grab: window that received the most recent touch down.
     static GRAB_WINDOW: std::cell::Cell<Option<crate::display::Xid>> = const { std::cell::Cell::new(None) };
+    /// Button number for the current grab (1=left, 2=middle, 3=right).
+    static GRAB_BUTTON: std::cell::Cell<u8> = const { std::cell::Cell::new(1) };
     /// Drag state: (native_window_id, start_layer_x, start_layer_y, start_touch_x, start_touch_y)
     static DRAG_STATE: std::cell::Cell<Option<(u64, f64, f64, f64, f64)>> = const { std::cell::Cell::new(None) };
     /// The main UIView (our single fullscreen view). Pointer stored for layer access.
@@ -187,6 +194,10 @@ thread_local! {
     /// Screen dimensions in points.
     static SCREEN_WIDTH: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     static SCREEN_HEIGHT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// Current keyboard height in points (0 when hidden).
+    static KEYBOARD_HEIGHT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// Pending resize from keyboard change — (width, height) applied on next timer tick.
+    static PENDING_RESIZE: std::cell::Cell<Option<(u16, u16)>> = const { std::cell::Cell::new(None) };
 }
 
 fn alloc_id() -> u64 {
@@ -217,6 +228,8 @@ fn get_pslx_view_class() -> &'static AnyClass {
             .expect("Failed to create PSLXView class");
 
         builder.add_ivar::<u8>(c"textInserted");
+        builder.add_ivar::<*mut AnyObject>(c"_inputDelegate"); // UITextInput inputDelegate property
+        builder.add_ivar::<*mut AnyObject>(c"_tokenizer"); // UITextInput tokenizer property
 
         extern "C" {
             fn class_addMethod(
@@ -237,10 +250,16 @@ fn get_pslx_view_class() -> &'static AnyClass {
         let raw_cls = builder.register() as *const AnyClass as *mut c_void;
 
         unsafe {
-            // Conform to UIKeyInput protocol for software keyboard
-            let proto = objc_getProtocol(c"UIKeyInput".as_ptr() as _);
+            // Conform to UITextInput protocol (superset of UIKeyInput) for full IME support
+            // This is the iOS equivalent of macOS NSTextInputClient
+            let proto = objc_getProtocol(c"UITextInput".as_ptr() as _);
             if !proto.is_null() {
                 class_addProtocol(raw_cls, proto);
+            }
+            // Also conform to UIKeyInput (parent protocol)
+            let proto2 = objc_getProtocol(c"UIKeyInput".as_ptr() as _);
+            if !proto2.is_null() {
+                class_addProtocol(raw_cls, proto2);
             }
 
             // canBecomeFirstResponder -> YES
@@ -254,6 +273,89 @@ fn get_pslx_view_class() -> &'static AnyClass {
                 ios_insert_text as *const c_void, c"v@:@".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(deleteBackward),
                 delete_backward as *const c_void, c"v@:".as_ptr() as _);
+
+            // === UITextInput methods (IME composition support) ===
+            // setMarkedText:selectedRange: — called during IME composition (like macOS setMarkedText:)
+            class_addMethod(raw_cls, objc2::sel!(setMarkedText:selectedRange:),
+                ios_set_marked_text as *const c_void, c"v@:@{_NSRange=QQ}".as_ptr() as _);
+            // unmarkText — called when composition ends
+            class_addMethod(raw_cls, objc2::sel!(unmarkText),
+                ios_unmark_text as *const c_void, c"v@:".as_ptr() as _);
+            // markedTextRange — returns current marked text range (nil if not composing)
+            class_addMethod(raw_cls, objc2::sel!(markedTextRange),
+                ios_marked_text_range as *const c_void, c"@@:".as_ptr() as _);
+            // selectedTextRange — returns current selection range
+            class_addMethod(raw_cls, objc2::sel!(selectedTextRange),
+                ios_selected_text_range as *const c_void, c"@@:".as_ptr() as _);
+            // setSelectedTextRange:
+            class_addMethod(raw_cls, objc2::sel!(setSelectedTextRange:),
+                ios_set_selected_text_range as *const c_void, c"v@:@".as_ptr() as _);
+            // markedTextStyle
+            class_addMethod(raw_cls, objc2::sel!(markedTextStyle),
+                ios_return_nil as *const c_void, c"@@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(setMarkedTextStyle:),
+                ios_set_noop as *const c_void, c"v@:@".as_ptr() as _);
+            // textInRange:
+            class_addMethod(raw_cls, objc2::sel!(textInRange:),
+                ios_text_in_range as *const c_void, c"@@:@".as_ptr() as _);
+            // replaceRange:withText:
+            class_addMethod(raw_cls, objc2::sel!(replaceRange:withText:),
+                ios_replace_range as *const c_void, c"v@:@@".as_ptr() as _);
+            // beginningOfDocument / endOfDocument
+            class_addMethod(raw_cls, objc2::sel!(beginningOfDocument),
+                ios_beginning_of_document as *const c_void, c"@@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(endOfDocument),
+                ios_end_of_document as *const c_void, c"@@:".as_ptr() as _);
+            // Position/range methods (stubs)
+            class_addMethod(raw_cls, objc2::sel!(positionFromPosition:offset:),
+                ios_position_from_offset as *const c_void, c"@@:@q".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(positionFromPosition:inDirection:offset:),
+                ios_position_from_direction as *const c_void, c"@@:@qq".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(textRangeFromPosition:toPosition:),
+                ios_text_range_from_positions as *const c_void, c"@@:@@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(comparePosition:toPosition:),
+                ios_compare_position as *const c_void, c"q@:@@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(offsetFromPosition:toPosition:),
+                ios_offset_from_position as *const c_void, c"q@:@@".as_ptr() as _);
+            // inputDelegate
+            class_addMethod(raw_cls, objc2::sel!(inputDelegate),
+                ios_get_input_delegate as *const c_void, c"@@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(setInputDelegate:),
+                ios_set_input_delegate as *const c_void, c"v@:@".as_ptr() as _);
+            // tokenizer
+            class_addMethod(raw_cls, objc2::sel!(tokenizer),
+                ios_tokenizer as *const c_void, c"@@:".as_ptr() as _);
+            // Geometry methods for IME candidate window positioning
+            class_addMethod(raw_cls, objc2::sel!(firstRectForRange:),
+                ios_first_rect_for_range as *const c_void,
+                c"{CGRect={CGPoint=dd}{CGSize=dd}}@:@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(caretRectForPosition:),
+                ios_caret_rect_for_position as *const c_void,
+                c"{CGRect={CGPoint=dd}{CGSize=dd}}@:@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(selectionRectsForRange:),
+                ios_selection_rects as *const c_void, c"@@:@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(closestPositionToPoint:),
+                ios_closest_position_to_point as *const c_void,
+                c"@@:{CGPoint=dd}".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(closestPositionToPoint:withinRange:),
+                ios_closest_position_to_point_in_range as *const c_void,
+                c"@@:{CGPoint=dd}@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(characterRangeAtPoint:),
+                ios_character_range_at_point as *const c_void,
+                c"@@:{CGPoint=dd}".as_ptr() as _);
+            // Writing direction (stubs)
+            class_addMethod(raw_cls, objc2::sel!(baseWritingDirectionForPosition:inDirection:),
+                ios_base_writing_direction as *const c_void, c"q@:@q".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(setBaseWritingDirection:forRange:),
+                ios_set_base_writing_direction as *const c_void, c"v@:q@".as_ptr() as _);
+            // positionWithinRange:farthestInDirection: / characterRangeByExtendingPosition:inDirection:
+            class_addMethod(raw_cls, objc2::sel!(positionWithinRange:farthestInDirection:),
+                ios_position_within_range as *const c_void, c"@@:@q".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(characterRangeByExtendingPosition:inDirection:),
+                ios_character_range_by_extending as *const c_void, c"@@:@q".as_ptr() as _);
+            // hasText (override for UITextInput — return YES when composing)
+            class_addMethod(raw_cls, objc2::sel!(hasText),
+                has_text as *const c_void, c"B@:".as_ptr() as _);
 
             // Touch handling
             class_addMethod(raw_cls, objc2::sel!(touchesBegan:withEvent:),
@@ -279,6 +381,14 @@ fn get_pslx_view_class() -> &'static AnyClass {
             class_addMethod(raw_cls, objc2::sel!(pressesEnded:withEvent:),
                 presses_ended as *const c_void, c"v@:@@".as_ptr() as _);
 
+            // Mouse hover handler (called by UIHoverGestureRecognizer added in setup_window_in_scene)
+            class_addMethod(raw_cls, objc2::sel!(handleHover:),
+                handle_hover as *const c_void, c"v@:@".as_ptr() as _);
+
+            // Scroll handler (called by UIPanGestureRecognizer with allowedScrollTypesMask)
+            class_addMethod(raw_cls, objc2::sel!(handleScroll:),
+                handle_scroll as *const c_void, c"v@:@".as_ptr() as _);
+
             CLASS = raw_cls as *const AnyClass;
         }
     });
@@ -296,11 +406,15 @@ unsafe extern "C" fn has_text(_this: *mut AnyObject, _sel: Sel) -> Bool {
     Bool::YES
 }
 
-/// UIKeyInput insertText: — called when user types on software or hardware keyboard.
-/// On hardware keyboard, pressesBegan already sends KeyPress for physical keys,
-/// so single ASCII chars are skipped here (same as macOS insertText logic).
+/// UIKeyInput insertText: — called when user confirms text input.
+/// For IME: called after setMarkedText when user confirms (like macOS insertText:replacementRange:).
+/// For direct typing: called for each character (like macOS interpretKeyEvents → insertText:).
 unsafe extern "C" fn ios_insert_text(_this: *mut AnyObject, _sel: Sel, text: *mut AnyObject) {
     if text.is_null() { return; }
+
+    // End IME composition (same as macOS insertText:replacementRange: line 512-513)
+    crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
+    crate::display::IME_CONVERTING.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let utf8: *const std::os::raw::c_char = msg_send![&*text, UTF8String];
     if utf8.is_null() { return; }
@@ -310,21 +424,368 @@ unsafe extern "C" fn ios_insert_text(_this: *mut AnyObject, _sel: Sel, text: *mu
     };
     if rust_str.is_empty() { return; }
 
-    // Single ASCII characters: skip — pressesBegan already sent KeyPress via physical keycode.
-    // This matches macOS insertText behavior (UCKeyTranslate keymapping handles ASCII).
-    let is_single_ascii = rust_str.len() == 1 && rust_str.as_bytes()[0] < 0x80;
-    if is_single_ascii {
+    let x11_id = get_focused_x11_window();
+    if x11_id == 0 { return; }
+    let time = get_timestamp();
+
+    // Single ASCII character: send as KeyPress/KeyRelease (like macOS insertText for ASCII)
+    // Skip if this exact keycode was already sent by pressesBegan (hardware keyboard).
+    // Software keyboard romaji: pressesBegan is NOT called, so LAST_HW_KEYCODE=0 and we send.
+    if rust_str.len() == 1 && rust_str.as_bytes()[0] < 0x80 {
+        let ch = rust_str.as_bytes()[0];
+        let (keycode, state) = ascii_to_x11_keycode_state(ch);
+        // Swap LAST_HW_KEYCODE atomically: if it matches, pressesBegan already sent this key.
+        let hw_kc = LAST_HW_KEYCODE.swap(0, Ordering::Relaxed);
+        if hw_kc != 0 && hw_kc == keycode {
+            // Hardware keyboard: pressesBegan already sent KeyPress; skip to avoid double-send.
+            return;
+        }
+        if keycode != 0 {
+            send_display_event(DisplayEvent::KeyPress {
+                window: x11_id, keycode, state, time,
+            });
+            send_display_event(DisplayEvent::KeyRelease {
+                window: x11_id, keycode, state, time,
+            });
+        }
         return;
     }
 
-    // Non-ASCII (IME, emoji, etc.) → ImeCommit
-    let x11_id = get_focused_x11_window();
-    if x11_id == 0 { return; }
+    // Non-ASCII (IME kanji, emoji, etc.) → ImeCommit (like macOS insertText for CJK)
+    // Suppress next KeyRelease — ImeCommit already handles the text (same as macOS line 549)
+    crate::display::SUPPRESS_NEXT_KEYUP.store(true, std::sync::atomic::Ordering::Relaxed);
     info!("iOS insertText: '{}' for window 0x{:08x}", rust_str, x11_id);
     send_display_event(DisplayEvent::ImeCommit {
         window: x11_id,
         text: rust_str,
     });
+}
+
+// === UITextInput method implementations ===
+// These mirror macOS NSTextInputClient methods for IME composition support.
+
+/// setMarkedText:selectedRange: — called by iOS IME during composition.
+/// This is the iOS equivalent of macOS setMarkedText:selectedRange:replacementRange:.
+/// Sends ImePreeditDraw to show preedit text inline in xterm.
+unsafe extern "C" fn ios_set_marked_text(_this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, _sel_range: NSRange) {
+    // Extract preedit text (may be NSString or NSAttributedString, same as macOS line 636-649)
+    let preedit_str = if !text.is_null() {
+        let is_attr_str: bool = msg_send![&*text, isKindOfClass: objc2::class!(NSAttributedString)];
+        let ns_string: *mut AnyObject = if is_attr_str {
+            msg_send![&*text, string]
+        } else {
+            text
+        };
+        if !ns_string.is_null() {
+            let utf8: *const std::os::raw::c_char = msg_send![&*ns_string, UTF8String];
+            if !utf8.is_null() {
+                std::ffi::CStr::from_ptr(utf8).to_str().ok().map(|s| s.to_string())
+            } else { None }
+        } else { None }
+    } else { None };
+
+    let preedit_empty = preedit_str.as_ref().map_or(true, |s| s.is_empty());
+
+    if preedit_empty {
+        // Preedit cleared (e.g., BS deleted all preedit chars) — end composition (macOS line 653-656)
+        crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::display::IME_CONVERTING.store(false, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        // Active composition (macOS line 658)
+        crate::display::IME_COMPOSING.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    if let Some(s) = preedit_str {
+        if !s.is_empty() {
+            let x11_id = get_focused_x11_window();
+            if x11_id != 0 {
+                info!("iOS setMarkedText: preedit='{}' (sent to X11)", s);
+                send_display_event(DisplayEvent::ImePreeditDraw {
+                    window: x11_id,
+                    text: s,
+                    cursor_pos: 0,
+                });
+            }
+        }
+    }
+}
+
+/// unmarkText — called when iOS ends composition without committing.
+/// Same as macOS unmarkText (line 686-689).
+unsafe extern "C" fn ios_unmark_text(_this: *mut AnyObject, _sel: Sel) {
+    crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
+    crate::display::IME_CONVERTING.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// markedTextRange — returns UITextRange for current marked text, nil if not composing.
+unsafe extern "C" fn ios_marked_text_range(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    if crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) {
+        // Return a non-nil UITextRange to indicate active composition
+        // Use UITextRange from beginningOfDocument to endOfDocument as a simple placeholder
+        ios_create_text_range(0, 1)
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// selectedTextRange — returns UITextRange for current selection (stub: empty range at position 0).
+unsafe extern "C" fn ios_selected_text_range(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    ios_create_text_range(0, 0)
+}
+
+/// setSelectedTextRange: — no-op (we don't track selection in X11 text buffer).
+unsafe extern "C" fn ios_set_selected_text_range(_this: *mut AnyObject, _sel: Sel, _range: *mut AnyObject) {}
+
+/// Generic nil-returning stub for optional UITextInput properties.
+unsafe extern "C" fn ios_return_nil(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    std::ptr::null_mut()
+}
+
+/// Generic no-op setter stub.
+unsafe extern "C" fn ios_set_noop(_this: *mut AnyObject, _sel: Sel, _value: *mut AnyObject) {}
+
+/// textInRange: — return empty string (we don't maintain a text buffer).
+unsafe extern "C" fn ios_text_in_range(_this: *mut AnyObject, _sel: Sel, _range: *mut AnyObject) -> *mut AnyObject {
+    let empty = NSString::from_str("");
+    let ptr: *mut AnyObject = &*empty as *const _ as *mut AnyObject;
+    let _: *mut AnyObject = msg_send![ptr, retain];
+    ptr
+}
+
+/// replaceRange:withText: — no-op (we don't maintain a text buffer, text goes via insertText).
+unsafe extern "C" fn ios_replace_range(_this: *mut AnyObject, _sel: Sel, _range: *mut AnyObject, _text: *mut AnyObject) {}
+
+/// beginningOfDocument — return a UITextPosition stub.
+unsafe extern "C" fn ios_beginning_of_document(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    ios_create_text_position(0)
+}
+
+/// endOfDocument — return a UITextPosition stub.
+unsafe extern "C" fn ios_end_of_document(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    ios_create_text_position(0)
+}
+
+/// positionFromPosition:offset: — return a UITextPosition stub.
+unsafe extern "C" fn ios_position_from_offset(_this: *mut AnyObject, _sel: Sel, _position: *mut AnyObject, _offset: i64) -> *mut AnyObject {
+    ios_create_text_position(0)
+}
+
+/// positionFromPosition:inDirection:offset: — stub.
+unsafe extern "C" fn ios_position_from_direction(_this: *mut AnyObject, _sel: Sel, _position: *mut AnyObject, _direction: i64, _offset: i64) -> *mut AnyObject {
+    ios_create_text_position(0)
+}
+
+/// textRangeFromPosition:toPosition: — stub.
+unsafe extern "C" fn ios_text_range_from_positions(_this: *mut AnyObject, _sel: Sel, _from: *mut AnyObject, _to: *mut AnyObject) -> *mut AnyObject {
+    ios_create_text_range(0, 0)
+}
+
+/// comparePosition:toPosition: — stub (return NSOrderedSame = 0).
+unsafe extern "C" fn ios_compare_position(_this: *mut AnyObject, _sel: Sel, _pos1: *mut AnyObject, _pos2: *mut AnyObject) -> i64 {
+    0 // NSOrderedSame
+}
+
+/// offsetFromPosition:toPosition: — stub (return 0).
+unsafe extern "C" fn ios_offset_from_position(_this: *mut AnyObject, _sel: Sel, _from: *mut AnyObject, _to: *mut AnyObject) -> i64 {
+    0
+}
+
+/// inputDelegate getter — return stored delegate.
+unsafe extern "C" fn ios_get_input_delegate(this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    let ivar = (*this).class().instance_variable(c"_inputDelegate").unwrap();
+    *ivar.load::<*mut AnyObject>(&*this)
+}
+
+/// inputDelegate setter — store delegate.
+unsafe extern "C" fn ios_set_input_delegate(this: *mut AnyObject, _sel: Sel, delegate: *mut AnyObject) {
+    let ivar = (*this).class().instance_variable(c"_inputDelegate").unwrap();
+    *ivar.load_mut::<*mut AnyObject>(&mut *this) = delegate;
+}
+
+/// tokenizer — return UITextInputStringTokenizer (default tokenizer).
+unsafe extern "C" fn ios_tokenizer(this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    let ivar = (*this).class().instance_variable(c"_tokenizer").unwrap();
+    let existing = *ivar.load::<*mut AnyObject>(&*this);
+    if !existing.is_null() { return existing; }
+    // Create default tokenizer
+    let cls = objc2::class!(UITextInputStringTokenizer);
+    let tokenizer: *mut AnyObject = msg_send![cls, alloc];
+    let tokenizer: *mut AnyObject = msg_send![tokenizer, initWithTextInput: this];
+    *ivar.load_mut::<*mut AnyObject>(&mut *this) = tokenizer;
+    tokenizer
+}
+
+/// firstRectForRange: — return rect at IME cursor position (for candidate window placement).
+/// Uses IME_SPOT_X/Y from mod.rs (same as macOS firstRectForCharacterRange:actualRange:).
+unsafe extern "C" fn ios_first_rect_for_range(_this: *mut AnyObject, _sel: Sel, _range: *mut AnyObject) -> CGRectVal {
+    let spot_x = crate::display::IME_SPOT_X.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    let spot_y = crate::display::IME_SPOT_Y.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    let line_h = crate::display::IME_SPOT_LINE_H.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    CGRectVal { origin: CGPointVal { x: spot_x, y: spot_y }, size: CGSizeVal { width: 10.0, height: line_h } }
+}
+
+/// caretRectForPosition: — return rect at IME cursor position.
+unsafe extern "C" fn ios_caret_rect_for_position(_this: *mut AnyObject, _sel: Sel, _position: *mut AnyObject) -> CGRectVal {
+    let spot_x = crate::display::IME_SPOT_X.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    let spot_y = crate::display::IME_SPOT_Y.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    let line_h = crate::display::IME_SPOT_LINE_H.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    CGRectVal { origin: CGPointVal { x: spot_x, y: spot_y }, size: CGSizeVal { width: 2.0, height: line_h } }
+}
+
+/// selectionRectsForRange: — return empty array (no selection rects).
+unsafe extern "C" fn ios_selection_rects(_this: *mut AnyObject, _sel: Sel, _range: *mut AnyObject) -> *mut AnyObject {
+    let arr: *mut AnyObject = msg_send![objc2::class!(NSArray), array];
+    arr
+}
+
+/// closestPositionToPoint: — stub, return position 0.
+unsafe extern "C" fn ios_closest_position_to_point(_this: *mut AnyObject, _sel: Sel, _point: CGPointVal) -> *mut AnyObject {
+    ios_create_text_position(0)
+}
+
+/// closestPositionToPoint:withinRange: — stub, return position 0.
+unsafe extern "C" fn ios_closest_position_to_point_in_range(_this: *mut AnyObject, _sel: Sel, _point: CGPointVal, _range: *mut AnyObject) -> *mut AnyObject {
+    ios_create_text_position(0)
+}
+
+/// characterRangeAtPoint: — stub, return nil.
+unsafe extern "C" fn ios_character_range_at_point(_this: *mut AnyObject, _sel: Sel, _point: CGPointVal) -> *mut AnyObject {
+    std::ptr::null_mut()
+}
+
+/// baseWritingDirectionForPosition:inDirection: — return LeftToRight (0).
+unsafe extern "C" fn ios_base_writing_direction(_this: *mut AnyObject, _sel: Sel, _pos: *mut AnyObject, _direction: i64) -> i64 {
+    0 // UITextWritingDirectionLeftToRight = NSWritingDirectionLeftToRight = 0
+}
+
+/// setBaseWritingDirection:forRange: — no-op.
+unsafe extern "C" fn ios_set_base_writing_direction(_this: *mut AnyObject, _sel: Sel, _direction: i64, _range: *mut AnyObject) {}
+
+/// positionWithinRange:farthestInDirection: — stub.
+unsafe extern "C" fn ios_position_within_range(_this: *mut AnyObject, _sel: Sel, _range: *mut AnyObject, _direction: i64) -> *mut AnyObject {
+    ios_create_text_position(0)
+}
+
+/// characterRangeByExtendingPosition:inDirection: — stub.
+unsafe extern "C" fn ios_character_range_by_extending(_this: *mut AnyObject, _sel: Sel, _pos: *mut AnyObject, _direction: i64) -> *mut AnyObject {
+    ios_create_text_range(0, 0)
+}
+
+// --- CG value types for UITextInput geometry methods ---
+use objc2::encode::{Encode, Encoding};
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CGPointVal { x: f64, y: f64 }
+unsafe impl Encode for CGPointVal {
+    const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CGSizeVal { width: f64, height: f64 }
+unsafe impl Encode for CGSizeVal {
+    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CGRectVal { origin: CGPointVal, size: CGSizeVal }
+unsafe impl Encode for CGRectVal {
+    const ENCODING: Encoding = Encoding::Struct("CGRect", &[CGPointVal::ENCODING, CGSizeVal::ENCODING]);
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct NSRange { location: usize, length: usize }
+unsafe impl Encode for NSRange {
+    const ENCODING: Encoding = Encoding::Struct("_NSRange", &[usize::ENCODING, usize::ENCODING]);
+}
+
+// --- UITextPosition / UITextRange helper creation ---
+
+/// Create a UITextPosition (opaque position object for UITextInput).
+/// We use a tag-based approach: store the offset as the object's tag.
+fn ios_create_text_position(offset: i64) -> *mut AnyObject {
+    unsafe {
+        let cls = objc2::class!(UITextPosition);
+        let obj: *mut AnyObject = msg_send![cls, alloc];
+        let obj: *mut AnyObject = msg_send![obj, init];
+        obj
+    }
+}
+
+/// Create a UITextRange (from position to position).
+/// Returns a simple UITextRange via UITextRange subclass or the base class.
+fn ios_create_text_range(start: i64, length: i64) -> *mut AnyObject {
+    unsafe {
+        // UITextRange is abstract — we need to create positions and use them.
+        // For our stub purposes, we return a minimal valid object.
+        // iOS will accept this for composition tracking.
+        let start_pos = ios_create_text_position(start);
+        let end_pos = ios_create_text_position(start + length);
+        // Use the concrete PSLXTextRange class
+        let cls = get_text_range_class();
+        let obj: *mut AnyObject = msg_send![cls, alloc];
+        let obj: *mut AnyObject = msg_send![obj, init];
+        // Store start and end positions as ivars
+        let start_ivar = (*obj).class().instance_variable(c"_start").unwrap();
+        *start_ivar.load_mut::<*mut AnyObject>(&mut *obj) = start_pos;
+        let end_ivar = (*obj).class().instance_variable(c"_end").unwrap();
+        *end_ivar.load_mut::<*mut AnyObject>(&mut *obj) = end_pos;
+        obj
+    }
+}
+
+/// Register PSLXTextRange — a concrete UITextRange subclass.
+/// UITextRange is abstract and requires `start` and `end` properties.
+fn get_text_range_class() -> &'static AnyClass {
+    use std::sync::Once;
+    static mut CLASS: *const AnyClass = std::ptr::null();
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let superclass = objc2::class!(UITextRange);
+        let mut builder = ClassBuilder::new(c"PSLXTextRange", superclass)
+            .expect("Failed to create PSLXTextRange class");
+
+        builder.add_ivar::<*mut AnyObject>(c"_start");
+        builder.add_ivar::<*mut AnyObject>(c"_end");
+        builder.add_ivar::<u8>(c"_isEmpty");
+
+        extern "C" {
+            fn class_addMethod(
+                cls: *mut c_void, sel: Sel, imp: *const c_void, types: *const std::ffi::c_char,
+            ) -> bool;
+        }
+
+        let raw_cls = builder.register() as *const AnyClass as *mut c_void;
+        unsafe {
+            class_addMethod(raw_cls, objc2::sel!(start),
+                text_range_start as *const c_void, c"@@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(end),
+                text_range_end as *const c_void, c"@@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(isEmpty),
+                text_range_is_empty as *const c_void, c"B@:".as_ptr() as _);
+            CLASS = raw_cls as *const AnyClass;
+        }
+    });
+
+    unsafe { &*CLASS }
+}
+
+unsafe extern "C" fn text_range_start(this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    let ivar = (*this).class().instance_variable(c"_start").unwrap();
+    *ivar.load::<*mut AnyObject>(&*this)
+}
+
+unsafe extern "C" fn text_range_end(this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    let ivar = (*this).class().instance_variable(c"_end").unwrap();
+    *ivar.load::<*mut AnyObject>(&*this)
+}
+
+unsafe extern "C" fn text_range_is_empty(_this: *mut AnyObject, _sel: Sel) -> Bool {
+    Bool::NO
 }
 
 /// UIKeyInput deleteBackward — Backspace key
@@ -356,19 +817,31 @@ unsafe extern "C" fn autocapitalization_type(_this: *mut AnyObject, _sel: Sel) -
 
 // --- Touch handling → X11 mouse events ---
 
-/// Height of the drag handle area at the top of each window (points).
+/// Height of the drag handle area at the top of each window (points = X11 pixels at contentsScale=1.0).
 const TITLE_BAR_HEIGHT: i16 = 30;
 
-unsafe extern "C" fn touches_began(this: *mut AnyObject, _sel: Sel, touches: *mut AnyObject, _event: *mut AnyObject) {
+unsafe extern "C" fn touches_began(this: *mut AnyObject, _sel: Sel, touches: *mut AnyObject, event: *mut AnyObject) {
     let touch = get_first_touch(touches);
     if touch.is_null() { return; }
     let (x, y) = touch_location_in_view(touch, this);
     let time = get_timestamp();
 
+    // Detect mouse button from UIEvent.buttonMask (iOS 13.4+)
+    // buttonMask: 1=primary(left), 2=secondary(right), 4=middle
+    let button: u8 = if !event.is_null() {
+        let mask: i64 = msg_send![event, buttonMask];
+        if mask & 2 != 0 { 3 }      // Right click → X11 Button3
+        else if mask & 4 != 0 { 2 }  // Middle click → X11 Button2
+        else { 1 }                    // Left click → X11 Button1
+    } else { 1 };
+
     // Check if touch is in a window's title bar (top TITLE_BAR_HEIGHT pixels)
-    if let Some((native_id, layer_x, layer_y)) = find_window_titlebar_at(x, y) {
-        DRAG_STATE.with(|ds| ds.set(Some((native_id, layer_x, layer_y, x as f64, y as f64))));
-        return; // Don't send X11 events during drag
+    // Only allow drag with left button
+    if button == 1 {
+        if let Some((native_id, layer_x, layer_y)) = find_window_titlebar_at(x, y) {
+            DRAG_STATE.with(|ds| ds.set(Some((native_id, layer_x, layer_y, x as f64, y as f64))));
+            return; // Don't send X11 events during drag
+        }
     }
 
     let x11_id = find_x11_window_at(x, y);
@@ -382,9 +855,11 @@ unsafe extern "C" fn touches_began(this: *mut AnyObject, _sel: Sel, touches: *mu
     // Show keyboard when tapping an X11 window
     let _: () = msg_send![this, becomeFirstResponder];
 
+    // Store button for matching release
+    GRAB_BUTTON.with(|gb| gb.set(button));
     GRAB_WINDOW.with(|gw| gw.set(Some(x11_id)));
     send_display_event(DisplayEvent::ButtonPress {
-        window: x11_id, button: 1,
+        window: x11_id, button,
         x: win_x, y: win_y, root_x: x, root_y: y,
         state: 0, time,
     });
@@ -414,9 +889,11 @@ unsafe extern "C" fn touches_moved(this: *mut AnyObject, _sel: Sel, touches: *mu
     let (win_x, win_y) = screen_to_window_coords(x, y, x11_id);
 
     LAST_POINTER.with(|lp| lp.set((x, y)));
+    let button = GRAB_BUTTON.with(|gb| gb.get());
+    let btn_state = match button { 1 => 0x100u16, 2 => 0x200, 3 => 0x400, _ => 0x100 };
     send_display_event(DisplayEvent::MotionNotify {
         window: x11_id, x: win_x, y: win_y,
-        root_x: x, root_y: y, state: 0x100, time,
+        root_x: x, root_y: y, state: btn_state, time,
     });
 }
 
@@ -446,10 +923,13 @@ unsafe extern "C" fn touches_ended(this: *mut AnyObject, _sel: Sel, touches: *mu
     if x11_id == 0 { return; }
     let (win_x, win_y) = screen_to_window_coords(x, y, x11_id);
 
+    let button = GRAB_BUTTON.with(|gb| gb.get());
+    GRAB_BUTTON.with(|gb| gb.set(1));
+    let btn_state = match button { 1 => 0x100u16, 2 => 0x200, 3 => 0x400, _ => 0x100 };
     send_display_event(DisplayEvent::ButtonRelease {
-        window: x11_id, button: 1,
+        window: x11_id, button,
         x: win_x, y: win_y, root_x: x, root_y: y,
-        state: 0x100, time,
+        state: btn_state, time,
     });
 }
 
@@ -459,7 +939,47 @@ unsafe extern "C" fn touches_cancelled(this: *mut AnyObject, sel: Sel, touches: 
 
 // --- Hardware keyboard (UIPress) ---
 
-/// UIKit keyCode → macOS virtual keycode mapping (for hardware keyboard in simulator).
+/// UIKit keyCode → macOS virtual keycode mapping for NON-TEXT keys only.
+/// Text keys (a-z, 0-9, symbols) are handled by insertText: (like macOS interpretKeyEvents).
+/// This only maps keys that don't produce text: arrows, Escape, function keys, Return, etc.
+fn uikit_keycode_to_mac_nontext(uikit_kc: i64) -> Option<u8> {
+    // UIKeyboardHIDUsage values → macOS kVK codes (non-text keys only)
+    let mac = match uikit_kc {
+        40 => 36,  // Return
+        41 => 53,  // Escape
+        // Note: Backspace (42) is handled by deleteBackward in UIKeyInput
+        43 => 48,  // Tab
+        // Arrow keys
+        79 => 124, // RightArrow (macOS kVK=124, X11=124+8=132... wait, need correct mapping)
+        80 => 123, // LeftArrow
+        81 => 125, // DownArrow
+        82 => 126, // UpArrow
+        // Function keys
+        58 => 122, // F1
+        59 => 120, // F2
+        60 => 99,  // F3
+        61 => 118, // F4
+        62 => 96,  // F5
+        63 => 97,  // F6
+        64 => 98,  // F7
+        65 => 100, // F8
+        66 => 101, // F9
+        67 => 109, // F10
+        68 => 103, // F11
+        69 => 111, // F12
+        // Home/End/PageUp/PageDown
+        74 => 115, // Home
+        75 => 116, // PageUp
+        76 => 117, // Delete (forward)
+        77 => 119, // End
+        78 => 121, // PageDown
+        _ => return None,
+    };
+    Some(mac)
+}
+
+/// Full UIKit keyCode → macOS virtual keycode mapping (all keys including text).
+/// Used for KeyRelease only (to match KeyPress sent by insertText:).
 fn uikit_keycode_to_mac(uikit_kc: i64) -> Option<u8> {
     // UIKeyboardHIDUsage values → macOS kVK codes
     let mac = match uikit_kc {
@@ -515,6 +1035,10 @@ fn uikit_keycode_to_mac(uikit_kc: i64) -> Option<u8> {
         54 => 43,  // Comma
         55 => 47,  // Period
         56 => 44,  // Slash
+        79 => 124, // RightArrow
+        80 => 123, // LeftArrow
+        81 => 125, // DownArrow
+        82 => 126, // UpArrow
         _ => return None,
     };
     Some(mac)
@@ -534,17 +1058,43 @@ unsafe extern "C" fn presses_began(_this: *mut AnyObject, _sel: Sel, presses: *m
         if x11_id == 0 { continue; }
         let time = get_timestamp();
 
-        if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
-            let keycode = mac_kc + 8;
-            let mut state: u16 = 0;
-            if modifier_flags & (1 << 17) != 0 { state |= 1; } // Shift
-            if modifier_flags & (1 << 18) != 0 { state |= 4; } // Control
-            if modifier_flags & (1 << 19) != 0 { state |= 8; } // Alt/Option
-            if modifier_flags & (1 << 20) != 0 { state |= 64; } // Command → Mod4
+        // Suppress key events during IME composition (same as macOS doCommandBySelector check)
+        if crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) {
+            debug!("pressesBegan: suppressed keycode {} during IME composition", uikit_kc);
+            continue;
+        }
 
-            send_display_event(DisplayEvent::KeyPress {
-                window: x11_id, keycode, state, time,
-            });
+        let mut state: u16 = 0;
+        if modifier_flags & (1 << 17) != 0 { state |= 1; } // Shift
+        if modifier_flags & (1 << 18) != 0 { state |= 4; } // Control
+        if modifier_flags & (1 << 19) != 0 { state |= 8; } // Alt/Option
+        if modifier_flags & (1 << 20) != 0 { state |= 64; } // Command → Mod4
+
+        // Ctrl+key or Command+key combinations: iOS doesn't send these through insertText,
+        // so we must handle them here (e.g., Ctrl+C, Ctrl+D, Ctrl+Z for terminal).
+        let has_modifier = (state & (4 | 64)) != 0; // Control or Command
+
+        if has_modifier {
+            // With Control/Command modifier: use full keycode map (text keys too)
+            if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
+                let keycode = mac_kc + 8;
+                send_display_event(DisplayEvent::KeyPress {
+                    window: x11_id, keycode, state, time,
+                });
+            }
+        } else if uikit_kc != 42 {
+            // Skip Backspace (42) — handled by deleteBackward.
+            // Use full keycode map: in the iOS simulator (and iPad with hardware keyboard),
+            // text keys come through pressesBegan, NOT insertText:.
+            // Set HARDWARE_KB_DETECTED so insertText: knows to skip ASCII to avoid double-send.
+            if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
+                let keycode = mac_kc + 8;
+                // Store keycode so insertText: can detect duplicate and skip.
+                LAST_HW_KEYCODE.store(keycode, Ordering::Relaxed);
+                send_display_event(DisplayEvent::KeyPress {
+                    window: x11_id, keycode, state, time,
+                });
+            }
         }
     }
 }
@@ -563,16 +1113,124 @@ unsafe extern "C" fn presses_ended(_this: *mut AnyObject, _sel: Sel, presses: *m
         if x11_id == 0 { continue; }
         let time = get_timestamp();
 
-        if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
-            let keycode = mac_kc + 8;
-            let mut state: u16 = 0;
-            if modifier_flags & (1 << 17) != 0 { state |= 1; }
-            if modifier_flags & (1 << 18) != 0 { state |= 4; }
-            if modifier_flags & (1 << 19) != 0 { state |= 8; }
-            if modifier_flags & (1 << 20) != 0 { state |= 64; }
+        // Suppress KeyRelease during IME composition (same as macOS IME_COMPOSING check)
+        if crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
 
-            send_display_event(DisplayEvent::KeyRelease {
-                window: x11_id, keycode, state, time,
+        // Suppress the next KeyRelease after IME commit (same as macOS SUPPRESS_NEXT_KEYUP)
+        if crate::display::SUPPRESS_NEXT_KEYUP.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            debug!("pressesEnded: suppressed keycode {} (SUPPRESS_NEXT_KEYUP)", uikit_kc);
+            continue;
+        }
+
+        let mut state: u16 = 0;
+        if modifier_flags & (1 << 17) != 0 { state |= 1; }
+        if modifier_flags & (1 << 18) != 0 { state |= 4; }
+        if modifier_flags & (1 << 19) != 0 { state |= 8; }
+        if modifier_flags & (1 << 20) != 0 { state |= 64; }
+
+        let has_modifier = (state & (4 | 64)) != 0;
+
+        if has_modifier {
+            if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
+                let keycode = mac_kc + 8;
+                send_display_event(DisplayEvent::KeyRelease {
+                    window: x11_id, keycode, state, time,
+                });
+            }
+        } else if uikit_kc != 42 {
+            // Skip Backspace (42) — handled by deleteBackward.
+            if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
+                let keycode = mac_kc + 8;
+                send_display_event(DisplayEvent::KeyRelease {
+                    window: x11_id, keycode, state, time,
+                });
+            }
+        }
+    }
+}
+
+// --- Mouse/Pointer support (iPad with mouse/trackpad) ---
+
+/// UIHoverGestureRecognizer handler — mouse/trackpad movement → X11 MotionNotify.
+unsafe extern "C" fn handle_hover(this: *mut AnyObject, _sel: Sel, gesture: *mut AnyObject) {
+    use objc2::encode::{Encode, Encoding};
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGPoint { x: f64, y: f64 }
+    unsafe impl Encode for CGPoint {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+
+    let loc: CGPoint = msg_send![gesture, locationInView: &*this];
+    // X11 pixels = UIKit points (contentsScale=1.0), so no conversion needed.
+    let x = loc.x as i16;
+    let y = loc.y as i16;
+    let time = get_timestamp();
+
+    LAST_POINTER.with(|lp| lp.set((x, y)));
+
+    let x11_id = find_x11_window_at(x, y);
+    if x11_id == 0 { return; }
+    let (win_x, win_y) = screen_to_window_coords(x, y, x11_id);
+
+    send_display_event(DisplayEvent::MotionNotify {
+        window: x11_id, x: win_x, y: win_y,
+        root_x: x, root_y: y, state: 0, time,
+    });
+}
+
+/// UIPanGestureRecognizer handler for scroll wheel (mouse/trackpad scroll → X11 Button4/5).
+unsafe extern "C" fn handle_scroll(this: *mut AnyObject, _sel: Sel, gesture: *mut AnyObject) {
+    use objc2::encode::{Encode, Encoding};
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGPoint { x: f64, y: f64 }
+    unsafe impl Encode for CGPoint {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+
+    // Only handle changed state (ongoing scroll)
+    let state: i64 = msg_send![gesture, state];
+    if state != 1 && state != 2 { return; } // UIGestureRecognizerStateBegan=1, Changed=2
+
+    let translation: CGPoint = msg_send![gesture, translationInView: &*this];
+    // Reset translation to get delta per callback
+    let zero = CGPoint { x: 0.0, y: 0.0 };
+    let _: () = msg_send![gesture, setTranslation: zero inView: &*this];
+
+    let loc: CGPoint = msg_send![gesture, locationInView: &*this];
+    // X11 pixels = UIKit points (contentsScale=1.0), so no conversion needed.
+    let x = loc.x as i16;
+    let y = loc.y as i16;
+    let time = get_timestamp();
+
+    let x11_id = find_x11_window_at(x, y);
+    if x11_id == 0 { return; }
+    let (win_x, win_y) = screen_to_window_coords(x, y, x11_id);
+
+    // Convert pixel delta to scroll events (80px threshold like macOS)
+    static SCROLL_ACCUM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    let dy = translation.y as i32;
+    let accum = SCROLL_ACCUM.fetch_add(dy, std::sync::atomic::Ordering::Relaxed) + dy;
+
+    let threshold = 30; // Lower threshold for smoother scrolling
+    if accum.abs() >= threshold {
+        let button = if accum < 0 { 4u8 } else { 5u8 }; // 4=scroll up, 5=scroll down
+        let clicks = (accum.abs() / threshold) as u32;
+        SCROLL_ACCUM.store(accum % threshold, std::sync::atomic::Ordering::Relaxed);
+
+        for _ in 0..clicks.min(5) {
+            send_display_event(DisplayEvent::ButtonPress {
+                window: x11_id, button,
+                x: win_x, y: win_y, root_x: x, root_y: y,
+                state: 0, time,
+            });
+            send_display_event(DisplayEvent::ButtonRelease {
+                window: x11_id, button,
+                x: win_x, y: win_y, root_x: x, root_y: y,
+                state: 0, time,
             });
         }
     }
@@ -599,6 +1257,7 @@ fn touch_location_in_view(touch: *mut AnyObject, view: *mut AnyObject) -> (i16, 
 
     unsafe {
         let point: CGPoint = msg_send![&*touch, locationInView: &*view];
+        // X11 pixels = UIKit points (contentsScale=1.0), so no conversion needed.
         (point.x as i16, point.y as i16)
     }
 }
@@ -641,6 +1300,7 @@ fn find_window_titlebar_at(x: i16, y: i16) -> Option<(u64, f64, f64)> {
 }
 
 /// Move a window's CALayer to a new position using setFrame.
+/// x, y are in X11 physical pixels which map 1:1 to UIKit points (contentsScale=1.0).
 fn move_window_layer(native_id: u64, x: f64, y: f64) {
     WINDOWS.with(|w| {
         let ws = w.borrow();
@@ -821,6 +1481,87 @@ fn coalesce_putimage(commands: Vec<crate::display::RenderCommand>, win_w: u32, w
     }
 }
 
+/// Add a window as a sublayer of the main view (for multi-window in single scene).
+/// Each subsequent X11 window gets its own CALayer positioned at (x11_x, x11_y).
+fn add_window_sublayer(native_id: u64) {
+    let main_view = MAIN_VIEW.with(|mv| *mv.borrow());
+    let main_view = match main_view {
+        Some(v) => v,
+        None => {
+            ios_log(&format!("add_window_sublayer: no main view for window {}", native_id));
+            // Defer — will be handled when first window creates main view
+            WINDOWS.with(|w| {
+                if let Some(info) = w.borrow_mut().get_mut(&native_id) {
+                    info.pending_show = true;
+                }
+            });
+            return;
+        }
+    };
+
+    WINDOWS.with(|w| {
+        let mut ws = w.borrow_mut();
+        let info = match ws.get_mut(&native_id) {
+            Some(i) => i,
+            None => return,
+        };
+
+        unsafe {
+            use objc2::encode::{Encode, Encoding};
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct CGRect { origin: [f64; 2], size: [f64; 2] }
+            unsafe impl Encode for CGRect {
+                const ENCODING: Encoding = Encoding::Struct("CGRect", &[
+                    Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
+                    Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
+                ]);
+            }
+
+            // Create a CALayer for this window.
+            // X11 pixels map 1:1 to UIKit points (contentsScale=1.0).
+            let ca_cls = objc_getClass(b"CALayer\0".as_ptr());
+            let layer: *mut AnyObject = msg_send![ca_cls, layer];
+            let frame = CGRect {
+                origin: [info.x11_x as f64, info.x11_y as f64],
+                size: [info.width as f64, info.height as f64],
+            };
+            let _: () = msg_send![layer, setFrame: frame];
+
+            // Same layer config as macOS
+            let gravity = NSString::from_str("topLeft");
+            let _: () = msg_send![layer, setContentsGravity: &*gravity];
+            let _: () = msg_send![layer, setContentsScale: 1.0_f64];
+            let _: () = msg_send![layer, setMasksToBounds: true];
+
+            // Set IOSurface as initial contents
+            if !info.display_surface.is_null() {
+                let _: () = msg_send![layer, setContents: info.display_surface as *mut AnyObject];
+            }
+
+            // Add as sublayer of main_view's layer (not container's layer).
+            // UIKit manages container's sublayers and may reorder them,
+            // hiding manually-added layers behind view-backed layers.
+            // Using main_view's layer ensures our sublayer renders on top
+            // of the primary window's IOSurface content.
+            let parent_layer: *mut AnyObject = msg_send![main_view, layer];
+            if !parent_layer.is_null() {
+                // Explicit zPosition to ensure sublayer is above the layer's contents
+                let _: () = msg_send![layer, setZPosition: 1.0_f64];
+                let _: () = msg_send![parent_layer, addSublayer: layer];
+            }
+
+            let _: *mut AnyObject = msg_send![layer, retain];
+            info.ca_layer = layer;
+            // Reuse main view for input events (single responder)
+            info.ui_view = main_view;
+
+            ios_log(&format!("add_window_sublayer: id={} {}x{} at ({},{})",
+                native_id, info.width, info.height, info.x11_x, info.x11_y));
+        }
+    });
+}
+
 // --- CoreAnimation FFI ---
 extern "C" {
     fn objc_getClass(name: *const u8) -> *mut AnyObject;
@@ -835,21 +1576,7 @@ fn ca_transaction_flush() {
     }
 }
 
-// CoreGraphics FFI for CGImage-based rendering on iOS
-extern "C" {
-    fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
-    fn CGColorSpaceRelease(cs: *mut c_void);
-    fn CGImageCreate(
-        width: usize, height: usize, bits_per_component: usize,
-        bits_per_pixel: usize, bytes_per_row: usize, space: *mut c_void,
-        bitmap_info: u32, provider: *mut c_void, decode: *const f64,
-        should_interpolate: bool, intent: u32,
-    ) -> *mut c_void;
-    fn CGImageRelease(image: *mut c_void);
-    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *mut c_void;
-    fn CGDataProviderCreateWithCFData(data: *mut c_void) -> *mut c_void;
-    fn CGDataProviderRelease(provider: *mut c_void);
-}
+// CGImage FFI removed — using zero-copy IOSurface as CALayer contents (same as macOS)
 
 /// Try to claim the main scene's UIWindow for an X11 window.
 /// This is the iOS equivalent of macOS creating the NSWindow: we reuse the auto-created
@@ -870,11 +1597,15 @@ fn claim_main_scene(native_id: u64, info: &mut WindowInfo) -> bool {
         let mut mw = mw.borrow_mut();
         if let Some(main_win) = mw.take() {
             unsafe {
-                // Same screen clamp as macOS (macos.rs:1767-1781)
+                // Same screen clamp as macOS (macos.rs:1767-1781).
+                // X11 pixels map 1:1 to UIKit points (contentsScale=1.0).
                 let screen: *mut AnyObject = msg_send![objc2::class!(UIScreen), mainScreen];
                 let screen_bounds: CGRect = msg_send![screen, bounds];
                 let mut pt_w = info.width as f64;
                 let mut pt_h = info.height as f64;
+                // Screen bounds are in points; at 2x scale a 1366pt screen = 2732px.
+                // Since we report physical pixels to X11, xterm creates a 484px window
+                // which maps to 484pt here. Clamp to screen bounds in points.
                 let max_w = screen_bounds.size[0];
                 let max_h = screen_bounds.size[1] - 30.0;
                 if pt_w > max_w || pt_h > max_h {
@@ -988,7 +1719,22 @@ fn setup_window_in_scene(native_id: u64) {
             };
             let _: () = msg_send![win, setFrame: scene_bounds];
 
-            // Create PSLXView at X11 window size (positioned at top-left of UIWindow)
+            // Get the screen scale factor to convert X11 pixel coordinates to UIKit points.
+            // X11 coordinates are now in physical pixels (hidpi.rs multiplies by nativeScale),
+            // so UIView frames must be in points = pixels / scale.
+            let main_screen: *mut AnyObject = msg_send![objc2::class!(UIScreen), mainScreen];
+            let display_scale: f64 = if !main_screen.is_null() {
+                let s: f64 = msg_send![main_screen, nativeScale];
+                if s > 0.0 { s } else { 2.0 }
+            } else { 2.0 };
+
+            // Create PSLXView at X11 window size in points.
+            // X11 pixels map 1:1 to UIKit points — we render the IOSurface at its
+            // natural pixel size. On a 2x Retina display, the view will appear at
+            // half the physical pixel count (e.g. 484pt wide on a 2732px/1366pt screen)
+            // which gives a reasonable window size. contentsScale=1.0 means 1 IOSurface
+            // pixel = 1 point on screen (displayed at 50% of physical resolution on 2x,
+            // i.e. 2 physical pixels per content pixel — looks crisp but not 4K).
             let view_cls = get_pslx_view_class();
             let view: *mut AnyObject = msg_send![view_cls, alloc];
             let view_frame = CGRect {
@@ -997,7 +1743,8 @@ fn setup_window_in_scene(native_id: u64) {
             };
             let view: *mut AnyObject = msg_send![view, initWithFrame: view_frame];
 
-            // Layer config (same as macOS: topLeft gravity, contentsScale=1.0, masksToBounds)
+            // Layer config: topLeft gravity, contentsScale=1.0 (IOSurface pixel = 1 point),
+            // masksToBounds to clip content to view bounds.
             let layer: *mut AnyObject = msg_send![view, layer];
             if !layer.is_null() {
                 let gravity = NSString::from_str("topLeft");
@@ -1022,11 +1769,39 @@ fn setup_window_in_scene(native_id: u64) {
             let _: () = msg_send![vc, setView: container];
             let _: () = msg_send![win, setRootViewController: vc];
 
+            // Add UIHoverGestureRecognizer for mouse/trackpad movement → X11 MotionNotify
+            let hover_cls = objc2::class!(UIHoverGestureRecognizer);
+            let hover: *mut AnyObject = msg_send![hover_cls, alloc];
+            let hover: *mut AnyObject = msg_send![hover, initWithTarget: view action: objc2::sel!(handleHover:)];
+            let _: () = msg_send![view, addGestureRecognizer: hover];
+
+            // Add UIPanGestureRecognizer for mouse scroll → X11 Button4/5
+            let pan_cls = objc2::class!(UIPanGestureRecognizer);
+            let pan: *mut AnyObject = msg_send![pan_cls, alloc];
+            let pan: *mut AnyObject = msg_send![pan, initWithTarget: view action: objc2::sel!(handleScroll:)];
+            // allowedScrollTypesMask = UIScrollTypeMaskContinuous (1 << 0)
+            let _: () = msg_send![pan, setAllowedScrollTypesMask: 1i64];
+            // Don't interfere with touch dragging
+            let _: () = msg_send![pan, setMaximumNumberOfTouches: 0usize];
+            let _: () = msg_send![view, addGestureRecognizer: pan];
+
             // White background fills entire scene (xterm content overlays at top-left)
             let white_color: *mut AnyObject = msg_send![objc2::class!(UIColor), whiteColor];
             let _: () = msg_send![win, setBackgroundColor: white_color];
             // Make window non-opaque so scene background doesn't show through
             let _: () = msg_send![win, setOpaque: false];
+
+            // Remove rounded corners — X11 windows must be sharp rectangles
+            let win_layer: *mut AnyObject = msg_send![win, layer];
+            if !win_layer.is_null() {
+                let _: () = msg_send![win_layer, setCornerRadius: 0.0_f64];
+                let _: () = msg_send![win_layer, setMasksToBounds: true];
+            }
+            // Also remove corner radius from the container and content view
+            let container_layer: *mut AnyObject = msg_send![container, layer];
+            if !container_layer.is_null() {
+                let _: () = msg_send![container_layer, setCornerRadius: 0.0_f64];
+            }
 
             // Hidden until ShowWindow (like macOS visible=false)
             let _: () = msg_send![win, setHidden: true];
@@ -1045,11 +1820,17 @@ fn setup_window_in_scene(native_id: u64) {
             info.ui_view = view;
             info.ca_layer = layer;
 
+            // Store main view for sublayer-based windows to attach to
+            let _: *mut AnyObject = msg_send![view, retain];
+            MAIN_VIEW.with(|mv| *mv.borrow_mut() = Some(view));
+
             // If ShowWindow was called before we had a UIWindow, show it now
             if info.pending_show || info.visible {
                 let _: () = msg_send![win, setHidden: false];
                 let _: () = msg_send![win, makeKeyAndVisible];
                 flush_window_to_layer(layer, info.display_surface);
+                // Make view first responder for hardware keyboard
+                let _: () = msg_send![view, becomeFirstResponder];
                 info.pending_show = false;
                 info.visible = true;
                 ios_log(&format!("setup_window_in_scene: id={} {}x{} scene={:p} (deferred show)",
@@ -1068,47 +1849,16 @@ thread_local! {
     static PENDING_SCENE_MAP: RefCell<Vec<(u64, *mut AnyObject)>> = RefCell::new(Vec::new());
 }
 
-/// Push IOSurface pixels to CALayer via CGImage.
-/// On macOS, setContents:IOSurface works directly (zero-copy). On iOS, IOSurface as
-/// layer contents has Y-axis flip issues, so we go through CGImage which handles
-/// coordinate conversion correctly.
+/// Push IOSurface to CALayer — zero-copy (same as macOS).
+/// setContents: with IOSurface works on iOS (CALayer accepts it directly).
 fn flush_window_to_layer(layer: *mut AnyObject, surface: *mut c_void) {
     if surface.is_null() || layer.is_null() { return; }
     unsafe {
-        let width = IOSurfaceGetWidth(surface);
-        let height = IOSurfaceGetHeight(surface);
-        let bytes_per_row = IOSurfaceGetBytesPerRow(surface);
-
-        IOSurfaceLock(surface, 1, std::ptr::null_mut()); // read-only lock
-        let base = IOSurfaceGetBaseAddress(surface) as *const u8;
-        let data_len = bytes_per_row * height;
-
-        let cf_data = CFDataCreate(std::ptr::null(), base, data_len as isize);
-        IOSurfaceUnlock(surface, 1, std::ptr::null_mut());
-        if cf_data.is_null() { return; }
-
-        let colorspace = CGColorSpaceCreateDeviceRGB();
-        let provider = CGDataProviderCreateWithCFData(cf_data);
-        CFRelease(cf_data);
-
-        // BGRA premultiplied alpha (same pixel format as IOSurface)
-        let bitmap_info: u32 = 0x2006;
-        let image = CGImageCreate(
-            width, height, 8, 32, bytes_per_row,
-            colorspace, bitmap_info,
-            provider, std::ptr::null(), false, 0,
-        );
-        CGDataProviderRelease(provider);
-        CGColorSpaceRelease(colorspace);
-
-        if !image.is_null() {
-            let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
-            let _: () = msg_send![ca_cls, begin];
-            let _: () = msg_send![ca_cls, setDisableActions: true];
-            let _: () = msg_send![layer, setContents: image as *mut AnyObject];
-            let _: () = msg_send![ca_cls, commit];
-            CGImageRelease(image);
-        }
+        let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
+        let _: () = msg_send![ca_cls, begin];
+        let _: () = msg_send![ca_cls, setDisableActions: true];
+        let _: () = msg_send![layer, setContents: surface as *mut AnyObject];
+        let _: () = msg_send![ca_cls, commit];
     }
 }
 
@@ -1143,6 +1893,7 @@ fn request_new_scene(native_window_id: u64) {
 /// Resize a UIScene's Stage Manager window to match the X11 window dimensions.
 /// Uses UIWindowScene.sizeRestrictions (iPadOS 16+) to constrain the window size,
 /// then requestGeometryUpdate to apply it.
+/// width/height are X11 dimensions in pixels = UIKit points (contentsScale=1.0 mapping).
 unsafe fn resize_scene_to_x11(ui_window: *mut AnyObject, width: u16, height: u16) {
     let scene: *mut AnyObject = msg_send![ui_window, windowScene];
     if scene.is_null() { return; }
@@ -1203,6 +1954,7 @@ fn resize_scene_to_content() {
 
     if max_right <= 0 || max_bottom <= 0 { return; }
 
+    // X11 pixels map 1:1 to UIKit points (contentsScale=1.0).
     let w = max_right as f64;
     let h = max_bottom as f64;
 
@@ -1239,6 +1991,24 @@ extern "C" fn timer_callback(_timer: *mut c_void, _info: *mut c_void) {
         ios_log("timer_callback: first tick");
     }
     process_commands();
+
+    // Apply pending keyboard resize (deferred to allow child windows to exist)
+    if let Some((w, h)) = PENDING_RESIZE.with(|pr| pr.get()) {
+        // Only apply after a short delay (30 ticks ≈ 0.5s at 60fps) so child windows exist
+        static RESIZE_COUNTDOWN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+        let val = RESIZE_COUNTDOWN.load(std::sync::atomic::Ordering::Relaxed);
+        if val == -1 {
+            // Start countdown
+            RESIZE_COUNTDOWN.store(30, std::sync::atomic::Ordering::Relaxed);
+        } else if val > 0 {
+            RESIZE_COUNTDOWN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            // Countdown done, apply resize
+            PENDING_RESIZE.with(|pr| pr.set(None));
+            RESIZE_COUNTDOWN.store(-1, std::sync::atomic::Ordering::Relaxed);
+            resize_primary_window(w, h);
+        }
+    }
 }
 
 fn process_commands() {
@@ -1257,7 +2027,8 @@ fn process_commands() {
     RENDER_MAILBOX.with(|mb| {
         let mb = mb.borrow();
         if let Some(ref mailbox) = *mb {
-            if mailbox.is_empty() { return; }
+            // Note: do NOT call mailbox.is_empty() — it locks all 16 DashMap shards,
+            // causing heavy contention with the protocol thread's write lock.
             WINDOWS.with(|w| {
                 let mut ws = w.borrow_mut();
                 let win_ids: Vec<u64> = ws.keys().copied().collect();
@@ -1337,6 +2108,38 @@ fn process_commands() {
                         let n_windows = ws.len();
                         let n_visible = ws.values().filter(|i| i.visible).count();
                         ios_log(&format!("render #{}: {} windows, {} visible", cnt, n_windows, n_visible));
+                        // Debug: dump window info to file
+                        if cnt < 5 || (n_windows > 1 && cnt < 300) {
+                            let mut debug = String::new();
+                            for (id, info) in ws.iter() {
+                                debug.push_str(&format!("  id={} x11=0x{:08X} {}x{} at ({},{}) vis={} layer={:?} uiwin={:?}\n",
+                                    id, info.x11_id, info.width, info.height,
+                                    info.x11_x, info.x11_y, info.visible,
+                                    info.ca_layer.is_null(), info.ui_window.is_null()));
+                            }
+                            // Also check sublayer count on container
+                            let main_view_ptr = MAIN_VIEW.with(|mv| *mv.borrow());
+                            if let Some(mv) = main_view_ptr {
+                                unsafe {
+                                    let container: *mut AnyObject = msg_send![mv, superview];
+                                    if !container.is_null() {
+                                        let clayer: *mut AnyObject = msg_send![container, layer];
+                                        let sublayers: *mut AnyObject = msg_send![clayer, sublayers];
+                                        let sublayer_count: usize = if !sublayers.is_null() {
+                                            msg_send![sublayers, count]
+                                        } else { 0 };
+                                        debug.push_str(&format!("  container.layer sublayers: {}\n", sublayer_count));
+                                    }
+                                    let vlayer: *mut AnyObject = msg_send![mv, layer];
+                                    let vsublayers: *mut AnyObject = msg_send![vlayer, sublayers];
+                                    let vsub_count: usize = if !vsublayers.is_null() {
+                                        msg_send![vsublayers, count]
+                                    } else { 0 };
+                                    debug.push_str(&format!("  main_view.layer sublayers: {}\n", vsub_count));
+                                }
+                            }
+                            let _ = std::fs::write("/tmp/pslx_render_debug.txt", debug);
+                        }
                     }
                     ca_transaction_flush();
                 }
@@ -1395,24 +2198,21 @@ fn handle_command(cmd: DisplayCommand) {
                 });
             });
 
-            // Check if the initial scene is still unclaimed
-            let main_scene_available = MAIN_SCENE.with(|ms| ms.borrow().is_some());
-            let main_window_used = MAIN_UI_WINDOW.with(|mw| mw.borrow().is_none());
-            // MAIN_UI_WINDOW is None when available (set to None after claim),
-            // so we check MAIN_SCENE is set AND no window has claimed it yet.
+            // Single-scene approach: all X11 windows share the initial scene.
+            // Each window gets its own CALayer positioned at (x11_x, x11_y) as a sublayer
+            // of the main view's layer. First window creates UIWindow in the scene;
+            // subsequent windows just add a sublayer.
             let first_window = WINDOWS.with(|w| w.borrow().len() == 1);
 
-            if main_scene_available && first_window {
-                // First X11 window: claim the initial scene that iOS gave us at launch.
-                // Create UIWindow in the existing scene (like macOS first NSWindow).
+            if first_window {
+                // First X11 window: create UIWindow in the initial scene.
                 setup_window_in_scene(id);
-                ios_log(&format!("CreateWindow: id={} x11=0x{:08X} {}x{} (claimed initial scene)",
+                ios_log(&format!("CreateWindow: id={} x11=0x{:08X} {}x{} (initial scene)",
                     id, x11_id, width, height));
             } else {
-                // Subsequent X11 windows: request a new UIWindowScene.
-                // scene_will_connect will pick up the window ID and create UIWindow there.
-                request_new_scene(id);
-                ios_log(&format!("CreateWindow: id={} x11=0x{:08X} {}x{} (requesting new scene)",
+                // Subsequent X11 windows: add a sublayer to the existing main view.
+                add_window_sublayer(id);
+                ios_log(&format!("CreateWindow: id={} x11=0x{:08X} {}x{} (sublayer)",
                     id, x11_id, width, height));
             }
 
@@ -1425,25 +2225,36 @@ fn handle_command(cmd: DisplayCommand) {
                 if let Some(info) = w.borrow_mut().get_mut(&handle.id) {
                     info.visible = visible;
                     if visible {
-                        if info.ui_window.is_null() {
-                            // UIWindow not yet created (scene_will_connect hasn't fired).
-                            // Defer — setup_window_in_scene will show it.
-                            info.pending_show = true;
-                            ios_log(&format!("ShowWindow: id={} deferred (no UIWindow yet)", handle.id));
-                            Some((info.x11_id, info.width, info.height))
-                        } else {
-                            // Show the per-window UIWindow (like macOS makeKeyAndOrderFront)
-                            unsafe {
-                                let _: () = msg_send![info.ui_window, setHidden: false];
-                                let _: () = msg_send![info.ui_window, makeKeyAndVisible];
+                        if !info.ca_layer.is_null() {
+                            // Window has a layer (either UIWindow-based or sublayer)
+                            if !info.ui_window.is_null() {
+                                unsafe {
+                                    let _: () = msg_send![info.ui_window, setHidden: false];
+                                    let _: () = msg_send![info.ui_window, makeKeyAndVisible];
+                                }
+                            } else {
+                                // Sublayer: make it visible
+                                unsafe {
+                                    let _: () = msg_send![info.ca_layer, setHidden: false];
+                                }
                             }
                             flush_window_to_layer(info.ca_layer, info.display_surface);
-                            Some((info.x11_id, info.width, info.height))
+                            Some((info.x11_id, info.width, info.height, info.ui_view))
+                        } else {
+                            // No layer yet — defer
+                            info.pending_show = true;
+                            ios_log(&format!("ShowWindow: id={} deferred (no layer yet)", handle.id));
+                            Some((info.x11_id, info.width, info.height, std::ptr::null_mut::<AnyObject>()))
                         }
                     } else {
+                        // Hide
                         if !info.ui_window.is_null() {
                             unsafe {
                                 let _: () = msg_send![info.ui_window, setHidden: true];
+                            }
+                        } else if !info.ca_layer.is_null() {
+                            unsafe {
+                                let _: () = msg_send![info.ca_layer, setHidden: true];
                             }
                         }
                         None
@@ -1452,7 +2263,14 @@ fn handle_command(cmd: DisplayCommand) {
                     None
                 }
             });
-            if let Some((x11_id, w, h)) = show_info {
+            if let Some((x11_id, w, h, view)) = show_info {
+                // Make view first responder for hardware keyboard input
+                if !view.is_null() {
+                    unsafe {
+                        let _: () = msg_send![view, becomeFirstResponder];
+                    }
+                    ios_log(&format!("ShowWindow: id={} becomeFirstResponder", handle.id));
+                }
                 send_display_event(DisplayEvent::FocusIn { window: x11_id });
                 ios_log(&format!("ShowWindow: id={} x11=0x{:08X} {}x{}",
                     handle.id, x11_id, w, h));
@@ -1471,8 +2289,19 @@ fn handle_command(cmd: DisplayCommand) {
             WINDOWS.with(|w| {
                 if let Some(info) = w.borrow_mut().remove(&handle.id) {
                     unsafe {
+                        if !info.ca_layer.is_null() {
+                            let _: () = msg_send![info.ca_layer, removeFromSuperlayer];
+                            let _: () = msg_send![info.ca_layer, release];
+                        }
                         if !info.ui_window.is_null() {
                             let _: () = msg_send![info.ui_window, setHidden: true];
+                            let _: () = msg_send![info.ui_window, release];
+                        }
+                        if !info.surface.is_null() {
+                            CFRelease(info.surface);
+                        }
+                        if !info.display_surface.is_null() {
+                            CFRelease(info.display_surface);
                         }
                     }
                 }
@@ -1527,6 +2356,28 @@ fn handle_command(cmd: DisplayCommand) {
                         info.width = width;
                         info.height = height;
                     }
+
+                    // Update sublayer frame position/size
+                    if !info.ca_layer.is_null() && info.ui_window.is_null() {
+                        unsafe {
+                            use objc2::encode::{Encode, Encoding};
+                            #[repr(C)]
+                            #[derive(Copy, Clone)]
+                            struct CGRect { origin: [f64; 2], size: [f64; 2] }
+                            unsafe impl Encode for CGRect {
+                                const ENCODING: Encoding = Encoding::Struct("CGRect", &[
+                                    Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
+                                    Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
+                                ]);
+                            }
+                            let frame = CGRect {
+                                origin: [info.x11_x as f64, info.x11_y as f64],
+                                size: [info.width as f64, info.height as f64],
+                            };
+                            let _: () = msg_send![info.ca_layer, setFrame: frame];
+                        }
+                    }
+
                     Some(info.x11_id)
                 } else {
                     None
@@ -1871,7 +2722,198 @@ unsafe extern "C" fn scene_will_connect(
         MAIN_SCENE.with(|ms| *ms.borrow_mut() = Some(scene));
         ios_log(&format!("scene_will_connect: initial scene saved (screen={}x{})",
             bounds.size[0], bounds.size[1]));
+
+        // Register for keyboard show/hide notifications
+        register_keyboard_observers();
     }
+}
+
+/// Register NSNotificationCenter observers for keyboard frame changes.
+/// When the keyboard appears/disappears, we resize the first X11 window
+/// to fit the available space above the keyboard.
+fn register_keyboard_observers() {
+    unsafe {
+        let center: *mut AnyObject = msg_send![objc2::class!(NSNotificationCenter), defaultCenter];
+
+        // UIKeyboardWillChangeFrameNotification gives us the final keyboard frame
+        let notif_name = NSString::from_str("UIKeyboardWillChangeFrameNotification");
+
+        // Register class that handles keyboard notifications
+        let cls = {
+            let existing = objc_getClass(b"PSLXKeyboardObserver\0".as_ptr());
+            if existing.is_null() {
+                let superclass = objc2::class!(NSObject);
+                let mut builder = ClassBuilder::new(c"PSLXKeyboardObserver", superclass)
+                    .expect("Failed to create PSLXKeyboardObserver class");
+                unsafe extern "C" fn keyboard_changed(_this: *mut AnyObject, _sel: Sel, notification: *mut AnyObject) {
+                    handle_keyboard_notification(notification);
+                }
+                builder.add_method(
+                    objc2::sel!(keyboardChanged:),
+                    keyboard_changed as unsafe extern "C" fn(_, _, _),
+                );
+                builder.register() as *const AnyClass
+            } else {
+                existing as *const AnyClass
+            }
+        };
+
+        let observer: *mut AnyObject = msg_send![cls, alloc];
+        let observer: *mut AnyObject = msg_send![observer, init];
+        let _: *mut AnyObject = msg_send![observer, retain]; // prevent dealloc
+
+        let _: () = msg_send![center,
+            addObserver: observer
+            selector: objc2::sel!(keyboardChanged:)
+            name: &*notif_name
+            object: std::ptr::null::<AnyObject>()
+        ];
+        info!("Registered keyboard frame observer");
+    }
+}
+
+/// Handle UIKeyboardWillChangeFrameNotification.
+/// Extracts the keyboard end frame and resizes the first X11 window accordingly.
+fn handle_keyboard_notification(notification: *mut AnyObject) {
+    if notification.is_null() { return; }
+
+    unsafe {
+        use objc2::encode::{Encode, Encoding};
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct CGRect { origin: [f64; 2], size: [f64; 2] }
+        unsafe impl Encode for CGRect {
+            const ENCODING: Encoding = Encoding::Struct("CGRect", &[
+                Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
+                Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
+            ]);
+        }
+
+        let user_info: *mut AnyObject = msg_send![notification, userInfo];
+        if user_info.is_null() { return; }
+
+        let key = NSString::from_str("UIKeyboardFrameEndUserInfoKey");
+        let value: *mut AnyObject = msg_send![user_info, objectForKey: &*key];
+        if value.is_null() { return; }
+
+        let end_frame: CGRect = msg_send![value, CGRectValue];
+        let screen_h = SCREEN_HEIGHT.with(|sh| sh.get());
+        let screen_w = SCREEN_WIDTH.with(|sw| sw.get());
+
+        // Keyboard height = screen height - keyboard frame origin Y
+        // When keyboard is hidden, end_frame.origin.y == screen_h
+        let kb_height = (screen_h - end_frame.origin[1]).max(0.0);
+        let old_kb_height = KEYBOARD_HEIGHT.with(|kh| kh.get());
+
+        if (kb_height - old_kb_height).abs() < 1.0 { return; } // no change
+
+        KEYBOARD_HEIGHT.with(|kh| kh.set(kb_height));
+        let available_h = (screen_h - kb_height) as u16;
+        let available_w = screen_w as u16;
+
+        ios_log(&format!("keyboard frame changed: kb_h={:.0} available={}x{}",
+            kb_height, available_w, available_h));
+
+        // Don't resize immediately — child windows may not exist yet.
+        // Store the pending size; the timer tick will apply it.
+        // TODO: re-enable after debugging multi-window
+        // PENDING_RESIZE.with(|pr| pr.set(Some((available_w, available_h))));
+    }
+}
+
+/// Resize the primary (first) X11 window to the given dimensions.
+/// Sends ConfigureNotify + Expose so the X11 client (e.g. xterm) reflows.
+fn resize_primary_window(new_width: u16, new_height: u16) {
+    WINDOWS.with(|w| {
+        let mut ws = w.borrow_mut();
+        // Find the first window (id=1) which is the primary UIWindow-backed one
+        if let Some(info) = ws.get_mut(&1) {
+            if info.width == new_width && info.height == new_height { return; }
+
+            let old_w = info.width;
+            let old_h = info.height;
+            info.width = new_width;
+            info.height = new_height;
+
+            // Create new IOSurfaces at the new size
+            let new_surface = create_iosurface(new_width, new_height);
+            let new_display = create_iosurface(new_width, new_height);
+            if new_surface.is_null() || new_display.is_null() { return; }
+
+            // Copy old content to new surfaces
+            unsafe {
+                for (old_s, new_s) in [(info.surface, new_surface), (info.display_surface, new_display)] {
+                    IOSurfaceLock(new_s, 0, std::ptr::null_mut());
+                    IOSurfaceLock(old_s, 0, std::ptr::null_mut());
+                    let src = IOSurfaceGetBaseAddress(old_s) as *const u8;
+                    let dst = IOSurfaceGetBaseAddress(new_s) as *mut u8;
+                    let src_stride = IOSurfaceGetBytesPerRow(old_s);
+                    let dst_stride = IOSurfaceGetBytesPerRow(new_s);
+                    let copy_h = old_h.min(new_height) as usize;
+                    let copy_w = (old_w.min(new_width) as usize) * 4;
+                    for row in 0..copy_h {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(row * src_stride),
+                            dst.add(row * dst_stride),
+                            copy_w,
+                        );
+                    }
+                    IOSurfaceUnlock(old_s, 0, std::ptr::null_mut());
+                    IOSurfaceUnlock(new_s, 0, std::ptr::null_mut());
+                }
+                // Release old surfaces (IOSurface is refcounted via CFRelease)
+                CFRelease(info.surface);
+                CFRelease(info.display_surface);
+            }
+            info.surface = new_surface;
+            info.display_surface = new_display;
+
+            // Update the view/layer frame
+            if !info.ui_view.is_null() {
+                unsafe {
+                    use objc2::encode::{Encode, Encoding};
+                    #[repr(C)]
+                    #[derive(Copy, Clone)]
+                    struct CGRect { origin: [f64; 2], size: [f64; 2] }
+                    unsafe impl Encode for CGRect {
+                        const ENCODING: Encoding = Encoding::Struct("CGRect", &[
+                            Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
+                            Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
+                        ]);
+                    }
+                    let frame = CGRect {
+                        origin: [0.0, 0.0],
+                        size: [new_width as f64, new_height as f64],
+                    };
+                    let _: () = msg_send![info.ui_view, setFrame: frame];
+                }
+            }
+
+            // Flush new surface to layer
+            flush_window_to_layer(info.ca_layer, info.display_surface);
+
+            let x11_id = info.x11_id;
+                ios_log(&format!("resize_primary_window: {}x{} -> {}x{} x11=0x{:08X}",
+                old_w, old_h, new_width, new_height, x11_id));
+
+            // Send ConfigureNotify + Expose to the X11 client so it reflows
+            send_display_event(DisplayEvent::ConfigureNotify {
+                window: x11_id,
+                x: 0,
+                y: 0,
+                width: new_width,
+                height: new_height,
+            });
+            send_display_event(DisplayEvent::Expose {
+                window: x11_id,
+                x: 0,
+                y: 0,
+                width: new_width,
+                height: new_height,
+                count: 0,
+            });
+        }
+    });
 }
 
 /// Build a keyboard map for iOS (simplified — no UCKeyTranslate on iOS).
@@ -1986,6 +3028,7 @@ pub fn run_ios_app(
     let _ = get_app_delegate_class();
     let _ = get_scene_delegate_class();
     let _ = get_pslx_view_class();
+    let _ = get_text_range_class();
 
     unsafe {
         UIApplicationMain(
