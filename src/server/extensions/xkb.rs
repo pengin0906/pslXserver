@@ -250,36 +250,25 @@ async fn handle_get_map<S: AsyncRead + AsyncWrite + Unpin>(
                 crate::server::connection::evdev_keycode_to_keysym(evdev)
             };
 
-            // Determine key type
-            let is_alpha = normal >= 0x0061 && normal <= 0x007A; // a-z
-            let type_idx: u8 = if is_alpha {
-                2 // ALPHABETIC
-            } else if normal != shifted && shifted != 0 {
-                1 // TWO_LEVEL
-            } else {
-                0 // ONE_LEVEL
-            };
-
-            let width: u8 = if type_idx == 0 { 1 } else { 2 };
-            let n_syms_this: u16 = width as u16;
+            // All keys use TWO_LEVEL type (width=2) for uniform entry size.
+            // This avoids variable-length entries that can cause parser misalignment.
+            let shifted_ks = if shifted != 0 { shifted } else { normal };
 
             // kt_index[4] — key type for each of 4 groups
-            syms_data.push(type_idx);
+            syms_data.push(1); // type 1 = TWO_LEVEL for all
             syms_data.push(0);
             syms_data.push(0);
             syms_data.push(0);
             // group_info: numGroups=1 (bits 0-3)
             syms_data.push(1);
             // width
-            syms_data.push(width);
+            syms_data.push(2); // always 2
             // n_syms (u16)
-            write_u16_to(conn, &mut syms_data, n_syms_this);
-            // keysyms
+            write_u16_to(conn, &mut syms_data, 2);
+            // keysyms (always 2 per key)
             write_u32_to(conn, &mut syms_data, normal);
-            if width == 2 {
-                write_u32_to(conn, &mut syms_data, shifted);
-            }
-            total_syms += n_syms_this;
+            write_u32_to(conn, &mut syms_data, shifted_ks);
+            total_syms += 2;
         }
     }
 
