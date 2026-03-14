@@ -240,12 +240,14 @@ async fn handle_get_map<S: AsyncRead + AsyncWrite + Unpin>(
     if want_syms {
         let vk = server.virtual_keysyms.read();
         for keycode in MIN_KEYCODE..=MAX_KEYCODE {
-            let mac_key = (keycode as u32).wrapping_sub(8);
-            let (normal, shifted) = if keycode >= 200 {
-                let idx = (keycode as usize) - 200;
+            let (normal, shifted) = if (keycode as u32) >= 136 {
+                // Virtual keycodes for IME Unicode keysyms
+                let idx = (keycode as usize) - 136;
                 if idx < vk.len() { (vk[idx], vk[idx]) } else { (0, 0) }
             } else {
-                macos_keycode_to_keysym(mac_key)
+                // evdev-based keymap (same as GetKeyboardMapping)
+                let evdev = (keycode as u32).wrapping_sub(8);
+                crate::server::connection::evdev_keycode_to_keysym(evdev)
             };
 
             // Determine key type
@@ -283,15 +285,16 @@ async fn handle_get_map<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Build ModifierMap
     let mut modmap_data = Vec::new();
+    // evdev keycodes + 8 = X11 keycodes
     let modifier_keycodes: &[(u8, u8)] = &[
-        (64, 1),  // Shift_L → ShiftMask
-        (68, 1),  // Shift_R → ShiftMask
-        (65, 2),  // CapsLock → LockMask
-        (67, 4),  // Control_L → ControlMask
-        (70, 4),  // Control_R → ControlMask
-        (66, 8),  // Alt_L → Mod1Mask
-        (69, 8),  // Alt_R → Mod1Mask
-        (63, 64), // Super_L → Mod4Mask
+        (50, 1),   // Shift_L (evdev 42+8) → ShiftMask
+        (62, 1),   // Shift_R (evdev 54+8) → ShiftMask
+        (66, 2),   // CapsLock (evdev 58+8) → LockMask
+        (37, 4),   // Control_L (evdev 29+8) → ControlMask
+        (105, 4),  // Control_R (evdev 97+8) → ControlMask
+        (64, 8),   // Alt_L (evdev 56+8) → Mod1Mask
+        (108, 8),  // Alt_R (evdev 100+8) → Mod1Mask
+        (133, 64), // Super_L (evdev 125+8) → Mod4Mask
     ];
     let n_mod_map_keys: u8;
     let first_mod_map_key: u8;

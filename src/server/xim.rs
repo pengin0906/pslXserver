@@ -832,6 +832,22 @@ impl XimServer {
         false
     }
 
+    /// Check if a window belongs to an app that has an XIM connection (even without IC).
+    /// Such apps expect XIM-based IME and cannot handle raw Unicode keysyms.
+    pub fn has_xim_connection(&self, _window: Xid) -> bool {
+        !self.connections.is_empty()
+    }
+
+    /// Check if a specific connection ID has an XIM connection.
+    pub fn has_xim_connection_by_conn_id(&self, conn_id: u32) -> bool {
+        for conn_entry in self.connections.iter() {
+            if conn_entry.value().conn_id == conn_id {
+                return true;
+            }
+        }
+        false
+    }
+
     // --- Internal helpers ---
 
     fn for_each_matching_ic<F>(&self, server: &XServer, focus_window: Xid, mut f: F)

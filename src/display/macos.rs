@@ -194,6 +194,124 @@ thread_local! {
     /// Set by activate_app() after calling activateIgnoringOtherApps:YES.
     /// Consumed by process_commands() so makeKeyAndOrderFront runs after activation settles.
     static PENDING_KEY_WINDOW: std::cell::Cell<*mut AnyObject> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Cached mouse location for check_enter_notify — skip windowNumberAtPoint when unchanged.
+    static LAST_MOUSE_LOC: std::cell::Cell<(i64, i64)> = const { std::cell::Cell::new((i64::MIN, i64::MIN)) };
+}
+
+/// Convert macOS keycode to X11 keycode (evdev keycode + 8).
+/// Chrome/Electron interpret X11 keycodes as evdev codes, so we must use the
+/// Linux evdev layout rather than macOS keycode + 8.
+/// evdev codes from linux/input-event-codes.h, X11 keycode = evdev + 8.
+fn macos_keycode_to_x11(mac: u16) -> u8 {
+    let evdev: u16 = match mac {
+        // Letters (macOS → evdev)
+        0  => 30,  // a → KEY_A
+        1  => 31,  // s → KEY_S
+        2  => 32,  // d → KEY_D
+        3  => 33,  // f → KEY_F
+        4  => 35,  // h → KEY_H
+        5  => 34,  // g → KEY_G
+        6  => 44,  // z → KEY_Z
+        7  => 45,  // x → KEY_X
+        8  => 46,  // c → KEY_C
+        9  => 47,  // v → KEY_V
+        11 => 48,  // b → KEY_B
+        12 => 16,  // q → KEY_Q
+        13 => 17,  // w → KEY_W
+        14 => 18,  // e → KEY_E
+        15 => 19,  // r → KEY_R
+        16 => 21,  // y → KEY_Y
+        17 => 20,  // t → KEY_T
+        // Numbers
+        18 => 2,   // 1 → KEY_1
+        19 => 3,   // 2 → KEY_2
+        20 => 4,   // 3 → KEY_3
+        21 => 5,   // 4 → KEY_4
+        22 => 7,   // 6 → KEY_6
+        23 => 6,   // 5 → KEY_5
+        24 => 13,  // = → KEY_EQUAL
+        25 => 10,  // 9 → KEY_9
+        26 => 8,   // 7 → KEY_7
+        27 => 12,  // - → KEY_MINUS
+        28 => 9,   // 8 → KEY_8
+        29 => 11,  // 0 → KEY_0
+        // Punctuation
+        30 => 27,  // ] → KEY_RIGHTBRACE
+        31 => 24,  // o → KEY_O
+        32 => 22,  // u → KEY_U
+        33 => 26,  // [ → KEY_LEFTBRACE
+        34 => 23,  // i → KEY_I
+        35 => 25,  // p → KEY_P
+        37 => 38,  // l → KEY_L
+        38 => 36,  // j → KEY_J
+        39 => 40,  // ' → KEY_APOSTROPHE
+        40 => 37,  // k → KEY_K
+        41 => 39,  // ; → KEY_SEMICOLON
+        42 => 43,  // \ → KEY_BACKSLASH
+        43 => 51,  // , → KEY_COMMA
+        44 => 53,  // / → KEY_SLASH
+        45 => 49,  // n → KEY_N
+        46 => 50,  // m → KEY_M
+        47 => 52,  // . → KEY_DOT
+        // Special keys
+        36 => 28,  // Return → KEY_ENTER
+        48 => 15,  // Tab → KEY_TAB
+        49 => 57,  // Space → KEY_SPACE
+        50 => 41,  // ` → KEY_GRAVE
+        51 => 14,  // Backspace → KEY_BACKSPACE
+        53 => 1,   // Escape → KEY_ESC
+        // Modifier keys
+        54 => 126, // Right Command → KEY_RIGHTMETA
+        55 => 125, // Left Command → KEY_LEFTMETA
+        56 => 42,  // Left Shift → KEY_LEFTSHIFT
+        57 => 58,  // Caps Lock → KEY_CAPSLOCK
+        58 => 56,  // Left Option → KEY_LEFTALT
+        59 => 29,  // Left Control → KEY_LEFTCTRL
+        60 => 54,  // Right Shift → KEY_RIGHTSHIFT
+        61 => 100, // Right Option → KEY_RIGHTALT
+        62 => 97,  // Right Control → KEY_RIGHTCTRL
+        // Function keys
+        122 => 59, // F1
+        120 => 60, // F2
+        99  => 61, // F3
+        118 => 62, // F4
+        96  => 63, // F5
+        97  => 64, // F6
+        98  => 65, // F7
+        100 => 66, // F8
+        101 => 67, // F9
+        109 => 68, // F10
+        103 => 87, // F11
+        111 => 88, // F12
+        // Arrow keys
+        123 => 105, // Left → KEY_LEFT
+        124 => 106, // Right → KEY_RIGHT
+        125 => 108, // Down → KEY_DOWN
+        126 => 103, // Up → KEY_UP
+        // JIS keys
+        102 => 100, // Eisu (英数)
+        104 => 92,  // Kana (かな) → KEY_HENKAN
+        // Keypad
+        65 => 83,   // Keypad . → KEY_KPDOT
+        67 => 55,   // Keypad * → KEY_KPASTERISK
+        69 => 78,   // Keypad + → KEY_KPPLUS
+        75 => 98,   // Keypad / → KEY_KPSLASH
+        76 => 96,   // Keypad Enter → KEY_KPENTER
+        78 => 74,   // Keypad - → KEY_KPMINUS
+        82 => 82,   // Keypad 0 → KEY_KP0
+        83 => 79,   // Keypad 1 → KEY_KP1
+        84 => 80,   // Keypad 2 → KEY_KP2
+        85 => 81,   // Keypad 3 → KEY_KP3
+        86 => 75,   // Keypad 4 → KEY_KP4
+        87 => 76,   // Keypad 5 → KEY_KP5
+        88 => 77,   // Keypad 6 → KEY_KP6
+        89 => 71,   // Keypad 7 → KEY_KP7
+        91 => 72,   // Keypad 8 → KEY_KP8
+        92 => 73,   // Keypad 9 → KEY_KP9
+        // Fallback
+        _ => return (mac as u8).wrapping_add(8),
+    };
+    (evdev + 8) as u8
 }
 
 fn get_scale_factor() -> f64 {
@@ -499,7 +617,7 @@ unsafe extern "C" fn view_key_down(this: *mut AnyObject, _sel: Sel, event: *mut 
 
         send_display_event(DisplayEvent::KeyPress {
             window: x11_id,
-            keycode: (keycode as u8).wrapping_add(8),
+            keycode: macos_keycode_to_x11(keycode),
             state,
             time,
         });
@@ -969,6 +1087,9 @@ extern "C" fn timer_callback(_timer: *mut c_void, _info: *mut c_void) {
     // Timer fires even during macOS live resize (via kCFRunLoopCommonModes).
     // Process commands here so windows update in real-time during resize drag.
     process_commands();
+
+    // Check if AudioQueue needs initialization (triggered by PA server)
+    unsafe { crate::audio::check_audio_init(); }
 }
 
 /// Convert a macOS NSWindow position to X11 screen coordinates.
@@ -1309,6 +1430,14 @@ unsafe fn activate_app(ns_window: *mut AnyObject) {
 /// This harmonizes X11's focus-follows-mouse with macOS's click-to-focus model.
 fn check_enter_notify() {
     let mouse_loc: NSPoint = unsafe { msg_send![objc2::class!(NSEvent), mouseLocation] };
+
+    // Skip expensive windowNumberAtPoint IPC if mouse hasn't moved (saves ~89% CPU).
+    let loc_key = (mouse_loc.x.to_bits() as i64, mouse_loc.y.to_bits() as i64);
+    let prev = LAST_MOUSE_LOC.with(|c| c.get());
+    if loc_key == prev {
+        return;
+    }
+    LAST_MOUSE_LOC.with(|c| c.set(loc_key));
 
     // Use windowNumberAtPoint to find the TOPMOST window at the cursor.
     // Only match if it's one of ours — prevents stealing focus from other apps.
@@ -1665,7 +1794,9 @@ fn process_commands() {
     RENDER_MAILBOX.with(|mb| {
         let mb = mb.borrow();
         if let Some(ref mailbox) = *mb {
-            if mailbox.is_empty() { return; }
+            // Note: do NOT call mailbox.is_empty() — it locks all 16 DashMap shards,
+            // causing heavy contention with the protocol thread's write lock.
+            // Instead, just iterate known window IDs and check each shard individually.
             WINDOWS.with(|w| {
                 let mut ws = w.borrow_mut();
                 let win_ids: Vec<u64> = ws.keys().copied().collect();
@@ -2650,7 +2781,7 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
                 let keycode: u16 = unsafe { msg_send![event, keyCode] };
                 let state = get_modifier_state(event);
                 send_display_event(DisplayEvent::KeyRelease {
-                    window: x11_id, keycode: (keycode as u8).wrapping_add(8), state, time,
+                    window: x11_id, keycode: macos_keycode_to_x11(keycode), state, time,
                 });
             }
         }

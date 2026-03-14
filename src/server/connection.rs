@@ -2304,6 +2304,14 @@ fn clip_clear_by_children(
 fn post_render_to_mailbox(server: &Arc<XServer>, win_id: u64, commands: Vec<crate::display::RenderCommand>) {
     let mut entry = server.render_mailbox.entry(win_id).or_default();
     entry.extend(commands);
+    // Cap mailbox to prevent unbounded memory growth.
+    // If a fast client (e.g. ico) produces commands faster than 60fps display can consume,
+    // drop all but the last MAX commands (keeps the most recent frame).
+    const MAX_COMMANDS: usize = 4096;
+    if entry.len() > MAX_COMMANDS {
+        let excess = entry.len() - MAX_COMMANDS;
+        entry.drain(..excess);
+    }
 }
 
 /// Update the global IME cursor spot position.
@@ -3417,7 +3425,9 @@ async fn handle_open_font<S: AsyncRead + AsyncWrite + Unpin>(
     };
     info!("OpenFont: 0x{:08X} '{}' is_2byte={}", fid, name, name.contains("iso10646"));
 
-    let is_2byte = name.contains("iso10646");
+    // pslXserver uses CoreText for all rendering, so any font can display CJK.
+    // Only treat as 1-byte if XLFD explicitly specifies a 1-byte charset.
+    let is_2byte = !name.contains("iso8859") && !name.contains("jisx0201");
     let (ascent, descent, char_width) = parse_xlfd_metrics(&name);
     let font = super::resources::FontState {
         id: fid,
@@ -3754,8 +3764,9 @@ async fn handle_get_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
     write_u32_to(conn, &mut reply, additional_len);
     reply.extend(std::iter::repeat(0).take(24)); // padding
 
-    // Generate keysym data: X11 keycode = macOS keycode + 8
-    // So X11 keycode 8 = macOS key 0 (A), keycode 9 = macOS key 1 (S), etc.
+    // Generate keysym data using evdev-based keycode layout.
+    // X11 keycode = evdev keycode + 8. Both macos_keycode_to_x11() and
+    // this mapping use the same evdev base so Chrome/xterm see consistent keysyms.
     for i in 0..count {
         let keycode = first_keycode + i;
 
@@ -3773,9 +3784,8 @@ async fn handle_get_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
             write_u32_to(conn, &mut reply, 0);
             write_u32_to(conn, &mut reply, 0);
         } else {
-            let mac_key = keycode.wrapping_sub(8); // reverse the +8 offset
-            // macOS virtual keycode → (normal keysym, shifted keysym)
-            let (keysym, shifted) = macos_keycode_to_keysym(mac_key);
+            let evdev = keycode.wrapping_sub(8); // X11 keycode - 8 = evdev keycode
+            let (keysym, shifted) = evdev_keycode_to_keysym(evdev);
             write_u32_to(conn, &mut reply, keysym);
             write_u32_to(conn, &mut reply, shifted);
             write_u32_to(conn, &mut reply, 0); // NoSymbol (mode switch)
@@ -3797,6 +3807,35 @@ async fn handle_change_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), ServerError> {
     // No reply needed for ChangeKeyboardMapping
     Ok(())
+}
+
+/// Map evdev keycode to X11 keysym (normal, shifted).
+/// Reverse-maps evdev → macOS keycode, then uses macos_keycode_to_keysym.
+pub(crate) fn evdev_keycode_to_keysym(evdev: u32) -> (u32, u32) {
+    // evdev → macOS keycode (reverse of macos_keycode_to_x11 in macos.rs)
+    let mac = match evdev {
+        30 => 0, 31 => 1, 32 => 2, 33 => 3, 35 => 4, 34 => 5,   // a s d f h g
+        44 => 6, 45 => 7, 46 => 8, 47 => 9, 48 => 11,             // z x c v b
+        16 => 12, 17 => 13, 18 => 14, 19 => 15, 21 => 16, 20 => 17, // q w e r y t
+        2 => 18, 3 => 19, 4 => 20, 5 => 21, 7 => 22, 6 => 23,    // 1 2 3 4 6 5
+        13 => 24, 10 => 25, 8 => 26, 12 => 27, 9 => 28, 11 => 29, // = 9 7 - 8 0
+        27 => 30, 24 => 31, 22 => 32, 26 => 33, 23 => 34, 25 => 35, // ] o u [ i p
+        28 => 36, 38 => 37, 36 => 38, 40 => 39, 37 => 40, 39 => 41, // Return l j ' k ;
+        43 => 42, 51 => 43, 53 => 44, 49 => 45, 50 => 46, 52 => 47, // \ , / n m .
+        15 => 48, 57 => 49, 41 => 50, 14 => 51, 1 => 53,           // Tab Space ` BS Esc
+        // Modifier keys
+        42 => 56, 58 => 57, 56 => 58, 29 => 59, 54 => 60, 100 => 61, 97 => 62,
+        125 | 126 => 55, // Meta → Command
+        // Arrow keys
+        105 => 123, 106 => 124, 108 => 125, 103 => 126,
+        // Function keys
+        59 => 122, 60 => 120, 61 => 99, 62 => 118, 63 => 96, 64 => 97, 65 => 98,
+        66 => 100, 67 => 101, 68 => 109, 87 => 103, 88 => 111,
+        // JIS
+        92 => 104, // Kana
+        _ => return (0, 0), // NoSymbol
+    };
+    macos_keycode_to_keysym(mac as u32)
 }
 
 /// Map macOS virtual keycode to X11 keysym (normal, shifted).

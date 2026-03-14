@@ -76,6 +76,9 @@ core-foundation = "0.10"
 core-graphics = "0.24"
 core-text = "20"
 
+[profile.release]
+debug = true
+
 # iOS dependencies
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"

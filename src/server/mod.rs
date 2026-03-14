@@ -307,10 +307,10 @@ pub async fn run_server(
     let mut server = XServer::new(display_number, cmd_tx, screen_width, screen_height);
     server.render_mailbox = render_mailbox;
 
-    // Set up XIM server advertisement:
-    // 1. Set XIM_SERVERS property on root window with @server=pslx atom
-    // 2. Own the @server=pslx selection
-    {
+    // XIM disabled: macOS IME handles all input processing.
+    // Without XIM, apps use Xutf8LookupString which converts Unicode keysyms to UTF-8.
+    // With XIM enabled, Chrome's XFilterEvent consumes all key events, breaking input.
+    if false {
         let root_id = server.screens[0].root_window;
         let xim_servers_atom = server.xim.atoms.xim_servers;
         let server_atom = server.xim.atoms.server_atom;
@@ -506,52 +506,56 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
         log::debug!("Dispatching event: {:?}", evt);
         match evt {
             DisplayEvent::ButtonPress { window, button, x, y, root_x, root_y, state, time } => {
+                let is_scroll = button >= 4; // Button 4/5/6/7 = scroll wheel
                 // Find deepest child window at the click point
                 let (target, cx, cy) = find_child_at_point(&server, window, x, y);
-                // Establish implicit pointer grab on first button press
-                if buttons_pressed == 0 {
-                    grab_window = target;
-                    grab_offset_x = x - cx;
-                    grab_offset_y = y - cy;
-                    log::debug!("Implicit grab: window=0x{:08x} offset=({},{})", target, grab_offset_x, grab_offset_y);
-                }
-                buttons_pressed = buttons_pressed.saturating_add(1);
-                // Send LeaveNotify to old window, EnterNotify to new window
-                if entered_window != target {
-                    if entered_window != 0 {
-                        send_enter_leave_event(&server, protocol::event_type::LEAVE_NOTIFY,
-                            entered_window, 0, 0, root_x, root_y, state, time);
+
+                if !is_scroll {
+                    // Establish implicit pointer grab on first real button press
+                    if buttons_pressed == 0 {
+                        grab_window = target;
+                        grab_offset_x = x - cx;
+                        grab_offset_y = y - cy;
+                        log::debug!("Implicit grab: window=0x{:08x} offset=({},{})", target, grab_offset_x, grab_offset_y);
                     }
-                    send_enter_leave_event(&server, protocol::event_type::ENTER_NOTIFY,
-                        target, cx, cy, root_x, root_y, state, time);
-                    entered_window = target;
-                }
-                // Sync local focused_window with global (may have changed via SetInputFocus/MapWindow)
-                let global_focus = server.focus_window.load(Ordering::Relaxed);
-                if global_focus > 1 {
-                    focused_window = global_focus;
-                }
-                // Only change focus when clicking on a different top-level window.
-                // Within the same top-level, let the app manage focus via SetInputFocus.
-                let target_toplevel = find_toplevel(&server, target);
-                let focused_toplevel = if focused_window > 1 { find_toplevel(&server, focused_window) } else { 0 };
-                if focused_toplevel != target_toplevel {
-                    if focused_window > 1 {
-                        send_focus_event(&server, protocol::event_type::FOCUS_OUT, focused_window);
+                    buttons_pressed = buttons_pressed.saturating_add(1);
+                    // Send LeaveNotify to old window, EnterNotify to new window
+                    if entered_window != target {
+                        if entered_window != 0 {
+                            send_enter_leave_event(&server, protocol::event_type::LEAVE_NOTIFY,
+                                entered_window, 0, 0, root_x, root_y, state, time);
+                        }
+                        send_enter_leave_event(&server, protocol::event_type::ENTER_NOTIFY,
+                            target, cx, cy, root_x, root_y, state, time);
+                        entered_window = target;
                     }
-                    send_focus_event(&server, protocol::event_type::FOCUS_IN, target_toplevel);
-                    focused_window = target_toplevel;
-                    // Update global focus so send_key_event routes to clicked window
-                    server.focus_window.store(target_toplevel, Ordering::Relaxed);
-                }
-                // Update cursor on click (in case MotionNotify didn't fire first)
-                let desired_cursor = determine_cursor(&server, target, cx, cy);
-                if desired_cursor != last_cursor_type {
-                    last_cursor_type = desired_cursor;
-                    if let Some(handle) = find_native_handle_for_event(&server, window) {
-                        let _ = server.display_cmd_tx.send(
-                            DisplayCommand::SetWindowCursor { handle, cursor_type: desired_cursor }
-                        );
+                    // Sync local focused_window with global (may have changed via SetInputFocus/MapWindow)
+                    let global_focus = server.focus_window.load(Ordering::Relaxed);
+                    if global_focus > 1 {
+                        focused_window = global_focus;
+                    }
+                    // Only change focus when clicking on a different top-level window.
+                    // Within the same top-level, let the app manage focus via SetInputFocus.
+                    let target_toplevel = find_toplevel(&server, target);
+                    let focused_toplevel = if focused_window > 1 { find_toplevel(&server, focused_window) } else { 0 };
+                    if focused_toplevel != target_toplevel {
+                        if focused_window > 1 {
+                            send_focus_event(&server, protocol::event_type::FOCUS_OUT, focused_window);
+                        }
+                        send_focus_event(&server, protocol::event_type::FOCUS_IN, target_toplevel);
+                        focused_window = target_toplevel;
+                        // Update global focus so send_key_event routes to clicked window
+                        server.focus_window.store(target_toplevel, Ordering::Relaxed);
+                    }
+                    // Update cursor on click (in case MotionNotify didn't fire first)
+                    let desired_cursor = determine_cursor(&server, target, cx, cy);
+                    if desired_cursor != last_cursor_type {
+                        last_cursor_type = desired_cursor;
+                        if let Some(handle) = find_native_handle_for_event(&server, window) {
+                            let _ = server.display_cmd_tx.send(
+                                DisplayCommand::SetWindowCursor { handle, cursor_type: desired_cursor }
+                            );
+                        }
                     }
                 }
 
@@ -560,8 +564,10 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                     target, button, cx, cy, root_x, root_y, state, time);
             }
             DisplayEvent::ButtonRelease { window, button, x, y, root_x, root_y, state, time } => {
+                let is_scroll = button >= 4;
                 // During implicit grab, send to grab window with adjusted coords
-                let (target, cx, cy) = if grab_window != 0 {
+                // Scroll events (button 4-7) bypass implicit grab — always go to window under pointer
+                let (target, cx, cy) = if !is_scroll && grab_window != 0 {
                     (grab_window, x - grab_offset_x, y - grab_offset_y)
                 } else {
                     find_child_at_point(&server, window, x, y)
@@ -569,11 +575,13 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 debug!("BTN_RELEASE: src=0x{:08x} target=0x{:08x} btn={} ({},{}) root=({},{}) state=0x{:04x}", window, target, button, cx, cy, root_x, root_y, state);
                 send_button_event(&server, protocol::event_type::BUTTON_RELEASE,
                     target, button, cx, cy, root_x, root_y, state, time);
-                // Release implicit grab when all buttons are released
-                buttons_pressed = buttons_pressed.saturating_sub(1);
-                if buttons_pressed == 0 {
-                    log::debug!("Implicit grab released (was 0x{:08x})", grab_window);
-                    grab_window = 0;
+                if !is_scroll {
+                    // Release implicit grab when all real buttons are released
+                    buttons_pressed = buttons_pressed.saturating_sub(1);
+                    if buttons_pressed == 0 {
+                        log::debug!("Implicit grab released (was 0x{:08x})", grab_window);
+                        grab_window = 0;
+                    }
                 }
             }
             DisplayEvent::MotionNotify { window, x, y, root_x, root_y, state, time } => {
@@ -676,33 +684,24 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                         server.xim.send_preedit_done(&server, target);
                     }
                 } else {
-                    // Non-XIM clients: only inject preedit inline into xterm.
-                    // Chrome/browsers use macOS native floating IME for display.
-                    // Injecting preedit chars into Chrome URL bar triggers autocomplete,
-                    // breaking BackSpace and cursor behaviour.
-                    if window_is_xterm(&server, target) {
-                        // xterm: inline preedit via BS + KeyPress
-                        // Incremental: if new text extends old, only send the appended suffix
-                        if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
-                            let suffix = &text[preedit_text.len()..];
-                            if !suffix.is_empty() {
-                                send_ime_text(&server, target, suffix).await;
-                            }
-                        } else {
-                            // Full erase + resend (conversion, deletion, or first char)
-                            if preedit_char_count > 0 {
-                                send_backspaces(&server, target, preedit_char_count);
-                            }
-                            if !text.is_empty() {
-                                send_ime_text(&server, target, &text).await;
-                            }
+                    // All apps: inject preedit inline via BS + Unicode keysym KeyPress.
+                    // macOS IME handles conversion; we relay via Unicode keysyms.
+                    // Without XIM, apps use Xutf8LookupString to convert keysyms to UTF-8.
+                    if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
+                        let suffix = &text[preedit_text.len()..];
+                        if !suffix.is_empty() {
+                            send_ime_text(&server, target, suffix).await;
                         }
-                        preedit_char_count = new_count;
-                        preedit_injected = true;
                     } else {
-                        // Non-xterm: track state only, no raw key injection
-                        preedit_injected = false;
+                        if preedit_char_count > 0 {
+                            send_backspaces(&server, target, preedit_char_count);
+                        }
+                        if !text.is_empty() {
+                            send_ime_text(&server, target, &text).await;
+                        }
                     }
+                    preedit_char_count = new_count;
+                    preedit_injected = true;
                 }
 
                 preedit_col_count = preedit_display_cols(&text);
@@ -1032,7 +1031,34 @@ pub fn send_key_event(
         prev = current;
         current = parent;
     }
-    log::debug!("  -> Key NOT delivered (no KEY_PRESS mask found)");
+    // Fallback: no KEY_PRESS mask found in any ancestor.
+    // Some apps (Chrome/Electron) never set KEY_PRESS mask but still expect key events.
+    // Find the connection that owns this window by resource ID base and deliver directly.
+    if let Some(conn_id) = find_conn_for_window(server, target) {
+        log::info!("  -> Key delivered (fallback) to conn {} target=0x{:08x}", conn_id, target);
+        if let Some(conn_ref) = server.connections.get(&conn_id) {
+            let conn = conn_ref.value();
+            let evt_data = events::build_key_event(
+                conn, event_type, keycode, time,
+                server.screens[0].root_window, target, 0,
+                0, 0, 0, 0, state, true,
+            );
+            let _ = conn.event_tx.send(evt_data.into());
+            return;
+        }
+    }
+    log::debug!("  -> Key NOT delivered (no connection found)");
+}
+
+/// Find the connection that owns a window by matching resource_id_base.
+fn find_conn_for_window(server: &XServer, window: Xid) -> Option<u32> {
+    for conn_ref in server.connections.iter() {
+        let conn = conn_ref.value();
+        if (window & !conn.resource_id_mask) == conn.resource_id_base {
+            return Some(*conn_ref.key());
+        }
+    }
+    None
 }
 
 /// Send IME committed text as X11 key events using Unicode keysyms.
@@ -1084,8 +1110,14 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
         match result {
             Some(r) => r,
             None => {
-                info!("send_ime_text: no conn with KEY_PRESS mask found for target=0x{:08x}", target);
-                return;
+                // Fallback: find connection by resource ID base
+                match find_conn_for_window(server, target) {
+                    Some(cid) => (cid, target, 0u32),
+                    None => {
+                        info!("send_ime_text: no connection found for target=0x{:08x}", target);
+                        return;
+                    }
+                }
             },
         }
     };
@@ -1187,6 +1219,13 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
         }
     }
 
+    // Small delay to ensure client has processed any pending MappingNotify
+    // from a previous send_ime_text call. Without this, rapid preedit updates
+    // can arrive before the client re-reads the keymap, causing characters to be dropped.
+    if char_keys.iter().any(|&(kc, _)| kc >= VIRTUAL_BASE) {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
     // Send KeyPress + KeyRelease for each character
     for &(keycode, state) in &char_keys {
         let press = events::build_key_event(
@@ -1215,7 +1254,7 @@ fn preedit_display_cols(text: &str) -> usize {
 /// BackSpace = macOS keycode 51 + 8 = X11 keycode 59.
 fn send_backspaces(server: &XServer, window: Xid, count: usize) {
     if count == 0 { return; }
-    const BACKSPACE_KEYCODE: u8 = 59; // macOS 51 + 8
+    const BACKSPACE_KEYCODE: u8 = 22; // evdev 14 (KEY_BACKSPACE) + 8 = X11 keycode 22
 
     let focus = server.focus_window.load(Ordering::Relaxed);
     let target = if focus >= 1 {
@@ -1252,7 +1291,12 @@ fn send_backspaces(server: &XServer, window: Xid, count: usize) {
         }
         match result {
             Some(r) => r,
-            None => return,
+            None => {
+                match find_conn_for_window(server, target) {
+                    Some(cid) => (cid, target, 0u32),
+                    None => return,
+                }
+            },
         }
     };
 
@@ -1285,90 +1329,90 @@ fn send_backspaces(server: &XServer, window: Xid, count: usize) {
     }
 }
 
-/// Map ASCII character to X11 keycode (reverse of macos_keycode_to_keysym).
-/// Returns the X11 keycode (macOS keycode + 8).
+/// Map ASCII character to X11 keycode (evdev keycode + 8).
+/// Used by send_ime_text to generate KeyPress events for committed text.
 fn ascii_to_x11_keycode(ascii: u32) -> u8 {
-    // Map of ASCII keysym -> macOS keycode (ANSI US layout)
-    let mac_key = match ascii {
-        0x61 => 0,  // a
-        0x73 => 1,  // s
-        0x64 => 2,  // d
-        0x66 => 3,  // f
-        0x68 => 4,  // h
-        0x67 => 5,  // g
-        0x7A => 6,  // z
-        0x78 => 7,  // x
-        0x63 => 8,  // c
-        0x76 => 9,  // v
-        0x62 => 11, // b
-        0x71 => 12, // q
-        0x77 => 13, // w
-        0x65 => 14, // e
-        0x72 => 15, // r
-        0x79 => 16, // y
-        0x74 => 17, // t
-        0x31 => 18, // 1
-        0x32 => 19, // 2
-        0x33 => 20, // 3
-        0x34 => 21, // 4
-        0x36 => 22, // 6
-        0x35 => 23, // 5
-        0x3D => 24, // =
-        0x39 => 25, // 9
-        0x37 => 26, // 7
-        0x2D => 27, // -
-        0x38 => 28, // 8
-        0x30 => 29, // 0
-        0x5D => 30, // ]
-        0x6F => 31, // o
-        0x75 => 32, // u
-        0x5B => 33, // [
-        0x69 => 34, // i
-        0x70 => 35, // p
-        0x6C => 37, // l
-        0x6A => 38, // j
-        0x27 => 39, // '
-        0x6B => 40, // k
-        0x3B => 41, // ;
-        0x5C => 42, // backslash
-        0x2C => 43, // ,
-        0x2F => 44, // /
-        0x6E => 45, // n
-        0x6D => 46, // m
-        0x2E => 47, // .
-        0x60 => 50, // `
-        0x20 => 49, // space
-        0x0D | 0x0A => 36, // Return/Enter
-        0x09 => 48, // Tab
-        0x08 | 0x7F => 51, // Backspace/Delete
-        0x1B => 53, // Escape
+    // Map ASCII → evdev keycode (linux/input-event-codes.h)
+    let evdev: u16 = match ascii {
+        0x61 => 30,  // a → KEY_A
+        0x73 => 31,  // s → KEY_S
+        0x64 => 32,  // d → KEY_D
+        0x66 => 33,  // f → KEY_F
+        0x68 => 35,  // h → KEY_H
+        0x67 => 34,  // g → KEY_G
+        0x7A => 44,  // z → KEY_Z
+        0x78 => 45,  // x → KEY_X
+        0x63 => 46,  // c → KEY_C
+        0x76 => 47,  // v → KEY_V
+        0x62 => 48,  // b → KEY_B
+        0x71 => 16,  // q → KEY_Q
+        0x77 => 17,  // w → KEY_W
+        0x65 => 18,  // e → KEY_E
+        0x72 => 19,  // r → KEY_R
+        0x79 => 21,  // y → KEY_Y
+        0x74 => 20,  // t → KEY_T
+        0x31 => 2,   // 1 → KEY_1
+        0x32 => 3,   // 2 → KEY_2
+        0x33 => 4,   // 3 → KEY_3
+        0x34 => 5,   // 4 → KEY_4
+        0x36 => 7,   // 6 → KEY_6
+        0x35 => 6,   // 5 → KEY_5
+        0x3D => 13,  // = → KEY_EQUAL
+        0x39 => 10,  // 9 → KEY_9
+        0x37 => 8,   // 7 → KEY_7
+        0x2D => 12,  // - → KEY_MINUS
+        0x38 => 9,   // 8 → KEY_8
+        0x30 => 11,  // 0 → KEY_0
+        0x5D => 27,  // ] → KEY_RIGHTBRACE
+        0x6F => 24,  // o → KEY_O
+        0x75 => 22,  // u → KEY_U
+        0x5B => 26,  // [ → KEY_LEFTBRACE
+        0x69 => 23,  // i → KEY_I
+        0x70 => 25,  // p → KEY_P
+        0x6C => 38,  // l → KEY_L
+        0x6A => 36,  // j → KEY_J
+        0x27 => 40,  // ' → KEY_APOSTROPHE
+        0x6B => 37,  // k → KEY_K
+        0x3B => 39,  // ; → KEY_SEMICOLON
+        0x5C => 43,  // \ → KEY_BACKSLASH
+        0x2C => 51,  // , → KEY_COMMA
+        0x2F => 53,  // / → KEY_SLASH
+        0x6E => 49,  // n → KEY_N
+        0x6D => 50,  // m → KEY_M
+        0x2E => 52,  // . → KEY_DOT
+        0x60 => 41,  // ` → KEY_GRAVE
+        0x20 => 57,  // space → KEY_SPACE
+        0x0D | 0x0A => 28, // Return → KEY_ENTER
+        0x09 => 15,  // Tab → KEY_TAB
+        0x08 | 0x7F => 14, // Backspace → KEY_BACKSPACE
+        0x1B => 1,   // Escape → KEY_ESC
         // Uppercase -> same key as lowercase
         0x41..=0x5A => return ascii_to_x11_keycode(ascii + 0x20),
         // Shifted symbols -> find base key
-        0x21 => 18, // ! (shift+1)
-        0x40 => 19, // @ (shift+2)
-        0x23 => 20, // # (shift+3)
-        0x24 => 21, // $ (shift+4)
-        0x5E => 22, // ^ (shift+6)
-        0x25 => 23, // % (shift+5)
-        0x2B => 24, // + (shift+=)
-        0x28 => 25, // ( (shift+9)
-        0x26 => 26, // & (shift+7)
-        0x5F => 27, // _ (shift+-)
-        0x2A => 28, // * (shift+8)
-        0x29 => 29, // ) (shift+0)
-        0x7D => 30, // } (shift+])
-        0x7B => 33, // { (shift+[)
-        0x22 => 39, // " (shift+')
-        0x3A => 41, // : (shift+;)
-        0x7C => 42, // | (shift+\)
-        0x3C => 43, // < (shift+,)
-        0x3F => 44, // ? (shift+/)
-        0x3E => 47, // > (shift+.)
-        0x7E => 50, // ~ (shift+`)
-        _ => 49, // fallback to space
+        0x21 => 2,   // ! (shift+1)
+        0x40 => 3,   // @ (shift+2)
+        0x23 => 4,   // # (shift+3)
+        0x24 => 5,   // $ (shift+4)
+        0x5E => 7,   // ^ (shift+6)
+        0x25 => 6,   // % (shift+5)
+        0x2B => 13,  // + (shift+=)
+        0x28 => 10,  // ( (shift+9)
+        0x26 => 8,   // & (shift+7)
+        0x5F => 12,  // _ (shift+-)
+        0x2A => 9,   // * (shift+8)
+        0x29 => 11,  // ) (shift+0)
+        0x7D => 27,  // } (shift+])
+        0x7B => 26,  // { (shift+[)
+        0x22 => 40,  // " (shift+')
+        0x3A => 39,  // : (shift+;)
+        0x7C => 43,  // | (shift+\)
+        0x3C => 51,  // < (shift+,)
+        0x3F => 53,  // ? (shift+/)
+        0x3E => 52,  // > (shift+.)
+        0x7E => 41,  // ~ (shift+`)
+        _ => 57, // fallback to space
     };
-    (mac_key as u8).wrapping_add(8) // macOS keycode + 8 = X11 keycode
+    (evdev as u8).wrapping_add(8) // evdev + 8 = X11 keycode
 }
 
 /// Returns true if the ASCII character requires Shift modifier to produce.
