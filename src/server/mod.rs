@@ -260,13 +260,15 @@ impl XServer {
     fn load_font_names() -> Vec<String> {
         // Only advertise fonts we actually handle. 4600+ system fonts cause
         // huge ListFonts responses that slow xterm startup significantly.
+        // All fonts are iso10646 (Unicode BMP). No iso8859 — pslXserver uses
+        // CoreText for all rendering, so every font can display CJK.
         let names: &[&str] = &[
             "fixed",
             "cursor",
             "-misc-fixed-medium-r-normal--13-120-75-75-c-70-iso10646-1",
             "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso10646-1",
-            "-misc-fixed-medium-r-normal--14-130-75-75-c-70-iso8859-1",
-            "-misc-fixed-medium-r-normal--13-120-75-75-c-70-iso8859-1",
+            "-misc-fixed-medium-r-normal--14-130-75-75-c-70-iso10646-1",
+            "-misc-fixed-medium-r-normal--13-120-75-75-c-70-iso10646-1",
         ];
         names.iter().map(|s| s.to_string()).collect()
     }
@@ -340,25 +342,33 @@ pub async fn run_server(
         });
     }
 
-    // Create Unix domain socket
-    let socket_dir = "/tmp/.X11-unix";
-    let socket_path = format!("{}/X{}", socket_dir, display_number);
+    // Create Unix domain socket (skip on iOS — no /tmp access)
+    #[cfg(not(target_os = "ios"))]
+    let listener = {
+        let socket_dir = "/tmp/.X11-unix";
+        let socket_path = format!("{}/X{}", socket_dir, display_number);
 
-    // Ensure the socket directory exists
-    std::fs::create_dir_all(socket_dir).ok();
+        // Ensure the socket directory exists
+        std::fs::create_dir_all(socket_dir).ok();
 
-    // Remove stale socket file
-    std::fs::remove_file(&socket_path).ok();
+        // Remove stale socket file
+        std::fs::remove_file(&socket_path).ok();
 
-    let listener = UnixListener::bind(&socket_path)?;
-    info!("Listening on {}", socket_path);
+        let listener = UnixListener::bind(&socket_path)?;
+        info!("Listening on {}", socket_path);
 
-    // Set socket permissions to world-readable/writable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777))?;
-    }
+        // Set socket permissions to world-readable/writable
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777))?;
+        }
+        Some(listener)
+    };
+    #[cfg(target_os = "ios")]
+    let listener: Option<UnixListener> = {
+        info!("iOS: skipping Unix domain socket, TCP only");
+        None
+    };
 
     // Optional TCP listener
     if listen_tcp {
@@ -436,24 +446,32 @@ pub async fn run_server(
     // This is needed to route display events back to the right X11 window.
     // For simplicity, we add a helper to XServer.
 
-    // Accept Unix socket connections
-    loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let server = Arc::clone(&server);
-                let conn_id = server.next_conn_id();
-                info!("New X11 client connection (id={})", conn_id);
+    // Accept Unix socket connections (or just keep alive on iOS where there's no Unix socket)
+    if let Some(listener) = listener {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let server = Arc::clone(&server);
+                    let conn_id = server.next_conn_id();
+                    info!("New X11 client connection (id={})", conn_id);
 
-                tokio::spawn(async move {
-                    if let Err(e) = connection::handle_connection(server, stream, conn_id).await {
-                        log::error!("Connection {} error: {}", conn_id, e);
-                    }
-                    info!("Connection {} closed", conn_id);
-                });
+                    tokio::spawn(async move {
+                        if let Err(e) = connection::handle_connection(server, stream, conn_id).await {
+                            log::error!("Connection {} error: {}", conn_id, e);
+                        }
+                        info!("Connection {} closed", conn_id);
+                    });
+                }
+                Err(e) => {
+                    log::error!("Accept error: {}", e);
+                }
             }
-            Err(e) => {
-                log::error!("Accept error: {}", e);
-            }
+        }
+    } else {
+        // iOS: no Unix socket, just keep the server alive via TCP
+        info!("Running in TCP-only mode (no Unix socket)");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     }
 }
@@ -614,6 +632,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 // Try XIM first (for GTK/Electron apps with XIM connections)
                 let focus = server.focus_window.load(Ordering::Relaxed);
                 let target = if focus > 1 { focus } else { window };
+                eprintln!("ImeCommit: focus=0x{:x} window=0x{:x} target=0x{:x} text='{}' preedit_injected={}", focus, window, target, text, preedit_injected);
                 if server.xim.has_xim_client(&server, target) {
                     server.xim.send_preedit_done(&server, target);
                     server.xim.send_commit(&server, target, &text);
@@ -1031,14 +1050,12 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     info!("send_ime_text: window=0x{:08x} text='{}'", window, text);
 
     let focus = server.focus_window.load(Ordering::Relaxed);
-    let target = if focus >= 1 {
-        // Always find the deepest child under the pointer — focus may be set
-        // to a top-level window, but KEY_PRESS mask is on the child (e.g. vt100)
-        find_deepest_child(server, window)
-    } else {
-        info!("send_ime_text: focus=None, discarding");
-        return;
-    };
+    // Always find the deepest child under the pointer — focus may be set
+    // to a top-level window, but KEY_PRESS mask is on the child (e.g. vt100).
+    // If focus==0 (not yet set), use `window` directly (iOS: window from ImeCommit/ShowWindow).
+    let target = find_deepest_child(server, if focus > 1 { focus } else { window });
+    eprintln!("send_ime_text: focus=0x{:x} window=0x{:x} target=0x{:x} text='{}'",
+        focus, window, target, text);
 
     // Find the connection that selected key events on target (or ancestors)
     // Track child field for proper event propagation

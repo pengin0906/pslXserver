@@ -18,6 +18,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 /// for software keyboard romaji letters, so LAST_HW_KEYCODE stays 0 and insertText: sends them.
 static LAST_HW_KEYCODE: AtomicU8 = AtomicU8::new(0);
 
+/// Current preedit/marked text buffer for UITextInput.
+/// UIKit calls textInRange: to know the current text in the marked range.
+/// Without this buffer returning the correct preedit, UIKit won't call insertText
+/// for the previous character when switching to a new kana key.
+std::thread_local! {
+    static PREEDIT_BUF: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
@@ -26,9 +34,25 @@ use objc2_foundation::{MainThreadMarker, NSString};
 use crate::display::{DisplayCommand, DisplayEvent, NativeWindowHandle};
 use crate::display::renderer::render_to_buffer;
 
-/// Log message using info! macro (visible via devicectl --console on real device, /tmp on simulator).
+/// Call becomeFirstResponder on the next run loop iteration.
+/// Uses performSelector:withObject:afterDelay:0 (pure ObjC messaging, no Dispatch linkage needed).
+/// Deferring avoids silent failure when the view hierarchy isn't fully set up yet.
+unsafe fn become_first_responder_deferred(view: *mut AnyObject) {
+    if view.is_null() { return; }
+    // Defer to next run loop iteration so UIKit finishes current layout pass first.
+    // Direct call inside timer callback confuses UIKit's software keyboard management.
+    // NOTE: reloadInputViews removed — it caused UIKit to suppress the software keyboard.
+    let sel_become = objc2::sel!(becomeFirstResponder);
+    let nil: *mut AnyObject = std::ptr::null_mut();
+    let _: () = msg_send![view, performSelector: sel_become withObject: nil afterDelay: 0.0_f64];
+}
+
+/// Write debug message to /tmp/pslx_ios.log (visible from host for simulator debugging).
 fn ios_log(msg: &str) {
-    info!("[ios] {}", msg);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/pslx_ios.log") {
+        let _ = writeln!(f, "{}", msg);
+    }
 }
 
 // --- IOSurface FFI (same as macOS) ---
@@ -158,9 +182,14 @@ impl Drop for WindowInfo {
                 CFRelease(self.ca_layer as *const c_void);
             }
         }
-        // UIWindow/UIView are managed by UIKit, just release our retain
+        // UIWindow cleanup: just hide. Do NOT call setRootViewController:nil (triggers
+        // UIKit transition animation → SIGSEGV in -[UIView frame] from UIPresentationController)
+        // and do NOT call CFRelease (causes SIGSEGV in CALayerGetSuperlayer during layout).
+        // UIKit holds its own strong references; hiding is sufficient for our use case.
         if !self.ui_window.is_null() {
-            unsafe { CFRelease(self.ui_window as *const c_void); }
+            unsafe {
+                let _: () = msg_send![self.ui_window, setHidden: true];
+            }
         }
     }
 }
@@ -250,21 +279,24 @@ fn get_pslx_view_class() -> &'static AnyClass {
         let raw_cls = builder.register() as *const AnyClass as *mut c_void;
 
         unsafe {
-            // Conform to UITextInput protocol (superset of UIKeyInput) for full IME support
-            // This is the iOS equivalent of macOS NSTextInputClient
-            let proto = objc_getProtocol(c"UITextInput".as_ptr() as _);
-            if !proto.is_null() {
-                class_addProtocol(raw_cls, proto);
+            // Conform to UIKeyInput AND UITextInput protocols.
+            // UITextInput is required for Japanese kana keyboard (Kana-RTL) to route input.
+            // Without UITextInput protocol adoption, kana keyboard taps are silently ignored.
+            let proto_keyinput = objc_getProtocol(c"UIKeyInput".as_ptr() as _);
+            if !proto_keyinput.is_null() {
+                class_addProtocol(raw_cls, proto_keyinput);
             }
-            // Also conform to UIKeyInput (parent protocol)
-            let proto2 = objc_getProtocol(c"UIKeyInput".as_ptr() as _);
-            if !proto2.is_null() {
-                class_addProtocol(raw_cls, proto2);
+            let proto_textinput = objc_getProtocol(c"UITextInput".as_ptr() as _);
+            if !proto_textinput.is_null() {
+                class_addProtocol(raw_cls, proto_textinput);
             }
 
             // canBecomeFirstResponder -> YES
             class_addMethod(raw_cls, objc2::sel!(canBecomeFirstResponder),
                 can_become_first_responder as *const c_void, c"B@:".as_ptr() as _);
+            // resignFirstResponder — log when UIKit takes focus away
+            class_addMethod(raw_cls, objc2::sel!(resignFirstResponder),
+                resign_first_responder as *const c_void, c"B@:".as_ptr() as _);
 
             // UIKeyInput methods
             class_addMethod(raw_cls, objc2::sel!(hasText),
@@ -274,88 +306,70 @@ fn get_pslx_view_class() -> &'static AnyClass {
             class_addMethod(raw_cls, objc2::sel!(deleteBackward),
                 delete_backward as *const c_void, c"v@:".as_ptr() as _);
 
-            // === UITextInput methods (IME composition support) ===
-            // setMarkedText:selectedRange: — called during IME composition (like macOS setMarkedText:)
+            // UITextInput methods — required for Japanese IME (kana/romaji keyboards)
             class_addMethod(raw_cls, objc2::sel!(setMarkedText:selectedRange:),
                 ios_set_marked_text as *const c_void, c"v@:@{_NSRange=QQ}".as_ptr() as _);
-            // unmarkText — called when composition ends
             class_addMethod(raw_cls, objc2::sel!(unmarkText),
                 ios_unmark_text as *const c_void, c"v@:".as_ptr() as _);
-            // markedTextRange — returns current marked text range (nil if not composing)
             class_addMethod(raw_cls, objc2::sel!(markedTextRange),
                 ios_marked_text_range as *const c_void, c"@@:".as_ptr() as _);
-            // selectedTextRange — returns current selection range
-            class_addMethod(raw_cls, objc2::sel!(selectedTextRange),
-                ios_selected_text_range as *const c_void, c"@@:".as_ptr() as _);
-            // setSelectedTextRange:
-            class_addMethod(raw_cls, objc2::sel!(setSelectedTextRange:),
-                ios_set_selected_text_range as *const c_void, c"v@:@".as_ptr() as _);
-            // markedTextStyle
             class_addMethod(raw_cls, objc2::sel!(markedTextStyle),
                 ios_return_nil as *const c_void, c"@@:".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(setMarkedTextStyle:),
                 ios_set_noop as *const c_void, c"v@:@".as_ptr() as _);
-            // textInRange:
-            class_addMethod(raw_cls, objc2::sel!(textInRange:),
-                ios_text_in_range as *const c_void, c"@@:@".as_ptr() as _);
-            // replaceRange:withText:
-            class_addMethod(raw_cls, objc2::sel!(replaceRange:withText:),
-                ios_replace_range as *const c_void, c"v@:@@".as_ptr() as _);
-            // beginningOfDocument / endOfDocument
+            class_addMethod(raw_cls, objc2::sel!(selectedTextRange),
+                ios_selected_text_range as *const c_void, c"@@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(setSelectedTextRange:),
+                ios_set_selected_text_range as *const c_void, c"v@:@".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(beginningOfDocument),
                 ios_beginning_of_document as *const c_void, c"@@:".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(endOfDocument),
                 ios_end_of_document as *const c_void, c"@@:".as_ptr() as _);
-            // Position/range methods (stubs)
+            class_addMethod(raw_cls, objc2::sel!(textInRange:),
+                ios_text_in_range as *const c_void, c"@@:@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(replaceRange:withText:),
+                ios_replace_range as *const c_void, c"v@:@@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(textRangeFromPosition:toPosition:),
+                ios_text_range_from_positions as *const c_void, c"@@:@@".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(positionFromPosition:offset:),
                 ios_position_from_offset as *const c_void, c"@@:@q".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(positionFromPosition:inDirection:offset:),
                 ios_position_from_direction as *const c_void, c"@@:@qq".as_ptr() as _);
-            class_addMethod(raw_cls, objc2::sel!(textRangeFromPosition:toPosition:),
-                ios_text_range_from_positions as *const c_void, c"@@:@@".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(comparePosition:toPosition:),
                 ios_compare_position as *const c_void, c"q@:@@".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(offsetFromPosition:toPosition:),
                 ios_offset_from_position as *const c_void, c"q@:@@".as_ptr() as _);
-            // inputDelegate
             class_addMethod(raw_cls, objc2::sel!(inputDelegate),
                 ios_get_input_delegate as *const c_void, c"@@:".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(setInputDelegate:),
                 ios_set_input_delegate as *const c_void, c"v@:@".as_ptr() as _);
-            // tokenizer
             class_addMethod(raw_cls, objc2::sel!(tokenizer),
                 ios_tokenizer as *const c_void, c"@@:".as_ptr() as _);
-            // Geometry methods for IME candidate window positioning
             class_addMethod(raw_cls, objc2::sel!(firstRectForRange:),
-                ios_first_rect_for_range as *const c_void,
-                c"{CGRect={CGPoint=dd}{CGSize=dd}}@:@".as_ptr() as _);
+                ios_first_rect_for_range as *const c_void, c"{CGRect={CGPoint=dd}{CGSize=dd}}@:@".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(caretRectForPosition:),
-                ios_caret_rect_for_position as *const c_void,
-                c"{CGRect={CGPoint=dd}{CGSize=dd}}@:@".as_ptr() as _);
+                ios_caret_rect_for_position as *const c_void, c"{CGRect={CGPoint=dd}{CGSize=dd}}@:@".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(selectionRectsForRange:),
                 ios_selection_rects as *const c_void, c"@@:@".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(closestPositionToPoint:),
-                ios_closest_position_to_point as *const c_void,
-                c"@@:{CGPoint=dd}".as_ptr() as _);
+                ios_closest_position_to_point as *const c_void, c"@@:{CGPoint=dd}".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(closestPositionToPoint:withinRange:),
-                ios_closest_position_to_point_in_range as *const c_void,
-                c"@@:{CGPoint=dd}@".as_ptr() as _);
+                ios_closest_position_to_point_in_range as *const c_void, c"@@:{CGPoint=dd}@".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(characterRangeAtPoint:),
-                ios_character_range_at_point as *const c_void,
-                c"@@:{CGPoint=dd}".as_ptr() as _);
-            // Writing direction (stubs)
+                ios_character_range_at_point as *const c_void, c"@@:{CGPoint=dd}".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(baseWritingDirectionForPosition:inDirection:),
                 ios_base_writing_direction as *const c_void, c"q@:@q".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(setBaseWritingDirection:forRange:),
                 ios_set_base_writing_direction as *const c_void, c"v@:q@".as_ptr() as _);
-            // positionWithinRange:farthestInDirection: / characterRangeByExtendingPosition:inDirection:
             class_addMethod(raw_cls, objc2::sel!(positionWithinRange:farthestInDirection:),
                 ios_position_within_range as *const c_void, c"@@:@q".as_ptr() as _);
             class_addMethod(raw_cls, objc2::sel!(characterRangeByExtendingPosition:inDirection:),
                 ios_character_range_by_extending as *const c_void, c"@@:@q".as_ptr() as _);
-            // hasText (override for UITextInput — return YES when composing)
-            class_addMethod(raw_cls, objc2::sel!(hasText),
-                has_text as *const c_void, c"B@:".as_ptr() as _);
+
+            // insertText:alternatives:style: — iOS 16+ richer insertion method
+            // Called by kana/IME keyboards with candidate alternatives. Forward to insertText:.
+            class_addMethod(raw_cls, objc2::sel!(insertText:alternatives:style:),
+                ios_insert_text_with_alternatives as *const c_void, c"v@:@@q".as_ptr() as _);
 
             // Touch handling
             class_addMethod(raw_cls, objc2::sel!(touchesBegan:withEvent:),
@@ -399,32 +413,63 @@ fn get_pslx_view_class() -> &'static AnyClass {
 // --- PSLXView method implementations ---
 
 unsafe extern "C" fn can_become_first_responder(_this: *mut AnyObject, _sel: Sel) -> Bool {
+    ios_log("canBecomeFirstResponder -> YES");
     Bool::YES
 }
 
+unsafe extern "C" fn resign_first_responder(_this: *mut AnyObject, _sel: Sel) -> Bool {
+    ios_log("resignFirstResponder called — view losing focus!");
+    // Return YES to allow resignation (default behavior)
+    Bool::YES
+}
+
+
 unsafe extern "C" fn has_text(_this: *mut AnyObject, _sel: Sel) -> Bool {
     Bool::YES
+}
+
+/// insertText:alternatives:style: — iOS 16+ richer text insertion.
+/// Called by kana/IME keyboards with autocorrect alternatives.
+/// Just forward text to our main insertText: implementation.
+unsafe extern "C" fn ios_insert_text_with_alternatives(this: *mut AnyObject, sel: Sel, text: *mut AnyObject, _alternatives: *mut AnyObject, _style: i64) {
+    ios_log("insertText:alternatives:style: called");
+    ios_insert_text(this, sel, text);
 }
 
 /// UIKeyInput insertText: — called when user confirms text input.
 /// For IME: called after setMarkedText when user confirms (like macOS insertText:replacementRange:).
 /// For direct typing: called for each character (like macOS interpretKeyEvents → insertText:).
 unsafe extern "C" fn ios_insert_text(_this: *mut AnyObject, _sel: Sel, text: *mut AnyObject) {
-    if text.is_null() { return; }
+    ios_log("insertText: called");
+    if text.is_null() { ios_log("insertText: null text"); return; }
 
-    // End IME composition (same as macOS insertText:replacementRange: line 512-513)
+    // End IME composition and clear preedit buffer
     crate::display::IME_COMPOSING.store(false, std::sync::atomic::Ordering::Relaxed);
     crate::display::IME_CONVERTING.store(false, std::sync::atomic::Ordering::Relaxed);
+    PREEDIT_BUF.with(|b| b.borrow_mut().clear());
 
+    // Try NSString first, then NSAttributedString (UIKit may pass either for IME)
     let utf8: *const std::os::raw::c_char = msg_send![&*text, UTF8String];
-    if utf8.is_null() { return; }
-    let rust_str = match std::ffi::CStr::from_ptr(utf8).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return,
+    let rust_str = if !utf8.is_null() {
+        match std::ffi::CStr::from_ptr(utf8).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => { ios_log("insertText: utf8 decode error"); return; },
+        }
+    } else {
+        // Try NSAttributedString → string
+        let nsstring: *mut AnyObject = msg_send![&*text, string];
+        if nsstring.is_null() { ios_log("insertText: null utf8 and null .string"); return; }
+        let utf8b: *const std::os::raw::c_char = msg_send![nsstring, UTF8String];
+        if utf8b.is_null() { ios_log("insertText: null utf8b"); return; }
+        match std::ffi::CStr::from_ptr(utf8b).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => { ios_log("insertText: utf8b decode error"); return; },
+        }
     };
-    if rust_str.is_empty() { return; }
+    if rust_str.is_empty() { ios_log("insertText: empty string"); return; }
 
     let x11_id = get_focused_x11_window();
+    ios_log(&format!("insertText: '{}' x11=0x{:08x}", rust_str.escape_debug(), x11_id));
     if x11_id == 0 { return; }
     let time = get_timestamp();
 
@@ -468,6 +513,7 @@ unsafe extern "C" fn ios_insert_text(_this: *mut AnyObject, _sel: Sel, text: *mu
 /// This is the iOS equivalent of macOS setMarkedText:selectedRange:replacementRange:.
 /// Sends ImePreeditDraw to show preedit text inline in xterm.
 unsafe extern "C" fn ios_set_marked_text(_this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, _sel_range: NSRange) {
+    ios_log("setMarkedText: called");
     // Extract preedit text (may be NSString or NSAttributedString, same as macOS line 636-649)
     let preedit_str = if !text.is_null() {
         let is_attr_str: bool = msg_send![&*text, isKindOfClass: objc2::class!(NSAttributedString)];
@@ -497,8 +543,12 @@ unsafe extern "C" fn ios_set_marked_text(_this: *mut AnyObject, _sel: Sel, text:
 
     if let Some(s) = preedit_str {
         if !s.is_empty() {
+            // Update preedit buffer so textInRange: returns correct text to UIKit.
+            // UIKit needs this to call insertText(prev_preedit) before switching to new character.
+            PREEDIT_BUF.with(|b| *b.borrow_mut() = s.clone());
             let x11_id = get_focused_x11_window();
             if x11_id != 0 {
+                ios_log(&format!("setMarkedText: preedit='{}' x11=0x{:08x}", s, x11_id));
                 info!("iOS setMarkedText: preedit='{}' (sent to X11)", s);
                 send_display_event(DisplayEvent::ImePreeditDraw {
                     window: x11_id,
@@ -506,7 +556,11 @@ unsafe extern "C" fn ios_set_marked_text(_this: *mut AnyObject, _sel: Sel, text:
                     cursor_pos: 0,
                 });
             }
+        } else {
+            PREEDIT_BUF.with(|b| b.borrow_mut().clear());
         }
+    } else {
+        PREEDIT_BUF.with(|b| b.borrow_mut().clear());
     }
 }
 
@@ -530,6 +584,7 @@ unsafe extern "C" fn ios_marked_text_range(_this: *mut AnyObject, _sel: Sel) -> 
 
 /// selectedTextRange — returns UITextRange for current selection (stub: empty range at position 0).
 unsafe extern "C" fn ios_selected_text_range(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    ios_log("selectedTextRange: called");
     ios_create_text_range(0, 0)
 }
 
@@ -544,10 +599,12 @@ unsafe extern "C" fn ios_return_nil(_this: *mut AnyObject, _sel: Sel) -> *mut An
 /// Generic no-op setter stub.
 unsafe extern "C" fn ios_set_noop(_this: *mut AnyObject, _sel: Sel, _value: *mut AnyObject) {}
 
-/// textInRange: — return empty string (we don't maintain a text buffer).
+/// textInRange: — return preedit buffer text (so UIKit knows what's in the marked range).
+/// Without this, UIKit won't call insertText for previous kana when switching characters.
 unsafe extern "C" fn ios_text_in_range(_this: *mut AnyObject, _sel: Sel, _range: *mut AnyObject) -> *mut AnyObject {
-    let empty = NSString::from_str("");
-    let ptr: *mut AnyObject = &*empty as *const _ as *mut AnyObject;
+    let text = PREEDIT_BUF.with(|b| b.borrow().clone());
+    let ns = NSString::from_str(&text);
+    let ptr: *mut AnyObject = &*ns as *const _ as *mut AnyObject;
     let _: *mut AnyObject = msg_send![ptr, retain];
     ptr
 }
@@ -733,6 +790,8 @@ fn ios_create_text_range(start: i64, length: i64) -> *mut AnyObject {
         *start_ivar.load_mut::<*mut AnyObject>(&mut *obj) = start_pos;
         let end_ivar = (*obj).class().instance_variable(c"_end").unwrap();
         *end_ivar.load_mut::<*mut AnyObject>(&mut *obj) = end_pos;
+        let empty_ivar = (*obj).class().instance_variable(c"_isEmpty").unwrap();
+        *empty_ivar.load_mut::<u8>(&mut *obj) = if length == 0 { 1 } else { 0 };
         obj
     }
 }
@@ -751,7 +810,7 @@ fn get_text_range_class() -> &'static AnyClass {
 
         builder.add_ivar::<*mut AnyObject>(c"_start");
         builder.add_ivar::<*mut AnyObject>(c"_end");
-        builder.add_ivar::<u8>(c"_isEmpty");
+        builder.add_ivar::<u8>(c"_isEmpty");  // 1 = empty (cursor), 0 = has selection
 
         extern "C" {
             fn class_addMethod(
@@ -784,13 +843,16 @@ unsafe extern "C" fn text_range_end(this: *mut AnyObject, _sel: Sel) -> *mut Any
     *ivar.load::<*mut AnyObject>(&*this)
 }
 
-unsafe extern "C" fn text_range_is_empty(_this: *mut AnyObject, _sel: Sel) -> Bool {
-    Bool::NO
+unsafe extern "C" fn text_range_is_empty(this: *mut AnyObject, _sel: Sel) -> Bool {
+    let ivar = (*this).class().instance_variable(c"_isEmpty").unwrap();
+    let v = *ivar.load::<u8>(&*this);
+    if v != 0 { Bool::YES } else { Bool::NO }
 }
 
 /// UIKeyInput deleteBackward — Backspace key
 unsafe extern "C" fn delete_backward(_this: *mut AnyObject, _sel: Sel) {
     let x11_id = get_focused_x11_window();
+    ios_log(&format!("deleteBackward: x11=0x{:08x}", x11_id));
     if x11_id == 0 { return; }
     let time = get_timestamp();
     // X11 keycode for BackSpace = 22 (8 + macOS keycode 51... just use 22 directly)
@@ -824,6 +886,7 @@ unsafe extern "C" fn touches_began(this: *mut AnyObject, _sel: Sel, touches: *mu
     let touch = get_first_touch(touches);
     if touch.is_null() { return; }
     let (x, y) = touch_location_in_view(touch, this);
+    ios_log(&format!("touchesBegan: ({},{})", x, y));
     let time = get_timestamp();
 
     // Detect mouse button from UIEvent.buttonMask (iOS 13.4+)
@@ -1055,12 +1118,13 @@ unsafe extern "C" fn presses_began(_this: *mut AnyObject, _sel: Sel, presses: *m
         let modifier_flags: u64 = msg_send![key, modifierFlags];
 
         let x11_id = get_focused_x11_window();
+        ios_log(&format!("pressesBegan: uikit_kc={} x11=0x{:08x}", uikit_kc, x11_id));
         if x11_id == 0 { continue; }
         let time = get_timestamp();
 
         // Suppress key events during IME composition (same as macOS doCommandBySelector check)
         if crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed) {
-            debug!("pressesBegan: suppressed keycode {} during IME composition", uikit_kc);
+            ios_log(&format!("pressesBegan: suppressed keycode {} during IME composition", uikit_kc));
             continue;
         }
 
@@ -1632,7 +1696,7 @@ fn claim_main_scene(native_id: u64, info: &mut WindowInfo) -> bool {
                         info.ca_layer = layer;
                     }
                     info.ui_view = view;
-                    let _: () = msg_send![view, becomeFirstResponder];
+                    become_first_responder_deferred(view);
                 }
 
                 info.ui_window = main_win;
@@ -1644,8 +1708,11 @@ fn claim_main_scene(native_id: u64, info: &mut WindowInfo) -> bool {
                     let _: () = msg_send![scene, setTitle: &*title_ns];
                 }
 
-                // Resize Stage Manager window to X11 size
+                // Resize Stage Manager window to X11 size (sizeRestrictions for real iPad)
                 resize_scene_to_x11(main_win, pt_w as u16, pt_h as u16);
+                // Direct setFrame for simulator (sizeRestrictions ignored on simulator)
+                let win_frame = CGRect { origin: [0.0, 0.0], size: [pt_w, pt_h] };
+                let _: () = msg_send![main_win, setFrame: win_frame];
 
                 // Now show the window (was hidden at scene creation, like macOS visible=false → makeKeyAndOrderFront)
                 let _: () = msg_send![main_win, setHidden: false];
@@ -1758,15 +1825,13 @@ fn setup_window_in_scene(native_id: u64) {
             let vc_cls = get_fullscreen_vc_class();
             let vc: *mut AnyObject = msg_send![vc_cls, alloc];
             let vc: *mut AnyObject = msg_send![vc, init];
-            // Create container view filling the scene
-            let container_cls = objc2::class!(UIView);
-            let container: *mut AnyObject = msg_send![container_cls, alloc];
-            let container: *mut AnyObject = msg_send![container, initWithFrame: scene_bounds];
-            let white: *mut AnyObject = msg_send![objc2::class!(UIColor), whiteColor];
-            let _: () = msg_send![container, setBackgroundColor: white];
-            // Add X11 content view as subview
-            let _: () = msg_send![container, addSubview: view];
-            let _: () = msg_send![vc, setView: container];
+            // Use PSLXView directly as the root view — no container wrapper.
+            // Container was only used for white background (now unwanted).
+            // PSLXView size = X11 window size, UIWindow is resized to match in resize_scene_to_content().
+            let clear: *mut AnyObject = msg_send![objc2::class!(UIColor), clearColor];
+            let _: () = msg_send![view, setBackgroundColor: clear];
+            let _: () = msg_send![win, setBackgroundColor: clear];
+            let _: () = msg_send![vc, setView: view];
             let _: () = msg_send![win, setRootViewController: vc];
 
             // Add UIHoverGestureRecognizer for mouse/trackpad movement → X11 MotionNotify
@@ -1797,10 +1862,10 @@ fn setup_window_in_scene(native_id: u64) {
                 let _: () = msg_send![win_layer, setCornerRadius: 0.0_f64];
                 let _: () = msg_send![win_layer, setMasksToBounds: true];
             }
-            // Also remove corner radius from the container and content view
-            let container_layer: *mut AnyObject = msg_send![container, layer];
-            if !container_layer.is_null() {
-                let _: () = msg_send![container_layer, setCornerRadius: 0.0_f64];
+            // Remove corner radius from the content view layer too
+            let view_layer: *mut AnyObject = msg_send![view, layer];
+            if !view_layer.is_null() {
+                let _: () = msg_send![view_layer, setCornerRadius: 0.0_f64];
             }
 
             // Hidden until ShowWindow (like macOS visible=false)
@@ -1810,8 +1875,11 @@ fn setup_window_in_scene(native_id: u64) {
             let title_ns = NSString::from_str(&info.title);
             let _: () = msg_send![scene, setTitle: &*title_ns];
 
-            // Resize Stage Manager window to X11 size
+            // Resize Stage Manager window to X11 size (sizeRestrictions for real iPad)
             resize_scene_to_x11(win, info.width, info.height);
+            // Direct setFrame for simulator (sizeRestrictions ignored on simulator)
+            let win_frame = CGRect { origin: [0.0, 0.0], size: [info.width as f64, info.height as f64] };
+            let _: () = msg_send![win, setFrame: win_frame];
 
             let _: *mut AnyObject = msg_send![win, retain];
             let _: *mut AnyObject = msg_send![layer, retain];
@@ -1829,8 +1897,8 @@ fn setup_window_in_scene(native_id: u64) {
                 let _: () = msg_send![win, setHidden: false];
                 let _: () = msg_send![win, makeKeyAndVisible];
                 flush_window_to_layer(layer, info.display_surface);
-                // Make view first responder for hardware keyboard
-                let _: () = msg_send![view, becomeFirstResponder];
+                // Make view first responder — deferred to next run loop so UIKit has settled
+                become_first_responder_deferred(view);
                 info.pending_show = false;
                 info.visible = true;
                 ios_log(&format!("setup_window_in_scene: id={} {}x{} scene={:p} (deferred show)",
@@ -1990,6 +2058,31 @@ extern "C" fn timer_callback(_timer: *mut c_void, _info: *mut c_void) {
     if cnt == 0 {
         ios_log("timer_callback: first tick");
     }
+
+    // Every ~2s (120 ticks at 60fps): check first responder status and window
+    if cnt % 120 == 60 {
+        MAIN_VIEW.with(|mv| {
+            if let Some(view) = *mv.borrow() {
+                unsafe {
+                    let is_fr: Bool = objc2::msg_send![&*view, isFirstResponder];
+                    // Check key window
+                    let app: *mut AnyObject = objc2::msg_send![objc2::class!(UIApplication), sharedApplication];
+                    let key_win: *mut AnyObject = if !app.is_null() {
+                        objc2::msg_send![app, keyWindow]
+                    } else { std::ptr::null_mut() };
+                    let win: *mut AnyObject = objc2::msg_send![&*view, window];
+                    let is_key: bool = !key_win.is_null() && !win.is_null() && key_win == win;
+                    ios_log(&format!("timer check: isFirstResponder={} isKeyWindow={} view={:p} win={:p} keyWin={:p}",
+                        is_fr.as_bool(), is_key, view, win, key_win));
+                    if !is_fr.as_bool() {
+                        ios_log("timer: re-acquiring first responder");
+                        let _: Bool = objc2::msg_send![&*view, becomeFirstResponder];
+                    }
+                }
+            }
+        });
+    }
+
     process_commands();
 
     // Apply pending keyboard resize (deferred to allow child windows to exist)
@@ -2264,12 +2357,10 @@ fn handle_command(cmd: DisplayCommand) {
                 }
             });
             if let Some((x11_id, w, h, view)) = show_info {
-                // Make view first responder for hardware keyboard input
+                // Make view first responder — deferred so UIKit has settled after makeKeyAndVisible
                 if !view.is_null() {
-                    unsafe {
-                        let _: () = msg_send![view, becomeFirstResponder];
-                    }
-                    ios_log(&format!("ShowWindow: id={} becomeFirstResponder", handle.id));
+                    unsafe { become_first_responder_deferred(view); }
+                    ios_log(&format!("ShowWindow: id={} become_first_responder_deferred", handle.id));
                 }
                 send_display_event(DisplayEvent::FocusIn { window: x11_id });
                 ios_log(&format!("ShowWindow: id={} x11=0x{:08X} {}x{}",
@@ -2286,25 +2377,15 @@ fn handle_command(cmd: DisplayCommand) {
         }
 
         DisplayCommand::DestroyWindow { handle } => {
+            // WindowInfo::Drop handles all releases (surface, display_surface, ca_layer, ui_window).
+            // Just hide the UIWindow before removing, then let Drop clean up.
             WINDOWS.with(|w| {
-                if let Some(info) = w.borrow_mut().remove(&handle.id) {
-                    unsafe {
-                        if !info.ca_layer.is_null() {
-                            let _: () = msg_send![info.ca_layer, removeFromSuperlayer];
-                            let _: () = msg_send![info.ca_layer, release];
-                        }
-                        if !info.ui_window.is_null() {
-                            let _: () = msg_send![info.ui_window, setHidden: true];
-                            let _: () = msg_send![info.ui_window, release];
-                        }
-                        if !info.surface.is_null() {
-                            CFRelease(info.surface);
-                        }
-                        if !info.display_surface.is_null() {
-                            CFRelease(info.display_surface);
-                        }
+                if let Some(info) = w.borrow_mut().get(&handle.id) {
+                    if !info.ui_window.is_null() {
+                        unsafe { let _: () = msg_send![info.ui_window, setHidden: true]; }
                     }
                 }
+                w.borrow_mut().remove(&handle.id); // triggers Drop
             });
         }
 
