@@ -507,6 +507,8 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
     let mut grab_offset_y: i16 = 0;
     let mut buttons_pressed: u8 = 0;    // count of currently pressed buttons
     let mut last_cursor_type: u8 = 0;   // track current macOS cursor to avoid redundant updates
+    let mut last_autoscroll: std::time::Instant = std::time::Instant::now();
+    let mut last_autoscroll: std::time::Instant = std::time::Instant::now();
     loop {
         // Use spawn_blocking to avoid blocking the tokio runtime
         let evt = {
