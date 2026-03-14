@@ -227,9 +227,9 @@ async fn handle_get_map<S: AsyncRead + AsyncWrite + Unpin>(
     if want_syms {
         let vk = server.virtual_keysyms.read();
         for keycode in MIN_KEYCODE..=MAX_KEYCODE {
-            let (normal, shifted) = if (keycode as u32) >= 136 {
+            let (normal, shifted) = if (keycode as u32) >= 86 {
                 // Virtual keycodes for IME Unicode keysyms
-                let idx = (keycode as usize) - 136;
+                let idx = (keycode as usize) - 86;
                 if idx < vk.len() { (vk[idx], vk[idx]) } else { (0, 0) }
             } else {
                 // evdev-based keymap (same as GetKeyboardMapping)

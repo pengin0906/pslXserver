@@ -1,14 +1,14 @@
 #![allow(dead_code)]
 
 // Use the library crate's modules (defined in lib.rs)
-use pslXserver::display;
-use pslXserver::server;
+use Xerver::display;
+use Xerver::server;
 
 use clap::Parser;
 use log::info;
 
 #[derive(Parser)]
-#[command(name = "pslXserver", about = "Native macOS X11 Server — XQuartz alternative")]
+#[command(name = "Xerver", about = "Native macOS X11 Server — XQuartz alternative")]
 struct Cli {
     /// Display number (e.g., 0 for :0)
     #[arg(short = 'd', long, default_value = "0")]
@@ -38,7 +38,7 @@ fn main() {
     std::env::set_var("RUST_LOG", &cli.log_level);
     env_logger::init();
 
-    info!("pslXserver starting on display :{}", cli.display);
+    info!("Xerver starting on display :{}", cli.display);
 
     // Detect screen resolution: CLI override or actual macOS screen size
     let (screen_width, screen_height) = if let Some(ref s) = cli.screen {
@@ -78,6 +78,9 @@ fn main() {
             .expect("Failed to create tokio runtime");
 
         rt.block_on(async {
+            // Spawn PulseAudio TCP server (port 4713)
+            tokio::spawn(Xerver::audio::start_pulse_server(4713));
+
             if let Err(e) = server::run_server(display_num, listen_tcp, compress_port, evt_rx, cmd_tx, screen_width, screen_height, render_mailbox).await {
                 log::error!("X11 server error: {}", e);
             }

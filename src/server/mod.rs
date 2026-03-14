@@ -270,12 +270,12 @@ impl XServer {
         server
     }
 
-    /// Return the minimal set of font names pslXserver advertises.
+    /// Return the minimal set of font names Xerver advertises.
     /// We use CoreText for all rendering, so these are just names clients can OpenFont.
     fn load_font_names() -> Vec<String> {
         // Only advertise fonts we actually handle. 4600+ system fonts cause
         // huge ListFonts responses that slow xterm startup significantly.
-        // All fonts are iso10646 (Unicode BMP). No iso8859 — pslXserver uses
+        // All fonts are iso10646 (Unicode BMP). No iso8859 — Xerver uses
         // CoreText for all rendering, so every font can display CJK.
         let names: &[&str] = &[
             "fixed",
@@ -322,7 +322,7 @@ pub async fn run_server(
     let mut server = XServer::new(display_number, cmd_tx, screen_width, screen_height);
     server.render_mailbox = render_mailbox;
 
-    // XIM enabled: pslXserver acts as XIM server for Chrome/Electron apps.
+    // XIM enabled: Xerver acts as XIM server for Chrome/Electron apps.
     // Chrome uses XIM for commit/preedit; xterm uses XMODIFIERS=@im=none (bypasses XIM).
     {
         let root_id = server.screens[0].root_window;
@@ -332,7 +332,7 @@ pub async fn run_server(
         if let Some(mut res) = server.resources.get_mut(&root_id) {
             if let resources::Resource::Window(ref w) = res.value() {
                 let mut w = w.write();
-                // XIM_SERVERS property: array of ATOM containing @server=pslx
+                // XIM_SERVERS property: array of ATOM containing @server=xerver
                 w.properties.push(resources::Property {
                     name: xim_servers_atom,
                     type_atom: 4, // ATOM
@@ -341,9 +341,9 @@ pub async fn run_server(
                 });
             }
         }
-        // Own the @server=pslx selection
+        // Own the @server=xerver selection
         server.selections.insert(server_atom, (root_id, server.startup_time));
-        info!("XIM: advertised @server=pslx on root window, owned selection atom={}", server_atom);
+        info!("XIM: advertised @server=xerver on root window, owned selection atom={}", server_atom);
     }
 
     let server = Arc::new(server);

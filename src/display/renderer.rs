@@ -771,6 +771,117 @@ fn get_glyph_bitmap(ch: u8) -> [u8; 13] {
     }
 }
 
+/// Detect system locale and return the Apple standard font PostScript name.
+/// All fonts are pre-installed on macOS 13+ / iOS 16+ (Apple system fonts).
+/// Reference: https://support.apple.com/en-us/120414 (macOS Sequoia fonts)
+///            https://developer.apple.com/fonts/system-fonts/
+/// Covers all ISO 639-1 languages with non-Latin primary scripts.
+fn detect_locale_font() -> &'static std::ffi::CStr {
+    use std::sync::OnceLock;
+    static FONT_NAME: OnceLock<&'static std::ffi::CStr> = OnceLock::new();
+    FONT_NAME.get_or_init(|| {
+        let lang = std::env::var("LANG").unwrap_or_default();
+        // Extract language code (before _ or .)
+        let lc = lang.split(|c| c == '_' || c == '.').next().unwrap_or("");
+        let font = match lc {
+            // === East Asian ===
+            "ja" => c"HiraginoSans-W3",              // Japanese — ヒラギノ角ゴシック
+            "ko" => c"AppleSDGothicNeo-Regular",      // Korean — Apple SD 고딕 Neo
+            "zh" => {
+                // Disambiguate Chinese variants by region
+                if lang.starts_with("zh_TW") || lang.starts_with("zh_Hant") {
+                    c"PingFangTC-Regular"              // Traditional Chinese (Taiwan) — 蘋方-繁
+                } else if lang.starts_with("zh_HK") || lang.starts_with("zh_MO") {
+                    c"PingFangHK-Regular"              // Traditional Chinese (HK/Macau) — 蘋方-港
+                } else {
+                    c"PingFangSC-Regular"              // Simplified Chinese — 苹方-简
+                }
+            }
+            // === South Asian / Indic (Devanagari script) ===
+            "hi" | "mr" | "ne" | "sa" | "bh" | "ks"
+                => c"KohinoorDevanagari-Regular",     // Hindi/Marathi/Nepali/Sanskrit/Bihari/Kashmiri
+            // === South Asian / Indic (other scripts) ===
+            "bn" | "as"
+                => c"KohinoorBangla-Regular",         // Bengali/Assamese — কোহিনূর বাংলা
+            "ta" => c"TamilSangamMN",                 // Tamil — தமிழ் சங்கம்
+            "te" => c"KohinoorTelugu-Regular",        // Telugu — కోహినూర్ తెలుగు
+            "kn" => c"KannadaSangamMN",               // Kannada — ಕನ್ನಡ ಸಂಗಮ
+            "ml" => c"MalayalamSangamMN",             // Malayalam — മലയാളം സംഗമം
+            "gu" => c"KohinoorGujarati-Regular",      // Gujarati — કોહિનૂર ગુજરાતી
+            "pa" => c"GurmukhiSangamMN",              // Punjabi/Gurmukhi — ਗੁਰਮੁਖੀ ਸੰਗਮ
+            "or" => c"OriyaSangamMN",                 // Odia/Oriya — ଓଡ଼ିଆ ସଂଗମ
+            "si" => c"SinhalaSangamMN",               // Sinhala — සිංහල සංගම
+            // === Southeast Asian ===
+            "th" => c"Thonburi",                      // Thai — ธนบุรี
+            "lo" => c"LaoSangamMN",                   // Lao — ລາວ
+            "km" => c"KhmerSangamMN",                 // Khmer/Cambodian — ខ្មែរ
+            "my" => c"MyanmarSangamMN",               // Myanmar/Burmese — မြန်မာ
+            // === Middle Eastern / RTL (Arabic script) ===
+            "ar" => c"GeezaPro",                      // Arabic — العربية
+            "fa" => c"GeezaPro",                      // Persian/Farsi — فارسی
+            "ur" => c"NotoNastaliqUrdu",              // Urdu — اردو (Nastaliq style)
+            "ps" => c"GeezaPro",                      // Pashto — پښتو
+            "ku" => c"GeezaPro",                      // Kurdish (Arabic script) — کوردی
+            "sd" => c"GeezaPro",                      // Sindhi — سنڌي
+            "ug" => c"GeezaPro",                      // Uyghur — ئۇيغۇرچە
+            // === Middle Eastern / RTL (Hebrew script) ===
+            "he" | "iw" => c"ArialHebrew",            // Hebrew — עברית
+            "yi" => c"ArialHebrew",                   // Yiddish — ייִדיש (Hebrew script)
+            // === Cyrillic script ===
+            "ru" => c"HelveticaNeue",                 // Russian — Русский
+            "uk" => c"HelveticaNeue",                 // Ukrainian — Українська
+            "bg" => c"HelveticaNeue",                 // Bulgarian — Български
+            "sr" => c"HelveticaNeue",                 // Serbian — Српски
+            "be" => c"HelveticaNeue",                 // Belarusian — Беларуская
+            "mk" => c"HelveticaNeue",                 // Macedonian — Македонски
+            "kk" => c"HelveticaNeue",                 // Kazakh — Қазақша
+            "ky" => c"HelveticaNeue",                 // Kyrgyz — Кыргызча
+            "mn" => c"HelveticaNeue",                 // Mongolian — Монгол
+            "tg" => c"HelveticaNeue",                 // Tajik — Тоҷикӣ
+            "tt" => c"HelveticaNeue",                 // Tatar — Татарча
+            "ba" => c"HelveticaNeue",                 // Bashkir — Башҡортса
+            "ce" => c"HelveticaNeue",                 // Chechen — Нохчийн
+            "cv" => c"HelveticaNeue",                 // Chuvash — Чӑвашла
+            "ab" => c"HelveticaNeue",                 // Abkhazian — Аԥсуа
+            "av" => c"HelveticaNeue",                 // Avaric — Авар
+            "os" => c"HelveticaNeue",                 // Ossetian — Ирон
+            "kv" => c"HelveticaNeue",                 // Komi — Коми
+            "cu" => c"HelveticaNeue",                 // Church Slavic — Кириллица
+            "az" => c"HelveticaNeue",                 // Azerbaijani — Azərbaycan/Азәрбајҹан (Cyrillic variant)
+            "uz" => c"HelveticaNeue",                 // Uzbek — Ўзбек (Cyrillic variant)
+            "tk" => c"HelveticaNeue",                 // Turkmen — Түркмен (Cyrillic variant)
+            // === Greek script ===
+            "el" => c"HelveticaNeue",                 // Greek — Ελληνικά
+            // === Caucasian ===
+            "ka" => c"Kailasa",                       // Georgian — ქართული
+            "hy" => c"Mshtakan",                      // Armenian — Հայերեն
+            // === Tibetan / Dzongkha ===
+            "bo" => c"Kokonor",                       // Tibetan — བོད་སྐད
+            "dz" => c"Kokonor",                       // Dzongkha — རྫོང་ཁ (Tibetan script)
+            // === Thaana (Maldivian) ===
+            "dv" => c"GeezaPro",                      // Divehi/Maldivian — ދިވެހި (fallback to Arabic)
+            // === African (Ethiopic/Ge'ez script) ===
+            "am" => c"Kefa-Regular",                  // Amharic — አማርኛ
+            "ti" => c"Kefa-Regular",                  // Tigrinya — ትግርኛ
+            "om" => c"Kefa-Regular",                  // Oromo — Afaan Oromoo (Ethiopic variant)
+            // === Indigenous / Special ===
+            "iu" => c"EuphemiaUCAS",                  // Inuktitut — ᐃᓄᒃᑎᑐᑦ (Canadian Syllabics)
+            "cr" => c"EuphemiaUCAS",                  // Cree — ᓀᐦᐃᔭᐍᐏᐣ (Canadian Syllabics)
+            "oj" => c"EuphemiaUCAS",                  // Ojibwe — ᐊᓂᔑᓈᐯᒧᐎᓐ (Canadian Syllabics variant)
+            "ii" => c"PingFangSC-Regular",            // Sichuan Yi — ꆈꌠꉙ (Yi script, PingFang has coverage)
+            // === Default: Latin + CJK coverage ===
+            // Covers: en, fr, de, es, pt, it, nl, sv, da, no, fi, pl, cs, sk, hu, ro, hr,
+            //         sl, et, lt, lv, tr, vi, id, ms, tl, sw, af, sq, bs, ca, eu, gl, mt,
+            //         cy, ga, gd, br, fo, is, lb, oc, rm, fy, gv, kw, se, sm, to, fj, mg,
+            //         rw, rn, sn, st, tn, ts, ss, ve, xh, zu, wo, yo, ig, ha, ak, bm, ee,
+            //         ff, sg, ln, lg, ki, ng, ny, nv, oj, qu, ay, gn, ht, eo, ia, ie, io, vo
+            _ => c"HiraginoSans-W3",                  // Latin/default + CJK fallback
+        };
+        log::info!("Locale font: {:?} (LANG={:?})", font, lang);
+        font
+    })
+}
+
 /// Thread-local glyph cache for CoreText-rendered characters.
 /// Key: (char, cell_w, cell_h). Value: BGRA bitmap (white on transparent, alpha-masked).
 /// At blit time, foreground color is applied per-pixel using cached alpha.
@@ -819,9 +930,10 @@ impl GlyphCache {
             unsafe {
                 use objc2::msg_send;
                 use objc2::runtime::AnyObject;
+                let locale_font = detect_locale_font();
                 let font_name: *mut AnyObject = msg_send![
                     objc2::class!(NSString),
-                    stringWithUTF8String: c"HiraginoSans-W3".as_ptr()
+                    stringWithUTF8String: locale_font.as_ptr()
                 ];
                 self.ct_font = CTFontCreateWithName(font_name as *const _, cell_h as f64 - 2.0, std::ptr::null());
             }

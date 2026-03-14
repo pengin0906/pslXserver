@@ -87,7 +87,7 @@ pub struct XimAtoms {
     pub xim_xconnect: u32,     // _XIM_XCONNECT
     pub xim_protocol: u32,     // _XIM_PROTOCOL
     pub xim_moredata: u32,     // _XIM_MOREDATA
-    pub server_atom: u32,      // @server=pslx
+    pub server_atom: u32,      // @server=xerver
     pub locales: u32,          // LOCALES
     pub transport: u32,        // TRANSPORT
 }
@@ -132,12 +132,12 @@ impl XimServer {
             xim_xconnect: atoms.intern_or_create("_XIM_XCONNECT"),
             xim_protocol: atoms.intern_or_create("_XIM_PROTOCOL"),
             xim_moredata: atoms.intern_or_create("_XIM_MOREDATA"),
-            server_atom: atoms.intern_or_create("@server=pslx"),
+            server_atom: atoms.intern_or_create("@server=xerver"),
             locales: atoms.intern_or_create("LOCALES"),
             transport: atoms.intern_or_create("TRANSPORT"),
         };
 
-        info!("XIM server initialized: XIM_SERVERS={}, _XIM_XCONNECT={}, _XIM_PROTOCOL={}, @server=pslx={}",
+        info!("XIM server initialized: XIM_SERVERS={}, _XIM_XCONNECT={}, _XIM_PROTOCOL={}, @server=xerver={}",
             xim_atoms.xim_servers, xim_atoms.xim_xconnect, xim_atoms.xim_protocol, xim_atoms.server_atom);
 
         XimServer {
@@ -166,7 +166,7 @@ impl XimServer {
             return false;
         }
 
-        debug!("XIM: SelectionRequest for @server=pslx, target={}, requestor=0x{:08x}", target, requestor);
+        debug!("XIM: SelectionRequest for @server=xerver, target={}, requestor=0x{:08x}", target, requestor);
 
         if target == self.atoms.locales {
             // Reply with supported locales

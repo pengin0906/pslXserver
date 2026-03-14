@@ -224,7 +224,7 @@ async fn handle_xi_query_device<S: AsyncRead + AsyncWrite + Unpin>(
         write_valuator_class(&mut classes, SLAVE_POINTER, 0, rel_x);
         write_valuator_class(&mut classes, SLAVE_POINTER, 1, rel_y);
         write_device_info(&mut body, SLAVE_POINTER, XI_SLAVE_POINTER, MASTER_POINTER,
-                         3, "pslXserver pointer", &classes);
+                         3, "Xerver pointer", &classes);
         num_devices += 1;
     }
 
@@ -233,7 +233,7 @@ async fn handle_xi_query_device<S: AsyncRead + AsyncWrite + Unpin>(
         let mut classes = Vec::new();
         write_key_class(&mut classes, SLAVE_KEYBOARD);
         write_device_info(&mut body, SLAVE_KEYBOARD, XI_SLAVE_KEYBOARD, MASTER_KEYBOARD,
-                         1, "pslXserver keyboard", &classes);
+                         1, "Xerver keyboard", &classes);
         num_devices += 1;
     }
 
@@ -423,8 +423,8 @@ async fn handle_list_input_devices<S: AsyncRead + AsyncWrite + Unpin>(
     let devices = [
         DevInfo { type_atom: pointer_atom, id: MASTER_POINTER as u8, use_type: 0, name: "Virtual core pointer", has_key_class: false },
         DevInfo { type_atom: keyboard_atom, id: MASTER_KEYBOARD as u8, use_type: 1, name: "Virtual core keyboard", has_key_class: true },
-        DevInfo { type_atom: pointer_atom, id: SLAVE_POINTER as u8, use_type: 4, name: "pslXserver pointer", has_key_class: false },
-        DevInfo { type_atom: keyboard_atom, id: SLAVE_KEYBOARD as u8, use_type: 3, name: "pslXserver keyboard", has_key_class: true },
+        DevInfo { type_atom: pointer_atom, id: SLAVE_POINTER as u8, use_type: 4, name: "Xerver pointer", has_key_class: false },
+        DevInfo { type_atom: keyboard_atom, id: SLAVE_KEYBOARD as u8, use_type: 3, name: "Xerver keyboard", has_key_class: true },
     ];
 
     // Wire format: xDeviceInfo[N] + xInputClassInfo[] + xStrings

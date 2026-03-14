@@ -1,4 +1,4 @@
-# pslXserver iOS ビルド手順
+# Xerver iOS ビルド手順
 
 ## 前提条件
 
@@ -16,7 +16,7 @@
 ### 方法1: Xcodeから（推奨）
 
 ```bash
-open ios-app/pslXserver-iOS.xcodeproj
+open ios-app/Xerver-iOS.xcodeproj
 ```
 
 - Xcodeが開いたらTeamを設定（Signing & Capabilities）
@@ -31,8 +31,8 @@ open ios-app/pslXserver-iOS.xcodeproj
 
 # 2. Xcodeプロジェクトをビルド
 cd ios-app
-xcodebuild -project pslXserver-iOS.xcodeproj \
-  -scheme pslXserver-iOS \
+xcodebuild -project Xerver-iOS.xcodeproj \
+  -scheme Xerver-iOS \
   -configuration Release \
   -destination 'generic/platform=iOS' \
   CODE_SIGN_IDENTITY=- \
@@ -42,7 +42,7 @@ xcodebuild -project pslXserver-iOS.xcodeproj \
 ## アーキテクチャ
 
 ```
-Mac (pslXserver macOS版)     iPhone/iPad (pslXserver iOS版)
+Mac (Xerver macOS版)     iPhone/iPad (Xerver iOS版)
 ┌──────────────────────┐    ┌──────────────────────────────┐
 │ server/              │    │ server/                      │
 │  connection.rs       │    │  connection.rs               │
@@ -62,7 +62,7 @@ Mac (pslXserver macOS版)     iPhone/iPad (pslXserver iOS版)
 
 ## 使い方
 
-iPhone上でpslXserverが起動すると、TCP ポート6000でX11接続を待ち受ける。
+iPhone上でXerverが起動すると、TCP ポート6000でX11接続を待ち受ける。
 
 同じWiFi上のLinuxマシンから：
 ```bash

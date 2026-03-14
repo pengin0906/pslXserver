@@ -1,4 +1,4 @@
-# pslXserver 設計書
+# Xerver 設計書
 
 ## ビジョン
 macOSネイティブのフルセットX11サーバー。AppleがXQuartzのサポートを終了した穴を埋め、
@@ -116,14 +116,14 @@ LinuxサーバーとMacをシームレスに統合する開発環境の中核を
 ```
 ┌──────────┐  TCP/6000   ┌──────────────┐
 │  9955wx  │ ──────────→ │  Mac         │
-│  (Linux) │  SSH -Y     │  pslXserver  │
+│  (Linux) │  SSH -Y     │  Xerver  │
 │  Chrome  │ ──────────→ │  :0          │
 │  xterm   │             │              │
 └──────────┘             └──────────────┘
 
 ┌──────────┐  TCP/6000   ┌──────────────┐
 │  Docker  │ ──────────→ │  Mac         │
-│  (Colima)│  via        │  pslXserver  │
+│  (Colima)│  via        │  Xerver  │
 │  Chrome  │  192.168.   │  :0          │
 │  VS Code │  5.2        │              │
 └──────────┘             └──────────────┘

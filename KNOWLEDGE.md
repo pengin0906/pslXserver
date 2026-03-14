@@ -1,4 +1,4 @@
-# pslXserver メモ
+# Xerver メモ
 
 ## プロジェクト概要
 - Rust製macOSネイティブX11サーバー（XQuartzの代替、IME対応）
@@ -59,7 +59,7 @@
 - xterm: `ssh pengin0906@9955wx "DISPLAY=penguinnoMacBook-Air.local:0 xterm"`
 - Chrome: `ssh pengin0906@9955wx "DISPLAY=penguinnoMacBook-Air.local:0 google-chrome-stable --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run --ozone-platform=x11"`
 - VS Code: `ssh pengin0906@9955wx "DISPLAY=penguinnoMacBook-Air.local:0 code --disable-gpu --no-sandbox"`
-- pslXserverは `--tcp` 付きで起動必須
+- Xerverは `--tcp` 付きで起動必須
 
 ## Homebrew libX11 locale修正（重要・永続）
 - **問題**: Homebrew libX11 1.8.13のXSupportsLocale()が常に0を返す → xterm C locale fallback → Unicode keysym(0x0100XXXX)が文字に変換不可 → 日本語インライン表示不可
@@ -73,7 +73,7 @@
 - 変換時（テキスト変化）のみ全消去→再描画
 
 ## 修正履歴 (2026-03-07)
-- **ListFonts高速化**: `/opt/X11`から4604フォントを読み込んでいたのをやめ、6個のハードコードリストに変更。ListFontsレスポンスが1000分の1になりxterm起動が大幅高速化。pslXserverはどのフォントもファイルから読まず全てCoreTextで描画するので、ファイルシステムフォントを広告する意味がない
+- **ListFonts高速化**: `/opt/X11`から4604フォントを読み込んでいたのをやめ、6個のハードコードリストに変更。ListFontsレスポンスが1000分の1になりxterm起動が大幅高速化。Xerverはどのフォントもファイルから読まず全てCoreTextで描画するので、ファイルシステムフォントを広告する意味がない
 - **MappingNotify同期**: 固定50ms sleep → AtomicU32世代カウンター(mapping_gen)によるラウンドトリップ同期に変更。GetKeyboardMapping応答時にgenをインクリメント、send_ime_textはgen変化を1msポーリングで待機（通常5〜15ms）。初回登録のみ遅延、同じ漢字は再登録不要で即座に入力
 - **virtual_keysymsリセット廃止**: ImeCommit/ImePreeditDoneでのtruncate(86)を削除。漢字スロットを積み上げたまま保持し、同じ漢字は既存スロット再利用→MappingNotify不送信→遅延ゼロ。スロット溢れ(119個超)時のみsend_ime_text内でtruncate(86)してリセット
 - **Chrome/xtermプリエディット分離**: window_is_xterm()でxterm判定。xtermのみ仮想キーコードによるインラインプリエディット挿入、Chrome等は挿入しない（ChromeのURL補完がBackSpaceを横取りするため）

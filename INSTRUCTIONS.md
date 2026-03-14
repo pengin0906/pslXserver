@@ -1,4 +1,4 @@
-# pslXserver 作業指示・課題管理
+# Xerver 作業指示・課題管理
 
 ## 作業方針
 - [x] 問題を一つ解決するたびに修正内容をメモし、git pushして手戻りを防ぐ
@@ -153,3 +153,18 @@
 - [x][ ] XTest拡張実装 (xdotool対応) — xtest.rs作成、FakeInput/GetVersion対応
 - [x][ ] GetImage: IOSurfaceからの実ピクセルデータ読み取り — ReadPixelsコマンド追加
 - [x][x] bit_gravity対応（リサイズ時のコンテンツ移動制御）— 既にフィールド+setFrameSizeで動作
+
+## iPad (iOS) 課題 (2026-03-13)
+- [x] 漢字入力: UITextInput(setMarkedText/insertText/unmarkText)実装、IME変換・確定動作確認済み
+- [x] ソフトウェアキーボード: becomeFirstResponder実装、タップ時にバーチャルキーボード表示
+- [ ] ウィンドウサイズ: Stage Managerでぴったりサイズ出ない問題
+- [x] コピペ: UIPasteboard経由のSetClipboard/GetClipboard実装済み
+- [x] マウス対応: UIHoverGestureRecognizer + buttonMask右クリック検出実装
+- [x] スクロール: UIPanGestureRecognizer(allowedScrollTypesMask=1)実装、30pxしきい値
+- [x] Ctrl+キー: pressesBegan修飾キー検出、Ctrl+C/D/Z等の端末制御対応
+- [x] IOSurface zero-copy: CGImage経由コピー廃止、macOS同様のsetContents:IOSurface
+
+### パフォーマンス最適化 (2026-03-13)
+- [x] DashMap is_empty()廃止: 全16シャード読みロック→個別get_mutに変更。プロトコルスレッドとの競合19K→9サンプルに激減
+- [x] レンダーメールボックスMAX_COMMANDS=4096: メモリリーク防止 (ico 55GB→121MB安定)
+- [x] iOS flush_window_to_layer: CFData→CGImage→setContentsを廃止、IOSurface直接設定（5サンプルに激減）

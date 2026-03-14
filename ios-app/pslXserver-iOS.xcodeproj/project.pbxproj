@@ -8,7 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		A1000001 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001; };
-		A1000002 /* libpslXserver.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000002; };
+		A1000002 /* libXerver.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000002; };
 		A1000003 /* IOSurface.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000003; };
 		A1000004 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000004; };
 		A1000005 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000005; };
@@ -16,21 +16,25 @@
 		A1000007 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000007; };
 		A1000008 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000008; };
 		A1000009 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A200000C; };
+		A100000A /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A200000D; };
+		A100000B /* AVFAudio.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A200000E; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A2000001 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
-		A2000002 /* libpslXserver.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libpslXserver.a; path = "../../target/aarch64-apple-ios-sim/release/libpslXserver.a"; sourceTree = "<group>"; };
+		A2000002 /* libXerver.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libXerver.a; path = "../../target/aarch64-apple-ios-sim/release/libXerver.a"; sourceTree = "<group>"; };
 		A2000003 /* IOSurface.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOSurface.framework; path = System/Library/Frameworks/IOSurface.framework; sourceTree = SDKROOT; };
 		A2000004 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
 		A2000005 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		A2000006 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
 		A2000007 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		A2000008 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
-		A2000009 /* pslXserver-iOS-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "pslXserver-iOS-Bridging-Header.h"; sourceTree = "<group>"; };
+		A2000009 /* Xerver-iOS-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Xerver-iOS-Bridging-Header.h"; sourceTree = "<group>"; };
 		A200000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		A200000B /* pslXserver-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "pslXserver-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A200000B /* Xerver-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Xerver-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		A200000C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A200000D /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
+		A200000E /* AVFAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFAudio.framework; path = System/Library/Frameworks/AVFAudio.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -45,6 +49,8 @@
 				A1000006,
 				A1000007,
 				A1000008,
+				A100000A,
+				A100000B,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -60,7 +66,7 @@
 			);
 			sourceTree = "<group>";
 		};
-		A4000002 /* pslXserver-iOS */ = {
+		A4000002 /* Xerver-iOS */ = {
 			isa = PBXGroup;
 			children = (
 				A2000001,
@@ -68,7 +74,7 @@
 				A200000A,
 				A200000C,
 			);
-			path = "pslXserver-iOS";
+			path = "Xerver-iOS";
 			sourceTree = "<group>";
 		};
 		A4000003 /* Frameworks */ = {
@@ -81,6 +87,8 @@
 				A2000006,
 				A2000007,
 				A2000008,
+				A200000D,
+				A200000E,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -88,7 +96,7 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		A5000001 /* pslXserver-iOS */ = {
+		A5000001 /* Xerver-iOS */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = A6000003;
 			buildPhases = (
@@ -101,8 +109,8 @@
 			);
 			dependencies = (
 			);
-			name = "pslXserver-iOS";
-			productName = "pslXserver-iOS";
+			name = "Xerver-iOS";
+			productName = "Xerver-iOS";
 			productReference = A200000B;
 			productType = "com.apple.product-type.application";
 		};
@@ -205,22 +213,21 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				INFOPLIST_FILE = "pslXserver-iOS/Info.plist";
+				DEVELOPMENT_TEAM = 7ZKWW636GM;
+				INFOPLIST_FILE = "Xerver-iOS/Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = (
-					"$(SRCROOT)/../target/aarch64-apple-ios/release",
-					"$(SRCROOT)/../target/aarch64-apple-ios-sim/release",
-				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/../target/aarch64-apple-ios/release";
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "$(SRCROOT)/../target/aarch64-apple-ios-sim/release";
 				OTHER_LDFLAGS = (
 					"-lresolv",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.pslx.pslXserver-iOS";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.pslx.Xerver-iOS";
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SWIFT_BRIDGING_HEADER = "pslXserver-iOS/pslXserver-iOS-Bridging-Header.h";
+				SWIFT_BRIDGING_HEADER = "Xerver-iOS/Xerver-iOS-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};

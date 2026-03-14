@@ -47,12 +47,9 @@ unsafe fn become_first_responder_deferred(view: *mut AnyObject) {
     let _: () = msg_send![view, performSelector: sel_become withObject: nil afterDelay: 0.0_f64];
 }
 
-/// Write debug message to /tmp/pslx_ios.log (visible from host for simulator debugging).
+/// Write debug message to stderr (visible via devicectl --console on real device).
 fn ios_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/pslx_ios.log") {
-        let _ = writeln!(f, "{}", msg);
-    }
+    eprintln!("[pslx-ios] {}", msg);
 }
 
 // --- IOSurface FFI (same as macOS) ---
@@ -158,12 +155,19 @@ struct WindowInfo {
     title: String,
     /// override_redirect flag (same as macOS borderless style).
     override_redirect: bool,
-    /// CALayer for rendering this window's content (UIView.layer, like macOS contentView.layer).
+    /// Content CALayer — holds IOSurface, positioned at y=TITLE_BAR_HEIGHT within container_layer.
     ca_layer: *mut AnyObject,
+    /// Container CALayer — parent of title bar + ca_layer. This is what gets moved for dragging.
+    /// Positioned at (x11_x, x11_y), size = (width, height + TITLE_BAR_HEIGHT).
+    container_layer: *mut AnyObject,
     /// Per-window UIWindow (like macOS NSWindow). May be null until scene_will_connect.
     ui_window: *mut AnyObject,
     /// Per-window PSLXView (like macOS PSLXInputView/contentView).
     ui_view: *mut AnyObject,
+    /// Title bar UIView with traffic light buttons (red/yellow/green).
+    title_bar: *mut AnyObject,
+    /// Whether this window is in fullscreen mode (title bar hidden).
+    is_fullscreen: bool,
     /// Deferred show: ShowWindow was called before scene_will_connect created the UIWindow.
     pending_show: bool,
 }
@@ -176,16 +180,14 @@ impl Drop for WindowInfo {
         if !self.display_surface.is_null() {
             unsafe { CFRelease(self.display_surface as *const c_void); }
         }
+        // CALayer (IOSurface layer on PSLXView) — just release, no removeFromSuperlayer needed
+        // (UIWindow is hidden, view will be released separately)
         if !self.ca_layer.is_null() {
             unsafe {
-                let _: () = msg_send![self.ca_layer, removeFromSuperlayer];
                 CFRelease(self.ca_layer as *const c_void);
             }
         }
-        // UIWindow cleanup: just hide. Do NOT call setRootViewController:nil (triggers
-        // UIKit transition animation → SIGSEGV in -[UIView frame] from UIPresentationController)
-        // and do NOT call CFRelease (causes SIGSEGV in CALayerGetSuperlayer during layout).
-        // UIKit holds its own strong references; hiding is sufficient for our use case.
+        // UIWindow cleanup: just hide.
         if !self.ui_window.is_null() {
             unsafe {
                 let _: () = msg_send![self.ui_window, setHidden: true];
@@ -257,6 +259,7 @@ fn get_pslx_view_class() -> &'static AnyClass {
             .expect("Failed to create PSLXView class");
 
         builder.add_ivar::<u8>(c"textInserted");
+        builder.add_ivar::<u32>(c"x11WindowId"); // X11 window ID for per-window event routing
         builder.add_ivar::<*mut AnyObject>(c"_inputDelegate"); // UITextInput inputDelegate property
         builder.add_ivar::<*mut AnyObject>(c"_tokenizer"); // UITextInput tokenizer property
 
@@ -294,6 +297,9 @@ fn get_pslx_view_class() -> &'static AnyClass {
             // canBecomeFirstResponder -> YES
             class_addMethod(raw_cls, objc2::sel!(canBecomeFirstResponder),
                 can_become_first_responder as *const c_void, c"B@:".as_ptr() as _);
+            // becomeFirstResponder — track focused view for keyboard event routing
+            class_addMethod(raw_cls, objc2::sel!(becomeFirstResponder),
+                become_first_responder as *const c_void, c"B@:".as_ptr() as _);
             // resignFirstResponder — log when UIKit takes focus away
             class_addMethod(raw_cls, objc2::sel!(resignFirstResponder),
                 resign_first_responder as *const c_void, c"B@:".as_ptr() as _);
@@ -403,6 +409,42 @@ fn get_pslx_view_class() -> &'static AnyClass {
             class_addMethod(raw_cls, objc2::sel!(handleScroll:),
                 handle_scroll as *const c_void, c"v@:@".as_ptr() as _);
 
+            // Touch scroll handler (2-finger pan → Button4/5 emulation, like jog dial)
+            class_addMethod(raw_cls, objc2::sel!(handleTouchScroll:),
+                handle_touch_scroll as *const c_void, c"v@:@".as_ptr() as _);
+
+            // inputAccessoryView — shows Ctrl/Esc/Tab/arrow toolbar above the keyboard
+            class_addMethod(raw_cls, objc2::sel!(inputAccessoryView),
+                input_accessory_view as *const c_void, c"@@:".as_ptr() as _);
+
+            // Control key shortcuts (targets for accessory toolbar buttons)
+            class_addMethod(raw_cls, objc2::sel!(sendCtrlC),
+                send_ctrl_c as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendCtrlD),
+                send_ctrl_d as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendCtrlZ),
+                send_ctrl_z as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendCtrlA),
+                send_ctrl_a as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendCtrlE),
+                send_ctrl_e as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendCtrlU),
+                send_ctrl_u as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendCtrlL),
+                send_ctrl_l as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendEsc),
+                send_esc as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendTab),
+                send_tab as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendArrowUp),
+                send_arrow_up as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendArrowDown),
+                send_arrow_down as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendArrowLeft),
+                send_arrow_left as *const c_void, c"v@:".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(sendArrowRight),
+                send_arrow_right as *const c_void, c"v@:".as_ptr() as _);
+
             CLASS = raw_cls as *const AnyClass;
         }
     });
@@ -415,6 +457,16 @@ fn get_pslx_view_class() -> &'static AnyClass {
 unsafe extern "C" fn can_become_first_responder(_this: *mut AnyObject, _sel: Sel) -> Bool {
     ios_log("canBecomeFirstResponder -> YES");
     Bool::YES
+}
+
+unsafe extern "C" fn become_first_responder(this: *mut AnyObject, sel: Sel) -> Bool {
+    // Update FOCUSED_VIEW so get_focused_x11_window() returns this view's x11_id
+    FOCUSED_VIEW.store(this as usize, std::sync::atomic::Ordering::Relaxed);
+    let x11_id = view_x11_id(this);
+    ios_log(&format!("becomeFirstResponder: view={:p} x11=0x{:08x}", this, x11_id));
+    // Call super implementation
+    let superclass = objc2::class!(UIView);
+    objc2::msg_send![super(this, superclass), becomeFirstResponder]
 }
 
 unsafe extern "C" fn resign_first_responder(_this: *mut AnyObject, _sel: Sel) -> Bool {
@@ -849,18 +901,158 @@ unsafe extern "C" fn text_range_is_empty(this: *mut AnyObject, _sel: Sel) -> Boo
     if v != 0 { Bool::YES } else { Bool::NO }
 }
 
-/// UIKeyInput deleteBackward — Backspace key
-unsafe extern "C" fn delete_backward(_this: *mut AnyObject, _sel: Sel) {
+// --- Keyboard accessory view (Ctrl/Esc/Tab/arrow toolbar above software keyboard) ---
+
+/// Helper: send a key event to the focused X11 window.
+fn send_key_to_focused(keycode: u8, state: u16) {
     let x11_id = get_focused_x11_window();
+    if x11_id == 0 { return; }
+    let time = get_timestamp();
+    send_display_event(DisplayEvent::KeyPress { window: x11_id, keycode, state, time });
+    send_display_event(DisplayEvent::KeyRelease { window: x11_id, keycode, state, time });
+}
+
+// Ctrl modifier state = 4
+const CTRL: u16 = 4;
+
+unsafe extern "C" fn send_ctrl_c(_this: *mut AnyObject, _sel: Sel) { send_key_to_focused(16, CTRL); } // C = mac 8, X11=16
+unsafe extern "C" fn send_ctrl_d(_this: *mut AnyObject, _sel: Sel) { send_key_to_focused(10, CTRL); } // D = mac 2, X11=10
+unsafe extern "C" fn send_ctrl_z(_this: *mut AnyObject, _sel: Sel) { send_key_to_focused(14, CTRL); } // Z = mac 6, X11=14
+unsafe extern "C" fn send_ctrl_a(_this: *mut AnyObject, _sel: Sel) { send_key_to_focused(8,  CTRL); } // A = mac 0, X11=8
+unsafe extern "C" fn send_ctrl_e(_this: *mut AnyObject, _sel: Sel) { send_key_to_focused(22, CTRL); } // E = mac 14, X11=22
+unsafe extern "C" fn send_ctrl_u(_this: *mut AnyObject, _sel: Sel) { send_key_to_focused(40, CTRL); } // U = mac 32, X11=40
+unsafe extern "C" fn send_ctrl_l(_this: *mut AnyObject, _sel: Sel) { send_key_to_focused(45, CTRL); } // L = mac 37, X11=45
+unsafe extern "C" fn send_esc(_this: *mut AnyObject, _sel: Sel)    { send_key_to_focused(61, 0); }    // Esc = mac 53, X11=61
+unsafe extern "C" fn send_tab(_this: *mut AnyObject, _sel: Sel)    { send_key_to_focused(56, 0); }    // Tab = mac 48, X11=56
+unsafe extern "C" fn send_arrow_up(_this: *mut AnyObject, _sel: Sel)    { send_key_to_focused(134, 0); } // ↑ = mac 126, X11=134
+unsafe extern "C" fn send_arrow_down(_this: *mut AnyObject, _sel: Sel)  { send_key_to_focused(133, 0); } // ↓ = mac 125, X11=133
+unsafe extern "C" fn send_arrow_left(_this: *mut AnyObject, _sel: Sel)  { send_key_to_focused(131, 0); } // ← = mac 123, X11=131
+unsafe extern "C" fn send_arrow_right(_this: *mut AnyObject, _sel: Sel) { send_key_to_focused(132, 0); } // → = mac 124, X11=132
+
+/// inputAccessoryView — creates the Ctrl/Esc/Tab/arrow toolbar shown above the keyboard.
+/// Returns a UIScrollView containing shortcut buttons.
+unsafe extern "C" fn input_accessory_view(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    // Return cached accessory view (created once).
+    static CACHED_VIEW: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+    let cached = *CACHED_VIEW.lock().unwrap();
+    if cached != 0 { return cached as *mut AnyObject; }
+
+    use objc2::encode::{Encode, Encoding};
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGRect { origin: [f64; 2], size: [f64; 2] }
+    unsafe impl Encode for CGRect {
+        const ENCODING: Encoding = Encoding::Struct("CGRect", &[
+            Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
+            Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
+        ]);
+    }
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGPoint { x: f64, y: f64 }
+    unsafe impl Encode for CGPoint {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+
+    let height = 44.0_f64;
+    let bar_frame = CGRect { origin: [0.0, 0.0], size: [0.0, height] };
+
+    // Use UIScrollView so buttons can be scrolled if they don't all fit.
+    let scroll: *mut AnyObject = msg_send![objc2::class!(UIScrollView), alloc];
+    let scroll: *mut AnyObject = msg_send![scroll, initWithFrame: bar_frame];
+    // Dark toolbar background
+    let dark: *mut AnyObject = msg_send![objc2::class!(UIColor),
+        colorWithRed: 0.18_f64 green: 0.18_f64 blue: 0.18_f64 alpha: 1.0_f64];
+    let _: () = msg_send![scroll, setBackgroundColor: dark];
+    let _: () = msg_send![scroll, setShowsHorizontalScrollIndicator: false];
+
+    // Button definitions: (title, selector_string)
+    let buttons: &[(&str, objc2::runtime::Sel)] = &[
+        ("^C",  objc2::sel!(sendCtrlC)),
+        ("^D",  objc2::sel!(sendCtrlD)),
+        ("^Z",  objc2::sel!(sendCtrlZ)),
+        ("^A",  objc2::sel!(sendCtrlA)),
+        ("^E",  objc2::sel!(sendCtrlE)),
+        ("^U",  objc2::sel!(sendCtrlU)),
+        ("^L",  objc2::sel!(sendCtrlL)),
+        ("Esc", objc2::sel!(sendEsc)),
+        ("Tab", objc2::sel!(sendTab)),
+        ("↑",   objc2::sel!(sendArrowUp)),
+        ("↓",   objc2::sel!(sendArrowDown)),
+        ("←",   objc2::sel!(sendArrowLeft)),
+        ("→",   objc2::sel!(sendArrowRight)),
+    ];
+
+    let btn_w = 54.0_f64;
+    let btn_gap = 4.0_f64;
+    let btn_h = height - 8.0;
+    let btn_y = 4.0;
+    let white: *mut AnyObject = msg_send![objc2::class!(UIColor), whiteColor];
+    let white_cg: *const std::ffi::c_void = msg_send![white, CGColor];
+    let btn_bg: *mut AnyObject = msg_send![objc2::class!(UIColor),
+        colorWithRed: 0.30_f64 green: 0.30_f64 blue: 0.30_f64 alpha: 1.0_f64];
+    let btn_bg_cg: *const std::ffi::c_void = msg_send![btn_bg, CGColor];
+
+    // We need a view to act as the button target (must be a PSLXView for our selectors).
+    // Create a thin proxy PSLXView that is NOT displayed but handles the button actions.
+    let view_cls = get_pslx_view_class();
+    let proxy: *mut AnyObject = msg_send![view_cls, alloc];
+    let proxy_frame = CGRect { origin: [0.0, 0.0], size: [0.0, 0.0] };
+    let proxy: *mut AnyObject = msg_send![proxy, initWithFrame: proxy_frame];
+    // Retain so it stays alive
+    let _: *mut AnyObject = msg_send![proxy, retain];
+
+    for (i, (title, sel)) in buttons.iter().enumerate() {
+        let x = i as f64 * (btn_w + btn_gap) + btn_gap;
+        let btn_frame = CGRect { origin: [x, btn_y], size: [btn_w, btn_h] };
+
+        // UIButtonTypeSystem = 1
+        let btn: *mut AnyObject = msg_send![objc2::class!(UIButton), buttonWithType: 1i64];
+        let _: () = msg_send![btn, setFrame: btn_frame];
+
+        let title_ns = NSString::from_str(title);
+        // UIControlStateNormal = 0
+        let _: () = msg_send![btn, setTitle: &*title_ns forState: 0u64];
+        let _: () = msg_send![btn, setTitleColor: white forState: 0u64];
+
+        // Round corners
+        let layer: *mut AnyObject = msg_send![btn, layer];
+        let _: () = msg_send![layer, setCornerRadius: 5.0_f64];
+        let _: () = msg_send![layer, setBackgroundColor: btn_bg_cg];
+
+        // Target-action: UIControlEventTouchUpInside = 64
+        let _: () = msg_send![btn, addTarget: proxy action: *sel forControlEvents: 64u64];
+        let _: () = msg_send![scroll, addSubview: btn];
+    }
+
+    // Set content size so scrolling works
+    let total_w = buttons.len() as f64 * (btn_w + btn_gap) + btn_gap;
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGSize { w: f64, h: f64 }
+    unsafe impl Encode for CGSize {
+        const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+    }
+    let content_size = CGSize { w: total_w, h: height };
+    let _: () = msg_send![scroll, setContentSize: content_size];
+
+    let _: *mut AnyObject = msg_send![scroll, retain];
+    *CACHED_VIEW.lock().unwrap() = scroll as usize;
+    scroll
+}
+
+/// UIKeyInput deleteBackward — Backspace key (software keyboard)
+unsafe extern "C" fn delete_backward(this: *mut AnyObject, _sel: Sel) {
+    let x11_id = view_x11_id(this);
     ios_log(&format!("deleteBackward: x11=0x{:08x}", x11_id));
     if x11_id == 0 { return; }
     let time = get_timestamp();
-    // X11 keycode for BackSpace = 22 (8 + macOS keycode 51... just use 22 directly)
+    // macOS keycode 51 = Backspace → X11 keycode = 51 + 8 = 59
     send_display_event(DisplayEvent::KeyPress {
-        window: x11_id, keycode: 22, state: 0, time,
+        window: x11_id, keycode: 59, state: 0, time,
     });
     send_display_event(DisplayEvent::KeyRelease {
-        window: x11_id, keycode: 22, state: 0, time,
+        window: x11_id, keycode: 59, state: 0, time,
     });
 }
 
@@ -877,123 +1069,428 @@ unsafe extern "C" fn autocapitalization_type(_this: *mut AnyObject, _sel: Sel) -
     0 // UITextAutocapitalizationTypeNone
 }
 
+// --- Title bar with traffic light buttons (red/yellow/green) ---
+
+const IOS_TITLE_BAR_HEIGHT: f64 = 36.0;
+
+/// Create a title bar UIView with red (close), yellow (minimize), green (fullscreen) buttons.
+/// Returns the title bar view (retained). Also sets window title text.
+unsafe fn create_title_bar(width: f64, title: &str, x11_id: u32) -> *mut AnyObject {
+    use objc2::encode::{Encode, Encoding};
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGRect { origin: [f64; 2], size: [f64; 2] }
+    unsafe impl Encode for CGRect {
+        const ENCODING: Encoding = Encoding::Struct("CGRect", &[
+            Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
+            Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
+        ]);
+    }
+
+    let bar_frame = CGRect { origin: [0.0, 0.0], size: [width, IOS_TITLE_BAR_HEIGHT] };
+    let bar: *mut AnyObject = msg_send![objc2::class!(UIView), alloc];
+    let bar: *mut AnyObject = msg_send![bar, initWithFrame: bar_frame];
+
+    // Dark background (#2D2D2D)
+    let bg_color: *mut AnyObject = msg_send![objc2::class!(UIColor),
+        colorWithRed: 0.176_f64 green: 0.176_f64 blue: 0.176_f64 alpha: 1.0_f64];
+    let _: () = msg_send![bar, setBackgroundColor: bg_color];
+
+    // Traffic light button target handler class
+    let handler_cls = get_title_bar_handler_class();
+    let handler: *mut AnyObject = msg_send![handler_cls, alloc];
+    let handler: *mut AnyObject = msg_send![handler, init];
+    // Store x11_id in handler via ivar
+    if let Some(ivar) = (*handler).class().instance_variable(c"x11WindowId") {
+        *ivar.load_mut::<u32>(&mut *handler) = x11_id;
+    }
+    let _: *mut AnyObject = msg_send![handler, retain];
+
+    // Button definitions: (color_r, color_g, color_b, selector)
+    let buttons: &[(f64, f64, f64, Sel)] = &[
+        (0.937, 0.325, 0.314, objc2::sel!(closeWindow:)),    // Red — close
+        (0.988, 0.741, 0.176, objc2::sel!(minimizeWindow:)), // Yellow — minimize
+        (0.157, 0.788, 0.263, objc2::sel!(fullscreenWindow:)), // Green — fullscreen
+    ];
+
+    let btn_size = 14.0_f64;
+    let btn_gap = 8.0_f64;
+    let start_x = 12.0_f64;
+    let btn_y = (IOS_TITLE_BAR_HEIGHT - btn_size) / 2.0;
+
+    for (i, (r, g, b, sel)) in buttons.iter().enumerate() {
+        let x = start_x + i as f64 * (btn_size + btn_gap);
+        let btn_frame = CGRect { origin: [x, btn_y], size: [btn_size, btn_size] };
+
+        // UIButtonTypeCustom = 0
+        let btn: *mut AnyObject = msg_send![objc2::class!(UIButton), buttonWithType: 0i64];
+        let _: () = msg_send![btn, setFrame: btn_frame];
+
+        let color: *mut AnyObject = msg_send![objc2::class!(UIColor),
+            colorWithRed: *r green: *g blue: *b alpha: 1.0_f64];
+        let _: () = msg_send![btn, setBackgroundColor: color];
+
+        // Round circle
+        let layer: *mut AnyObject = msg_send![btn, layer];
+        let _: () = msg_send![layer, setCornerRadius: btn_size / 2.0];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+
+        // Target-action: UIControlEventTouchUpInside = 64
+        let _: () = msg_send![btn, addTarget: handler action: *sel forControlEvents: 64u64];
+        let _: () = msg_send![bar, addSubview: btn];
+    }
+
+    // Title label
+    let label_x = start_x + 3.0 * (btn_size + btn_gap) + 8.0;
+    let label_frame = CGRect { origin: [label_x, 0.0], size: [width - label_x - 8.0, IOS_TITLE_BAR_HEIGHT] };
+    let label: *mut AnyObject = msg_send![objc2::class!(UILabel), alloc];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: label_frame];
+    let title_ns = NSString::from_str(title);
+    let _: () = msg_send![label, setText: &*title_ns];
+    let white: *mut AnyObject = msg_send![objc2::class!(UIColor),
+        colorWithRed: 0.85_f64 green: 0.85_f64 blue: 0.85_f64 alpha: 1.0_f64];
+    let _: () = msg_send![label, setTextColor: white];
+    let font: *mut AnyObject = msg_send![objc2::class!(UIFont), systemFontOfSize: 13.0_f64];
+    let _: () = msg_send![label, setFont: font];
+    // Tag = 100 so we can find it later to update title
+    let _: () = msg_send![label, setTag: 100i64];
+    let _: () = msg_send![bar, addSubview: label];
+
+    let _: *mut AnyObject = msg_send![bar, retain];
+    bar
+}
+
+/// ObjC class for title bar button actions.
+fn get_title_bar_handler_class() -> &'static AnyClass {
+    use std::sync::Once;
+    static mut CLASS: *const AnyClass = std::ptr::null();
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let superclass = objc2::class!(NSObject);
+        let mut builder = ClassBuilder::new(c"PSLXTitleBarHandler", superclass)
+            .expect("Failed to create PSLXTitleBarHandler class");
+
+        builder.add_ivar::<u32>(c"x11WindowId");
+
+        extern "C" {
+            fn class_addMethod(
+                cls: *mut c_void, sel: Sel, imp: *const c_void, types: *const std::ffi::c_char,
+            ) -> bool;
+        }
+
+        let raw_cls = builder.register() as *const AnyClass as *mut c_void;
+        unsafe {
+            class_addMethod(raw_cls, objc2::sel!(closeWindow:),
+                title_bar_close as *const c_void, c"v@:@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(minimizeWindow:),
+                title_bar_minimize as *const c_void, c"v@:@".as_ptr() as _);
+            class_addMethod(raw_cls, objc2::sel!(fullscreenWindow:),
+                title_bar_fullscreen as *const c_void, c"v@:@".as_ptr() as _);
+            CLASS = raw_cls as *const AnyClass;
+        }
+    });
+
+    unsafe { &*CLASS }
+}
+
+/// Red button — close: send DestroyNotify to X11 client
+unsafe extern "C" fn title_bar_close(this: *mut AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+    let x11_id = if let Some(ivar) = (*this).class().instance_variable(c"x11WindowId") {
+        *ivar.load::<u32>(&*this)
+    } else { return; };
+    ios_log(&format!("title_bar_close: x11=0x{:08X}", x11_id));
+    // Send WM_DELETE_WINDOW ClientMessage (graceful close)
+    send_display_event(DisplayEvent::WindowCloseRequested { window: x11_id });
+}
+
+/// Yellow button — minimize: hide the UIWindow (Stage Manager keeps it in the shelf)
+unsafe extern "C" fn title_bar_minimize(this: *mut AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+    let x11_id = if let Some(ivar) = (*this).class().instance_variable(c"x11WindowId") {
+        *ivar.load::<u32>(&*this)
+    } else { return; };
+    ios_log(&format!("title_bar_minimize: x11=0x{:08X}", x11_id));
+    // Find the UIWindow for this X11 window and hide it
+    WINDOWS.with(|w| {
+        let ws = w.borrow();
+        for info in ws.values() {
+            if info.x11_id == x11_id && !info.ui_window.is_null() {
+                let _: () = msg_send![info.ui_window, setHidden: true];
+                break;
+            }
+        }
+    });
+}
+
+/// Green button — toggle fullscreen
+unsafe extern "C" fn title_bar_fullscreen(this: *mut AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+    let x11_id = if let Some(ivar) = (*this).class().instance_variable(c"x11WindowId") {
+        *ivar.load::<u32>(&*this)
+    } else { return; };
+    ios_log(&format!("title_bar_fullscreen: x11=0x{:08X}", x11_id));
+    toggle_fullscreen(x11_id);
+}
+
+/// Toggle fullscreen: hide/show title bar, resize content to fill window.
+fn toggle_fullscreen(x11_id: u32) {
+    use objc2::encode::{Encode, Encoding};
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGRect { origin: [f64; 2], size: [f64; 2] }
+    unsafe impl Encode for CGRect {
+        const ENCODING: Encoding = Encoding::Struct("CGRect", &[
+            Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
+            Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
+        ]);
+    }
+
+    WINDOWS.with(|w| {
+        let mut ws = w.borrow_mut();
+        for info in ws.values_mut() {
+            if info.x11_id != x11_id { continue; }
+            info.is_fullscreen = !info.is_fullscreen;
+            let fs = info.is_fullscreen;
+
+            unsafe {
+                if !info.title_bar.is_null() {
+                    // Hide/show title bar
+                    let _: () = msg_send![info.title_bar, setHidden: fs];
+                }
+
+                if !info.ui_view.is_null() {
+                    // Reposition content view: fullscreen → y=0, normal → y=title_bar_height
+                    let y_offset = if fs { 0.0 } else { IOS_TITLE_BAR_HEIGHT };
+                    let win_bounds: CGRect = if !info.ui_window.is_null() {
+                        msg_send![info.ui_window, bounds]
+                    } else {
+                        CGRect { origin: [0.0, 0.0], size: [info.width as f64, info.height as f64 + IOS_TITLE_BAR_HEIGHT] }
+                    };
+                    let content_h = win_bounds.size[1] - y_offset;
+                    let content_w = win_bounds.size[0];
+                    let view_frame = CGRect {
+                        origin: [0.0, y_offset],
+                        size: [content_w, content_h],
+                    };
+                    let _: () = msg_send![info.ui_view, setFrame: view_frame];
+                }
+            }
+
+            ios_log(&format!("toggle_fullscreen: x11=0x{:08X} fullscreen={}", x11_id, fs));
+            break;
+        }
+    });
+}
+
 // --- Touch handling → X11 mouse events ---
 
 /// Height of the drag handle area at the top of each window (points = X11 pixels at contentsScale=1.0).
 const TITLE_BAR_HEIGHT: i16 = 30;
 
+/// Touch mode state machine:
+/// - Undecided: just touched, waiting to see if it's a tap, scroll, or drag
+/// - Scrolling: finger moved >10px before long-press threshold → emit Button4/5
+/// - Dragging: long press detected (>300ms) → emit ButtonPress + MotionNotify
+#[derive(Clone, Copy, PartialEq)]
+enum TouchMode { Undecided, Scrolling, Dragging }
+
+thread_local! {
+    static TOUCH_MODE: std::cell::Cell<TouchMode> = const { std::cell::Cell::new(TouchMode::Undecided) };
+    static TOUCH_START_XY: std::cell::Cell<(i16, i16)> = const { std::cell::Cell::new((0, 0)) };
+    static TOUCH_START_TIME: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static TOUCH_SCROLL_Y: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    static TOUCH_SCROLL_HX: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+const TOUCH_MOVE_THRESHOLD: i16 = 10; // pixels to distinguish scroll from tap
+const TOUCH_LONG_PRESS_MS: u32 = 300; // ms before long-press = drag mode
+
 unsafe extern "C" fn touches_began(this: *mut AnyObject, _sel: Sel, touches: *mut AnyObject, event: *mut AnyObject) {
     let touch = get_first_touch(touches);
     if touch.is_null() { return; }
     let (x, y) = touch_location_in_view(touch, this);
-    ios_log(&format!("touchesBegan: ({},{})", x, y));
     let time = get_timestamp();
 
     // Detect mouse button from UIEvent.buttonMask (iOS 13.4+)
-    // buttonMask: 1=primary(left), 2=secondary(right), 4=middle
     let button: u8 = if !event.is_null() {
         let mask: i64 = msg_send![event, buttonMask];
-        if mask & 2 != 0 { 3 }      // Right click → X11 Button3
-        else if mask & 4 != 0 { 2 }  // Middle click → X11 Button2
-        else { 1 }                    // Left click → X11 Button1
+        if mask & 2 != 0 { 3 } else if mask & 4 != 0 { 2 } else { 1 }
     } else { 1 };
 
-    // Check if touch is in a window's title bar (top TITLE_BAR_HEIGHT pixels)
-    // Only allow drag with left button
-    if button == 1 {
-        if let Some((native_id, layer_x, layer_y)) = find_window_titlebar_at(x, y) {
-            DRAG_STATE.with(|ds| ds.set(Some((native_id, layer_x, layer_y, x as f64, y as f64))));
-            return; // Don't send X11 events during drag
-        }
-    }
+    let x11_id = view_x11_id(this);
+    if x11_id == 0 { return; }
 
-    let x11_id = find_x11_window_at(x, y);
-    if x11_id == 0 {
-        // Tap on empty area — toggle keyboard
-        let _: () = msg_send![this, becomeFirstResponder];
-        return;
-    }
-    let (win_x, win_y) = screen_to_window_coords(x, y, x11_id);
-
-    // Show keyboard when tapping an X11 window
     let _: () = msg_send![this, becomeFirstResponder];
 
-    // Store button for matching release
-    GRAB_BUTTON.with(|gb| gb.set(button));
-    GRAB_WINDOW.with(|gw| gw.set(Some(x11_id)));
-    send_display_event(DisplayEvent::ButtonPress {
-        window: x11_id, button,
-        x: win_x, y: win_y, root_x: x, root_y: y,
-        state: 0, time,
-    });
-    send_display_event(DisplayEvent::FocusIn { window: x11_id });
+    // If using mouse/trackpad (buttonMask != 0), go straight to drag mode
+    let is_mouse = if !event.is_null() {
+        let mask: i64 = msg_send![event, buttonMask];
+        mask != 0
+    } else { false };
+
+    if is_mouse {
+        TOUCH_MODE.with(|m| m.set(TouchMode::Dragging));
+        GRAB_BUTTON.with(|gb| gb.set(button));
+        GRAB_WINDOW.with(|gw| gw.set(Some(x11_id)));
+        send_display_event(DisplayEvent::ButtonPress {
+            window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+        });
+        send_display_event(DisplayEvent::FocusIn { window: x11_id });
+    } else {
+        // Touch: start in undecided mode
+        TOUCH_MODE.with(|m| m.set(TouchMode::Undecided));
+        TOUCH_START_XY.with(|s| s.set((x, y)));
+        TOUCH_START_TIME.with(|t| t.set(time));
+        TOUCH_SCROLL_Y.with(|a| a.set(0));
+        TOUCH_SCROLL_HX.with(|a| a.set(0));
+        GRAB_BUTTON.with(|gb| gb.set(button));
+        GRAB_WINDOW.with(|gw| gw.set(Some(x11_id)));
+        send_display_event(DisplayEvent::FocusIn { window: x11_id });
+    }
 }
 
 unsafe extern "C" fn touches_moved(this: *mut AnyObject, _sel: Sel, touches: *mut AnyObject, _event: *mut AnyObject) {
     let touch = get_first_touch(touches);
     if touch.is_null() { return; }
     let (x, y) = touch_location_in_view(touch, this);
-
-    // Check if we're in drag mode
-    let drag = DRAG_STATE.with(|ds| ds.get());
-    if let Some((native_id, start_lx, start_ly, start_tx, start_ty)) = drag {
-        let dx = x as f64 - start_tx;
-        let dy = y as f64 - start_ty;
-        let new_x = start_lx + dx;
-        let new_y = start_ly + dy;
-        move_window_layer(native_id, new_x, new_y);
-        return;
-    }
-
     let time = get_timestamp();
-    let grab_xid = GRAB_WINDOW.with(|gw| gw.get());
-    let x11_id = grab_xid.unwrap_or_else(|| find_x11_window_at(x, y));
+    let x11_id = view_x11_id(this);
     if x11_id == 0 { return; }
-    let (win_x, win_y) = screen_to_window_coords(x, y, x11_id);
 
     LAST_POINTER.with(|lp| lp.set((x, y)));
-    let button = GRAB_BUTTON.with(|gb| gb.get());
-    let btn_state = match button { 1 => 0x100u16, 2 => 0x200, 3 => 0x400, _ => 0x100 };
-    send_display_event(DisplayEvent::MotionNotify {
-        window: x11_id, x: win_x, y: win_y,
-        root_x: x, root_y: y, state: btn_state, time,
-    });
+
+    let mode = TOUCH_MODE.with(|m| m.get());
+    match mode {
+        TouchMode::Undecided => {
+            let (sx, sy) = TOUCH_START_XY.with(|s| s.get());
+            let dx = (x - sx).abs();
+            let dy = (y - sy).abs();
+            let start_time = TOUCH_START_TIME.with(|t| t.get());
+            let elapsed = time.wrapping_sub(start_time);
+
+            if dx > TOUCH_MOVE_THRESHOLD || dy > TOUCH_MOVE_THRESHOLD {
+                if elapsed < TOUCH_LONG_PRESS_MS {
+                    // Moved quickly → scroll mode
+                    TOUCH_MODE.with(|m| m.set(TouchMode::Scrolling));
+                    // Emit scroll for initial movement
+                    emit_touch_scroll(x11_id, x, y, sy - y, sx - x, time);
+                } else {
+                    // Moved after long press → drag mode
+                    TOUCH_MODE.with(|m| m.set(TouchMode::Dragging));
+                    let button = GRAB_BUTTON.with(|gb| gb.get());
+                    send_display_event(DisplayEvent::ButtonPress {
+                        window: x11_id, button, x: sx, y: sy,
+                        root_x: sx, root_y: sy, state: 0, time,
+                    });
+                    // Send initial motion
+                    let btn_state = match button { 1 => 0x100u16, 2 => 0x200, 3 => 0x400, _ => 0x100 };
+                    send_display_event(DisplayEvent::MotionNotify {
+                        window: x11_id, x, y, root_x: x, root_y: y, state: btn_state, time,
+                    });
+                }
+            }
+        }
+        TouchMode::Scrolling => {
+            // Continue scrolling — use delta from previous position
+            let (sx, sy) = TOUCH_START_XY.with(|s| s.get());
+            TOUCH_START_XY.with(|s| s.set((x, y)));
+            emit_touch_scroll(x11_id, x, y, sy - y, sx - x, time);
+        }
+        TouchMode::Dragging => {
+            let button = GRAB_BUTTON.with(|gb| gb.get());
+            let btn_state = match button { 1 => 0x100u16, 2 => 0x200, 3 => 0x400, _ => 0x100 };
+            send_display_event(DisplayEvent::MotionNotify {
+                window: x11_id, x, y, root_x: x, root_y: y, state: btn_state, time,
+            });
+        }
+    }
+}
+
+/// Convert touch scroll delta to Button4/5/6/7 events.
+fn emit_touch_scroll(x11_id: u32, x: i16, y: i16, dy: i16, dx: i16, time: u32) {
+    let threshold = 80; // pixels per scroll click — match finger movement 1:1
+
+    // Vertical
+    if dy != 0 {
+        let accum = TOUCH_SCROLL_Y.with(|a| {
+            let v = a.get() + dy as i32;
+            a.set(v);
+            v
+        });
+        if accum.abs() >= threshold {
+            // Natural scrolling: swipe up (dy>0) → scroll down (Button5), swipe down → scroll up (Button4)
+            let button = if accum > 0 { 5u8 } else { 4u8 };
+            let clicks = (accum.abs() / threshold) as u32;
+            TOUCH_SCROLL_Y.with(|a| a.set(accum % threshold));
+            for _ in 0..clicks.min(5) {
+                send_display_event(DisplayEvent::ButtonPress {
+                    window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+                });
+                send_display_event(DisplayEvent::ButtonRelease {
+                    window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+                });
+            }
+        }
+    }
+
+    // Horizontal
+    if dx != 0 {
+        let accum = TOUCH_SCROLL_HX.with(|a| {
+            let v = a.get() + dx as i32;
+            a.set(v);
+            v
+        });
+        if accum.abs() >= threshold {
+            let button = if accum > 0 { 6u8 } else { 7u8 };
+            let clicks = (accum.abs() / threshold) as u32;
+            TOUCH_SCROLL_HX.with(|a| a.set(accum % threshold));
+            for _ in 0..clicks.min(5) {
+                send_display_event(DisplayEvent::ButtonPress {
+                    window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+                });
+                send_display_event(DisplayEvent::ButtonRelease {
+                    window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+                });
+            }
+        }
+    }
 }
 
 unsafe extern "C" fn touches_ended(this: *mut AnyObject, _sel: Sel, touches: *mut AnyObject, _event: *mut AnyObject) {
     let touch = get_first_touch(touches);
     if touch.is_null() { return; }
     let (x, y) = touch_location_in_view(touch, this);
-
-    // End drag if active
-    let drag = DRAG_STATE.with(|ds| ds.get());
-    if let Some((native_id, start_lx, start_ly, start_tx, start_ty)) = drag {
-        let dx = x as f64 - start_tx;
-        let dy = y as f64 - start_ty;
-        let new_x = start_lx + dx;
-        let new_y = start_ly + dy;
-        move_window_layer(native_id, new_x, new_y);
-        // Update x11 position
-        update_window_position(native_id, new_x as i16, new_y as i16);
-        DRAG_STATE.with(|ds| ds.set(None));
-        return;
-    }
-
     let time = get_timestamp();
-    let grab_xid = GRAB_WINDOW.with(|gw| gw.get());
-    let x11_id = grab_xid.unwrap_or_else(|| find_x11_window_at(x, y));
+    let x11_id = view_x11_id(this);
     GRAB_WINDOW.with(|gw| gw.set(None));
     if x11_id == 0 { return; }
-    let (win_x, win_y) = screen_to_window_coords(x, y, x11_id);
 
+    let mode = TOUCH_MODE.with(|m| m.get());
     let button = GRAB_BUTTON.with(|gb| gb.get());
     GRAB_BUTTON.with(|gb| gb.set(1));
-    let btn_state = match button { 1 => 0x100u16, 2 => 0x200, 3 => 0x400, _ => 0x100 };
-    send_display_event(DisplayEvent::ButtonRelease {
-        window: x11_id, button,
-        x: win_x, y: win_y, root_x: x, root_y: y,
-        state: btn_state, time,
-    });
+
+    match mode {
+        TouchMode::Undecided => {
+            // No significant movement → tap = click
+            send_display_event(DisplayEvent::ButtonPress {
+                window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+            });
+            send_display_event(DisplayEvent::ButtonRelease {
+                window: x11_id, button, x, y, root_x: x, root_y: y,
+                state: match button { 1 => 0x100u16, 2 => 0x200, 3 => 0x400, _ => 0x100 }, time,
+            });
+        }
+        TouchMode::Scrolling => {
+            // Scroll ended — nothing to send
+        }
+        TouchMode::Dragging => {
+            let btn_state = match button { 1 => 0x100u16, 2 => 0x200, 3 => 0x400, _ => 0x100 };
+            send_display_event(DisplayEvent::ButtonRelease {
+                window: x11_id, button, x, y, root_x: x, root_y: y, state: btn_state, time,
+            });
+        }
+    }
+
+    TOUCH_MODE.with(|m| m.set(TouchMode::Undecided));
 }
 
 unsafe extern "C" fn touches_cancelled(this: *mut AnyObject, sel: Sel, touches: *mut AnyObject, event: *mut AnyObject) {
@@ -1107,9 +1604,10 @@ fn uikit_keycode_to_mac(uikit_kc: i64) -> Option<u8> {
     Some(mac)
 }
 
-unsafe extern "C" fn presses_began(_this: *mut AnyObject, _sel: Sel, presses: *mut AnyObject, _event: *mut AnyObject) {
+unsafe extern "C" fn presses_began(this: *mut AnyObject, _sel: Sel, presses: *mut AnyObject, _event: *mut AnyObject) {
     let all: *mut AnyObject = msg_send![presses, allObjects];
     let count: usize = msg_send![all, count];
+    let x11_id = view_x11_id(this);
     for i in 0..count {
         let press: *mut AnyObject = msg_send![all, objectAtIndex: i];
         let key: *mut AnyObject = msg_send![press, key];
@@ -1117,7 +1615,6 @@ unsafe extern "C" fn presses_began(_this: *mut AnyObject, _sel: Sel, presses: *m
         let uikit_kc: i64 = msg_send![key, keyCode];
         let modifier_flags: u64 = msg_send![key, modifierFlags];
 
-        let x11_id = get_focused_x11_window();
         ios_log(&format!("pressesBegan: uikit_kc={} x11=0x{:08x}", uikit_kc, x11_id));
         if x11_id == 0 { continue; }
         let time = get_timestamp();
@@ -1146,8 +1643,12 @@ unsafe extern "C" fn presses_began(_this: *mut AnyObject, _sel: Sel, presses: *m
                     window: x11_id, keycode, state, time,
                 });
             }
-        } else if uikit_kc != 42 {
-            // Skip Backspace (42) — handled by deleteBackward.
+        } else if uikit_kc == 42 {
+            // Backspace — mac keycode 51 + 8 = 59
+            send_display_event(DisplayEvent::KeyPress {
+                window: x11_id, keycode: 59, state, time,
+            });
+        } else {
             // Use full keycode map: in the iOS simulator (and iPad with hardware keyboard),
             // text keys come through pressesBegan, NOT insertText:.
             // Set HARDWARE_KB_DETECTED so insertText: knows to skip ASCII to avoid double-send.
@@ -1163,9 +1664,10 @@ unsafe extern "C" fn presses_began(_this: *mut AnyObject, _sel: Sel, presses: *m
     }
 }
 
-unsafe extern "C" fn presses_ended(_this: *mut AnyObject, _sel: Sel, presses: *mut AnyObject, _event: *mut AnyObject) {
+unsafe extern "C" fn presses_ended(this: *mut AnyObject, _sel: Sel, presses: *mut AnyObject, _event: *mut AnyObject) {
     let all: *mut AnyObject = msg_send![presses, allObjects];
     let count: usize = msg_send![all, count];
+    let x11_id = view_x11_id(this);
     for i in 0..count {
         let press: *mut AnyObject = msg_send![all, objectAtIndex: i];
         let key: *mut AnyObject = msg_send![press, key];
@@ -1173,7 +1675,6 @@ unsafe extern "C" fn presses_ended(_this: *mut AnyObject, _sel: Sel, presses: *m
         let uikit_kc: i64 = msg_send![key, keyCode];
         let modifier_flags: u64 = msg_send![key, modifierFlags];
 
-        let x11_id = get_focused_x11_window();
         if x11_id == 0 { continue; }
         let time = get_timestamp();
 
@@ -1203,8 +1704,12 @@ unsafe extern "C" fn presses_ended(_this: *mut AnyObject, _sel: Sel, presses: *m
                     window: x11_id, keycode, state, time,
                 });
             }
-        } else if uikit_kc != 42 {
-            // Skip Backspace (42) — handled by deleteBackward.
+        } else if uikit_kc == 42 {
+            // Backspace KeyRelease — mac keycode 51 + 8 = 59
+            send_display_event(DisplayEvent::KeyRelease {
+                window: x11_id, keycode: 59, state, time,
+            });
+        } else {
             if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
                 let keycode = mac_kc + 8;
                 send_display_event(DisplayEvent::KeyRelease {
@@ -1235,12 +1740,12 @@ unsafe extern "C" fn handle_hover(this: *mut AnyObject, _sel: Sel, gesture: *mut
 
     LAST_POINTER.with(|lp| lp.set((x, y)));
 
-    let x11_id = find_x11_window_at(x, y);
+    // Per-window design: this PSLXView = one X11 window; coords are view-local = X11-local
+    let x11_id = view_x11_id(this);
     if x11_id == 0 { return; }
-    let (win_x, win_y) = screen_to_window_coords(x, y, x11_id);
 
     send_display_event(DisplayEvent::MotionNotify {
-        window: x11_id, x: win_x, y: win_y,
+        window: x11_id, x, y,
         root_x: x, root_y: y, state: 0, time,
     });
 }
@@ -1270,9 +1775,9 @@ unsafe extern "C" fn handle_scroll(this: *mut AnyObject, _sel: Sel, gesture: *mu
     let y = loc.y as i16;
     let time = get_timestamp();
 
-    let x11_id = find_x11_window_at(x, y);
+    // Per-window design: this PSLXView = one X11 window; coords are view-local = X11-local
+    let x11_id = view_x11_id(this);
     if x11_id == 0 { return; }
-    let (win_x, win_y) = screen_to_window_coords(x, y, x11_id);
 
     // Convert pixel delta to scroll events (80px threshold like macOS)
     static SCROLL_ACCUM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -1288,17 +1793,96 @@ unsafe extern "C" fn handle_scroll(this: *mut AnyObject, _sel: Sel, gesture: *mu
         for _ in 0..clicks.min(5) {
             send_display_event(DisplayEvent::ButtonPress {
                 window: x11_id, button,
-                x: win_x, y: win_y, root_x: x, root_y: y,
+                x, y, root_x: x, root_y: y,
                 state: 0, time,
             });
             send_display_event(DisplayEvent::ButtonRelease {
                 window: x11_id, button,
-                x: win_x, y: win_y, root_x: x, root_y: y,
+                x, y, root_x: x, root_y: y,
                 state: 0, time,
             });
         }
     }
 }
+
+/// 2-finger touch pan → Button4/5 scroll emulation (jog dial).
+/// Single finger = mouse drag (handled by touchesBegan/Moved).
+/// Two fingers = scroll wheel emulation.
+unsafe extern "C" fn handle_touch_scroll(this: *mut AnyObject, _sel: Sel, gesture: *mut AnyObject) {
+    use objc2::encode::{Encode, Encoding};
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGPoint { x: f64, y: f64 }
+    unsafe impl Encode for CGPoint {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+
+    let state: i64 = msg_send![gesture, state];
+    // Began=1, Changed=2, Ended/Cancelled=3,4
+    if state == 3 || state == 4 {
+        // Reset accumulator on gesture end
+        TOUCH_SCROLL_ACCUM_Y.store(0, std::sync::atomic::Ordering::Relaxed);
+        TOUCH_SCROLL_ACCUM_X.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    if state != 1 && state != 2 { return; }
+
+    let translation: CGPoint = msg_send![gesture, translationInView: &*this];
+    let zero = CGPoint { x: 0.0, y: 0.0 };
+    let _: () = msg_send![gesture, setTranslation: zero inView: &*this];
+
+    let loc: CGPoint = msg_send![gesture, locationInView: &*this];
+    let x = loc.x as i16;
+    let y = loc.y as i16;
+    let time = get_timestamp();
+
+    let x11_id = view_x11_id(this);
+    if x11_id == 0 { return; }
+
+    let threshold = 20; // pixels per scroll click — responsive like a jog dial
+
+    // Vertical scroll (Button 4=up, 5=down)
+    let dy = translation.y as i32;
+    if dy != 0 {
+        let accum = TOUCH_SCROLL_ACCUM_Y.fetch_add(dy, std::sync::atomic::Ordering::Relaxed) + dy;
+        if accum.abs() >= threshold {
+            // Natural scrolling: swipe up (dy<0) → scroll down (Button5), swipe down (dy>0) → scroll up (Button4)
+            let button = if accum > 0 { 4u8 } else { 5u8 };
+            let clicks = (accum.abs() / threshold) as u32;
+            TOUCH_SCROLL_ACCUM_Y.store(accum % threshold, std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..clicks.min(5) {
+                send_display_event(DisplayEvent::ButtonPress {
+                    window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+                });
+                send_display_event(DisplayEvent::ButtonRelease {
+                    window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+                });
+            }
+        }
+    }
+
+    // Horizontal scroll: natural direction
+    let dx = translation.x as i32;
+    if dx != 0 {
+        let accum = TOUCH_SCROLL_ACCUM_X.fetch_add(dx, std::sync::atomic::Ordering::Relaxed) + dx;
+        if accum.abs() >= threshold {
+            let button = if accum < 0 { 6u8 } else { 7u8 };
+            let clicks = (accum.abs() / threshold) as u32;
+            TOUCH_SCROLL_ACCUM_X.store(accum % threshold, std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..clicks.min(5) {
+                send_display_event(DisplayEvent::ButtonPress {
+                    window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+                });
+                send_display_event(DisplayEvent::ButtonRelease {
+                    window: x11_id, button, x, y, root_x: x, root_y: y, state: 0, time,
+                });
+            }
+        }
+    }
+}
+
+static TOUCH_SCROLL_ACCUM_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static TOUCH_SCROLL_ACCUM_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 // --- Helper functions ---
 
@@ -1333,14 +1917,25 @@ fn get_timestamp() -> u32 {
         .as_millis() as u32
 }
 
-fn get_focused_x11_window() -> crate::display::Xid {
-    WINDOWS.with(|w| {
-        let ws = w.borrow();
-        for info in ws.values() {
-            if info.visible { return info.x11_id; }
+/// Pointer to the PSLXView that currently has focus (first responder), stored as usize.
+/// Updated when a PSLXView becomes first responder.
+static FOCUSED_VIEW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Read x11WindowId ivar from a PSLXView pointer.
+fn view_x11_id(view: *mut AnyObject) -> crate::display::Xid {
+    if view.is_null() { return 0; }
+    unsafe {
+        if let Some(ivar) = (*view).class().instance_variable(c"x11WindowId") {
+            return *ivar.load::<u32>(&*view) as crate::display::Xid;
         }
         0
-    })
+    }
+}
+
+fn get_focused_x11_window() -> crate::display::Xid {
+    let view = FOCUSED_VIEW.load(std::sync::atomic::Ordering::Relaxed) as *mut AnyObject;
+    if view.is_null() { return 0; }
+    view_x11_id(view)
 }
 
 /// Check if (x,y) is in the title bar area of any visible window.
@@ -1363,13 +1958,16 @@ fn find_window_titlebar_at(x: i16, y: i16) -> Option<(u64, f64, f64)> {
     })
 }
 
-/// Move a window's CALayer to a new position using setFrame.
+/// Move a window's panel to a new position using setFrame on the container_layer.
 /// x, y are in X11 physical pixels which map 1:1 to UIKit points (contentsScale=1.0).
 fn move_window_layer(native_id: u64, x: f64, y: f64) {
     WINDOWS.with(|w| {
         let ws = w.borrow();
         if let Some(info) = ws.get(&native_id) {
-            if info.ca_layer.is_null() { return; }
+            // Use container_layer (title bar + content) for drag; fall back to ca_layer.
+            let layer = if !info.container_layer.is_null() { info.container_layer }
+                        else if !info.ca_layer.is_null() { info.ca_layer }
+                        else { return; };
             unsafe {
                 use objc2::encode::{Encode, Encoding};
 
@@ -1392,16 +1990,16 @@ fn move_window_layer(native_id: u64, x: f64, y: f64) {
                     const ENCODING: Encoding = Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
                 }
 
-                // Disable implicit animation
                 let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
                 let _: () = msg_send![ca_cls, begin];
                 let _: () = msg_send![ca_cls, setDisableActions: true];
 
+                let panel_h = info.height as f64 + TITLE_BAR_HEIGHT as f64;
                 let frame = CGRect {
                     origin: CGPoint { x, y },
-                    size: CGSize { w: info.width as f64, h: info.height as f64 },
+                    size: CGSize { w: info.width as f64, h: panel_h },
                 };
-                let _: () = msg_send![info.ca_layer, setFrame: frame];
+                let _: () = msg_send![layer, setFrame: frame];
 
                 let _: () = msg_send![ca_cls, commit];
             }
@@ -1421,15 +2019,16 @@ fn update_window_position(native_id: u64, new_x: i16, new_y: i16) {
 }
 
 /// Find which X11 window is at screen position (x, y).
+/// Skips the title bar area (top TITLE_BAR_HEIGHT pixels of each window panel).
 fn find_x11_window_at(x: i16, y: i16) -> crate::display::Xid {
     WINDOWS.with(|w| {
         let ws = w.borrow();
-        // Check windows in reverse insertion order (later = on top)
         let mut best: Option<(crate::display::Xid, u64)> = None;
         for (id, info) in ws.iter() {
             if !info.visible { continue; }
             let wx = x - info.x11_x;
-            let wy = y - info.x11_y;
+            // Content starts at y = x11_y + TITLE_BAR_HEIGHT (title bar is above).
+            let wy = y - info.x11_y - TITLE_BAR_HEIGHT;
             if wx >= 0 && wy >= 0 && (wx as u16) < info.width && (wy as u16) < info.height {
                 if best.is_none() || *id > best.unwrap().1 {
                     best = Some((info.x11_id, *id));
@@ -1441,12 +2040,13 @@ fn find_x11_window_at(x: i16, y: i16) -> crate::display::Xid {
 }
 
 /// Convert screen coordinates to window-local coordinates.
+/// Subtracts TITLE_BAR_HEIGHT so y=0 in X11 space aligns with the top of the content (not title bar).
 fn screen_to_window_coords(screen_x: i16, screen_y: i16, x11_id: crate::display::Xid) -> (i16, i16) {
     WINDOWS.with(|w| {
         let ws = w.borrow();
         for info in ws.values() {
             if info.x11_id == x11_id {
-                return (screen_x - info.x11_x, screen_y - info.x11_y);
+                return (screen_x - info.x11_x, screen_y - info.x11_y - TITLE_BAR_HEIGHT);
             }
         }
         (screen_x, screen_y)
@@ -1545,15 +2145,17 @@ fn coalesce_putimage(commands: Vec<crate::display::RenderCommand>, win_w: u32, w
     }
 }
 
-/// Add a window as a sublayer of the main view (for multi-window in single scene).
-/// Each subsequent X11 window gets its own CALayer positioned at (x11_x, x11_y).
-fn add_window_sublayer(native_id: u64) {
+/// Add a window as a floating panel: title bar + content CALayer.
+/// The panel is a container CALayer with:
+///   - title bar sublayer (dark gray, with window title text)
+///   - content sublayer (IOSurface at y=TITLE_BAR_HEIGHT)
+/// This gives each X11 window its own draggable panel UI.
+fn add_window_panel(native_id: u64) {
     let main_view = MAIN_VIEW.with(|mv| *mv.borrow());
     let main_view = match main_view {
         Some(v) => v,
         None => {
-            ios_log(&format!("add_window_sublayer: no main view for window {}", native_id));
-            // Defer — will be handled when first window creates main view
+            ios_log(&format!("add_window_panel: no main view for window {}", native_id));
             WINDOWS.with(|w| {
                 if let Some(info) = w.borrow_mut().get_mut(&native_id) {
                     info.pending_show = true;
@@ -1582,46 +2184,67 @@ fn add_window_sublayer(native_id: u64) {
                 ]);
             }
 
-            // Create a CALayer for this window.
-            // X11 pixels map 1:1 to UIKit points (contentsScale=1.0).
             let ca_cls = objc_getClass(b"CALayer\0".as_ptr());
-            let layer: *mut AnyObject = msg_send![ca_cls, layer];
-            let frame = CGRect {
+            let tb_h = TITLE_BAR_HEIGHT as f64;
+
+            // --- 1. Container layer (title bar + content, positioned at x11_x/y) ---
+            let container: *mut AnyObject = msg_send![ca_cls, layer];
+            let container_frame = CGRect {
                 origin: [info.x11_x as f64, info.x11_y as f64],
+                size: [info.width as f64, info.height as f64 + tb_h],
+            };
+            let _: () = msg_send![container, setFrame: container_frame];
+            let _: () = msg_send![container, setMasksToBounds: true];
+            // zPosition > 0 so panels render above the desktop background
+            let _: () = msg_send![container, setZPosition: 1.0_f64];
+
+            // --- 2. Title bar sublayer ---
+            let title_layer: *mut AnyObject = msg_send![ca_cls, layer];
+            let title_frame = CGRect {
+                origin: [0.0, 0.0],
+                size: [info.width as f64, tb_h],
+            };
+            let _: () = msg_send![title_layer, setFrame: title_frame];
+            // Dark title bar background (#333333)
+            let title_color: *mut AnyObject = msg_send![objc2::class!(UIColor),
+                colorWithRed: 0.2_f64 green: 0.2_f64 blue: 0.2_f64 alpha: 1.0_f64];
+            let title_cgcolor: *const std::ffi::c_void = msg_send![title_color, CGColor];
+            let _: () = msg_send![title_layer, setBackgroundColor: title_cgcolor];
+
+            // Note: CATextLayer avoided — it triggers UIKit safe-area layout crashes
+            // when multiple windows are open. Plain CALayer only.
+            let _: () = msg_send![container, addSublayer: title_layer];
+
+            // --- 3. Content sublayer (IOSurface, below title bar) ---
+            let content_layer: *mut AnyObject = msg_send![ca_cls, layer];
+            let content_frame = CGRect {
+                origin: [0.0, tb_h],
                 size: [info.width as f64, info.height as f64],
             };
-            let _: () = msg_send![layer, setFrame: frame];
-
-            // Same layer config as macOS
+            let _: () = msg_send![content_layer, setFrame: content_frame];
             let gravity = NSString::from_str("topLeft");
-            let _: () = msg_send![layer, setContentsGravity: &*gravity];
-            let _: () = msg_send![layer, setContentsScale: 1.0_f64];
-            let _: () = msg_send![layer, setMasksToBounds: true];
-
-            // Set IOSurface as initial contents
+            let _: () = msg_send![content_layer, setContentsGravity: &*gravity];
+            let _: () = msg_send![content_layer, setContentsScale: 1.0_f64];
+            let _: () = msg_send![content_layer, setMasksToBounds: true];
             if !info.display_surface.is_null() {
-                let _: () = msg_send![layer, setContents: info.display_surface as *mut AnyObject];
+                let _: () = msg_send![content_layer, setContents: info.display_surface as *mut AnyObject];
             }
+            let _: () = msg_send![container, addSublayer: content_layer];
 
-            // Add as sublayer of main_view's layer (not container's layer).
-            // UIKit manages container's sublayers and may reorder them,
-            // hiding manually-added layers behind view-backed layers.
-            // Using main_view's layer ensures our sublayer renders on top
-            // of the primary window's IOSurface content.
+            // --- 4. Add container to main view's layer ---
             let parent_layer: *mut AnyObject = msg_send![main_view, layer];
             if !parent_layer.is_null() {
-                // Explicit zPosition to ensure sublayer is above the layer's contents
-                let _: () = msg_send![layer, setZPosition: 1.0_f64];
-                let _: () = msg_send![parent_layer, addSublayer: layer];
+                let _: () = msg_send![parent_layer, addSublayer: container];
             }
 
-            let _: *mut AnyObject = msg_send![layer, retain];
-            info.ca_layer = layer;
-            // Reuse main view for input events (single responder)
+            let _: *mut AnyObject = msg_send![container, retain];
+            let _: *mut AnyObject = msg_send![content_layer, retain];
+            info.container_layer = container;
+            info.ca_layer = content_layer;
             info.ui_view = main_view;
 
-            ios_log(&format!("add_window_sublayer: id={} {}x{} at ({},{})",
-                native_id, info.width, info.height, info.x11_x, info.x11_y));
+            ios_log(&format!("add_window_panel: id={} '{}' {}x{} at ({},{})",
+                native_id, info.title, info.width, info.height, info.x11_x, info.x11_y));
         }
     });
 }
@@ -1728,187 +2351,193 @@ fn claim_main_scene(native_id: u64, info: &mut WindowInfo) -> bool {
     })
 }
 
-/// Create UIWindow + PSLXView + CALayer in a given UIWindowScene for a window.
-/// Called from CreateWindow (initial scene) and scene_will_connect (new scenes).
-/// This is the iOS equivalent of macOS's NSWindow + PSLXInputView creation.
+/// Create a per-window UIWindow + PSLXView in a UIWindowScene.
+/// Like macOS: 1 X11 window = 1 NSWindow → iOS: 1 X11 window = 1 UIWindow in its own UIWindowScene.
+/// For the first window: uses MAIN_SCENE (the auto-created initial scene).
+/// For subsequent windows: called from scene_will_connect after request_new_scene;
+///   the scene is already in PENDING_SCENE_MAP keyed by native_id.
 fn setup_window_in_scene(native_id: u64) {
     ios_log(&format!("setup_window_in_scene: START id={}", native_id));
-    // Get the scene to use — either MAIN_SCENE (for first window) or from PENDING_SCENE map
-    let scene = {
-        let from_pending = PENDING_SCENE_MAP.with(|pm| {
-            let mut map = pm.borrow_mut();
-            let pos = map.iter().position(|(id, _)| *id == native_id);
-            pos.map(|idx| map.remove(idx).1)
-        });
-        if let Some(s) = from_pending { Some(s) }
-        else { MAIN_SCENE.with(|ms| *ms.borrow()) }
+
+    // Get scene: PENDING_SCENE_MAP for new windows, MAIN_SCENE for first window.
+    let scene = PENDING_SCENE_MAP.with(|pm| {
+        let mut map = pm.borrow_mut();
+        if let Some(pos) = map.iter().position(|(id, _)| *id == native_id) {
+            Some(map.remove(pos).1)
+        } else {
+            None
+        }
+    }).or_else(|| MAIN_SCENE.with(|ms| *ms.borrow()));
+
+    let scene = match scene {
+        Some(s) => s,
+        None => {
+            ios_log("setup_window_in_scene: no scene available");
+            return;
+        }
     };
 
-    if scene.is_none() {
-        ios_log(&format!("setup_window_in_scene: no scene for window {}", native_id));
-        return;
-    }
-    let scene = scene.unwrap();
-    ios_log(&format!("setup_window_in_scene: got scene {:p} for id={}", scene, native_id));
-
-    WINDOWS.with(|w| {
-        let mut ws = w.borrow_mut();
-        let info = match ws.get_mut(&native_id) {
-            Some(i) => i,
-            None => {
-                ios_log(&format!("setup_window_in_scene: window {} not found", native_id));
-                return;
-            }
-        };
-
-        unsafe {
-            use objc2::encode::{Encode, Encoding};
-            #[repr(C)]
-            #[derive(Copy, Clone)]
-            struct CGRect { origin: [f64; 2], size: [f64; 2] }
-            unsafe impl Encode for CGRect {
-                const ENCODING: Encoding = Encoding::Struct("CGRect", &[
-                    Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
-                    Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
-                ]);
-            }
-
-            // Create UIWindow in this scene (like macOS NSWindow)
-            let win: *mut AnyObject = msg_send![objc2::class!(UIWindow), alloc];
-            let win: *mut AnyObject = msg_send![win, initWithWindowScene: &*scene];
-
-            // UIWindow fills the entire scene. On real iPad, sizeRestrictions shrinks the scene
-            // to X11 window size. On simulator, scene is fullscreen — we fill it all with white bg
-            // and put the X11 content view at top-left.
-            let scene_bounds: CGRect = {
-                let coord: *mut AnyObject = msg_send![scene, coordinateSpace];
-                msg_send![coord, bounds]
-            };
-            let _: () = msg_send![win, setFrame: scene_bounds];
-
-            // Get the screen scale factor to convert X11 pixel coordinates to UIKit points.
-            // X11 coordinates are now in physical pixels (hidpi.rs multiplies by nativeScale),
-            // so UIView frames must be in points = pixels / scale.
-            let main_screen: *mut AnyObject = msg_send![objc2::class!(UIScreen), mainScreen];
-            let display_scale: f64 = if !main_screen.is_null() {
-                let s: f64 = msg_send![main_screen, nativeScale];
-                if s > 0.0 { s } else { 2.0 }
-            } else { 2.0 };
-
-            // Create PSLXView at X11 window size in points.
-            // X11 pixels map 1:1 to UIKit points — we render the IOSurface at its
-            // natural pixel size. On a 2x Retina display, the view will appear at
-            // half the physical pixel count (e.g. 484pt wide on a 2732px/1366pt screen)
-            // which gives a reasonable window size. contentsScale=1.0 means 1 IOSurface
-            // pixel = 1 point on screen (displayed at 50% of physical resolution on 2x,
-            // i.e. 2 physical pixels per content pixel — looks crisp but not 4K).
-            let view_cls = get_pslx_view_class();
-            let view: *mut AnyObject = msg_send![view_cls, alloc];
-            let view_frame = CGRect {
-                origin: [0.0, 0.0],
-                size: [info.width as f64, info.height as f64],
-            };
-            let view: *mut AnyObject = msg_send![view, initWithFrame: view_frame];
-
-            // Layer config: topLeft gravity, contentsScale=1.0 (IOSurface pixel = 1 point),
-            // masksToBounds to clip content to view bounds.
-            let layer: *mut AnyObject = msg_send![view, layer];
-            if !layer.is_null() {
-                let gravity = NSString::from_str("topLeft");
-                let _: () = msg_send![layer, setContentsGravity: &*gravity];
-                let _: () = msg_send![layer, setContentsScale: 1.0_f64];
-                let _: () = msg_send![layer, setMasksToBounds: true];
-            }
-
-            // Set up view controller with a container view that fills the scene.
-            // The X11 content view is a subview at (0,0) with X11 size.
-            let vc_cls = get_fullscreen_vc_class();
-            let vc: *mut AnyObject = msg_send![vc_cls, alloc];
-            let vc: *mut AnyObject = msg_send![vc, init];
-            // Use PSLXView directly as the root view — no container wrapper.
-            // Container was only used for white background (now unwanted).
-            // PSLXView size = X11 window size, UIWindow is resized to match in resize_scene_to_content().
-            let clear: *mut AnyObject = msg_send![objc2::class!(UIColor), clearColor];
-            let _: () = msg_send![view, setBackgroundColor: clear];
-            let _: () = msg_send![win, setBackgroundColor: clear];
-            let _: () = msg_send![vc, setView: view];
-            let _: () = msg_send![win, setRootViewController: vc];
-
-            // Add UIHoverGestureRecognizer for mouse/trackpad movement → X11 MotionNotify
-            let hover_cls = objc2::class!(UIHoverGestureRecognizer);
-            let hover: *mut AnyObject = msg_send![hover_cls, alloc];
-            let hover: *mut AnyObject = msg_send![hover, initWithTarget: view action: objc2::sel!(handleHover:)];
-            let _: () = msg_send![view, addGestureRecognizer: hover];
-
-            // Add UIPanGestureRecognizer for mouse scroll → X11 Button4/5
-            let pan_cls = objc2::class!(UIPanGestureRecognizer);
-            let pan: *mut AnyObject = msg_send![pan_cls, alloc];
-            let pan: *mut AnyObject = msg_send![pan, initWithTarget: view action: objc2::sel!(handleScroll:)];
-            // allowedScrollTypesMask = UIScrollTypeMaskContinuous (1 << 0)
-            let _: () = msg_send![pan, setAllowedScrollTypesMask: 1i64];
-            // Don't interfere with touch dragging
-            let _: () = msg_send![pan, setMaximumNumberOfTouches: 0usize];
-            let _: () = msg_send![view, addGestureRecognizer: pan];
-
-            // White background fills entire scene (xterm content overlays at top-left)
-            let white_color: *mut AnyObject = msg_send![objc2::class!(UIColor), whiteColor];
-            let _: () = msg_send![win, setBackgroundColor: white_color];
-            // Make window non-opaque so scene background doesn't show through
-            let _: () = msg_send![win, setOpaque: false];
-
-            // Remove rounded corners — X11 windows must be sharp rectangles
-            let win_layer: *mut AnyObject = msg_send![win, layer];
-            if !win_layer.is_null() {
-                let _: () = msg_send![win_layer, setCornerRadius: 0.0_f64];
-                let _: () = msg_send![win_layer, setMasksToBounds: true];
-            }
-            // Remove corner radius from the content view layer too
-            let view_layer: *mut AnyObject = msg_send![view, layer];
-            if !view_layer.is_null() {
-                let _: () = msg_send![view_layer, setCornerRadius: 0.0_f64];
-            }
-
-            // Hidden until ShowWindow (like macOS visible=false)
-            let _: () = msg_send![win, setHidden: true];
-
-            // Set scene title (like macOS NSWindow.setTitle)
-            let title_ns = NSString::from_str(&info.title);
-            let _: () = msg_send![scene, setTitle: &*title_ns];
-
-            // Resize Stage Manager window to X11 size (sizeRestrictions for real iPad)
-            resize_scene_to_x11(win, info.width, info.height);
-            // Direct setFrame for simulator (sizeRestrictions ignored on simulator)
-            let win_frame = CGRect { origin: [0.0, 0.0], size: [info.width as f64, info.height as f64] };
-            let _: () = msg_send![win, setFrame: win_frame];
-
-            let _: *mut AnyObject = msg_send![win, retain];
-            let _: *mut AnyObject = msg_send![layer, retain];
-
-            info.ui_window = win;
-            info.ui_view = view;
-            info.ca_layer = layer;
-
-            // Store main view for sublayer-based windows to attach to
-            let _: *mut AnyObject = msg_send![view, retain];
-            MAIN_VIEW.with(|mv| *mv.borrow_mut() = Some(view));
-
-            // If ShowWindow was called before we had a UIWindow, show it now
-            if info.pending_show || info.visible {
-                let _: () = msg_send![win, setHidden: false];
-                let _: () = msg_send![win, makeKeyAndVisible];
-                flush_window_to_layer(layer, info.display_surface);
-                // Make view first responder — deferred to next run loop so UIKit has settled
-                become_first_responder_deferred(view);
-                info.pending_show = false;
-                info.visible = true;
-                ios_log(&format!("setup_window_in_scene: id={} {}x{} scene={:p} (deferred show)",
-                    native_id, info.width, info.height, scene));
-            } else {
-                ios_log(&format!("setup_window_in_scene: id={} {}x{} scene={:p}",
-                    native_id, info.width, info.height, scene));
-            }
+    // Read window info (size, x11_id) from WINDOWS
+    let (width, height, x11_id, display_surface, title, pending_show) = WINDOWS.with(|w| {
+        let ws = w.borrow();
+        if let Some(info) = ws.get(&native_id) {
+            (info.width, info.height, info.x11_id, info.display_surface, info.title.clone(), info.pending_show)
+        } else {
+            ios_log(&format!("setup_window_in_scene: native_id={} not found in WINDOWS", native_id));
+            return (800, 600, 0u32, std::ptr::null_mut(), String::new(), false);
         }
     });
+
+    unsafe {
+        use objc2::encode::{Encode, Encoding};
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct CGRect { origin: [f64; 2], size: [f64; 2] }
+        unsafe impl Encode for CGRect {
+            const ENCODING: Encoding = Encoding::Struct("CGRect", &[
+                Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
+                Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
+            ]);
+        }
+
+        // Clamp window size to screen bounds (same as macOS clamp to visibleFrame)
+        let screen_w = SCREEN_WIDTH.with(|sw| sw.get());
+        let screen_h = SCREEN_HEIGHT.with(|sh| sh.get());
+        let mut pt_w = width as f64;
+        let mut pt_h = height as f64;
+        if screen_w > 0.0 && screen_h > 0.0 {
+            let max_w = screen_w;
+            let max_h = screen_h - IOS_TITLE_BAR_HEIGHT; // reserve title bar space
+            if pt_w > max_w || pt_h > max_h {
+                let fit = (max_w / pt_w).min(max_h / pt_h);
+                pt_w *= fit;
+                pt_h *= fit;
+            }
+        }
+        // Window frame includes title bar height
+        let total_h = pt_h + IOS_TITLE_BAR_HEIGHT;
+        let win_frame = CGRect { origin: [0.0, 0.0], size: [pt_w, total_h] };
+
+        // Create UIWindow sized to X11 window + title bar
+        let win: *mut AnyObject = msg_send![objc2::class!(UIWindow), alloc];
+        let win: *mut AnyObject = msg_send![win, initWithWindowScene: &*scene];
+        let _: () = msg_send![win, setFrame: win_frame];
+
+        // Create container UIView (title bar + content)
+        let container: *mut AnyObject = msg_send![objc2::class!(UIView), alloc];
+        let container: *mut AnyObject = msg_send![container, initWithFrame: win_frame];
+
+        // Create title bar with traffic light buttons
+        let title_bar = create_title_bar(pt_w, &title, x11_id as u32);
+        let _: () = msg_send![container, addSubview: title_bar];
+
+        // Create PSLXView below title bar
+        let content_frame = CGRect { origin: [0.0, IOS_TITLE_BAR_HEIGHT], size: [pt_w, pt_h] };
+        let view_cls = get_pslx_view_class();
+        let view: *mut AnyObject = msg_send![view_cls, alloc];
+        let view: *mut AnyObject = msg_send![view, initWithFrame: content_frame];
+        let _: () = msg_send![container, addSubview: view];
+
+        // Set x11WindowId ivar so keyboard/touch handlers know which X11 window this is
+        if let Some(ivar) = (*view).class().instance_variable(c"x11WindowId") {
+            *ivar.load_mut::<u32>(&mut *view) = x11_id as u32;
+        }
+
+        // Set up view.layer with IOSurface (same as macOS: zero-copy IOSurface as CALayer contents)
+        let layer: *mut AnyObject = msg_send![view, layer];
+        if !layer.is_null() {
+            let gravity = NSString::from_str("topLeft");
+            let _: () = msg_send![layer, setContentsGravity: &*gravity];
+            let _: () = msg_send![layer, setContentsScale: 1.0_f64];
+            let _: () = msg_send![layer, setMasksToBounds: true];
+            if !display_surface.is_null() {
+                let _: () = msg_send![layer, setContents: display_surface as *mut AnyObject];
+            }
+        }
+
+        // UIHoverGestureRecognizer: mouse/trackpad movement → X11 MotionNotify
+        let hover_cls = objc2::class!(UIHoverGestureRecognizer);
+        let hover: *mut AnyObject = msg_send![hover_cls, alloc];
+        let hover: *mut AnyObject = msg_send![hover, initWithTarget: view action: objc2::sel!(handleHover:)];
+        let _: () = msg_send![view, addGestureRecognizer: hover];
+
+        // UIPanGestureRecognizer: mouse scroll → X11 Button4/5
+        let pan_cls = objc2::class!(UIPanGestureRecognizer);
+        let pan: *mut AnyObject = msg_send![pan_cls, alloc];
+        let pan: *mut AnyObject = msg_send![pan, initWithTarget: view action: objc2::sel!(handleScroll:)];
+        let _: () = msg_send![pan, setAllowedScrollTypesMask: 1i64];
+        let _: () = msg_send![pan, setMaximumNumberOfTouches: 0usize];
+        let _: () = msg_send![view, addGestureRecognizer: pan];
+
+        // 2-finger touch pan → scroll emulation (jog dial)
+        let touch_pan_cls = objc2::class!(UIPanGestureRecognizer);
+        let touch_pan: *mut AnyObject = msg_send![touch_pan_cls, alloc];
+        let touch_pan: *mut AnyObject = msg_send![touch_pan, initWithTarget: view action: objc2::sel!(handleTouchScroll:)];
+        let _: () = msg_send![touch_pan, setMinimumNumberOfTouches: 2usize];
+        let _: () = msg_send![touch_pan, setMaximumNumberOfTouches: 2usize];
+        let _: () = msg_send![view, addGestureRecognizer: touch_pan];
+
+        // Set up view controller
+        let vc_cls = get_fullscreen_vc_class();
+        let vc: *mut AnyObject = msg_send![vc_cls, alloc];
+        let vc: *mut AnyObject = msg_send![vc, init];
+        let _: () = msg_send![vc, setView: container];
+        let _: () = msg_send![win, setRootViewController: vc];
+
+        // Set scene title (like macOS window.setTitle)
+        if !title.is_empty() {
+            let title_ns = NSString::from_str(&title);
+            let _: () = msg_send![scene, setTitle: &*title_ns];
+        }
+
+        // Resize Stage Manager window to X11 size + title bar
+        resize_scene_to_x11(win, pt_w as u16, total_h as u16);
+
+        let _: *mut AnyObject = msg_send![win, retain];
+        let _: *mut AnyObject = msg_send![view, retain];
+        let _: *mut AnyObject = msg_send![container, retain];
+
+        // Update WINDOWS with UIWindow + PSLXView + CALayer
+        WINDOWS.with(|w| {
+            if let Some(info) = w.borrow_mut().get_mut(&native_id) {
+                info.ui_window = win;
+                info.ui_view = view;
+                info.ca_layer = layer;
+                info.title_bar = title_bar;
+                // Update clamped dimensions
+                info.width = pt_w as u16;
+                info.height = pt_h as u16;
+            }
+        });
+
+        // Update MAIN_UI_WINDOW/MAIN_VIEW for timer callback (first window only)
+        let is_main_scene = MAIN_SCENE.with(|ms| ms.borrow().map_or(false, |s| s == scene));
+        if is_main_scene {
+            MAIN_UI_WINDOW.with(|mw| *mw.borrow_mut() = Some(win));
+            MAIN_VIEW.with(|mv| *mv.borrow_mut() = Some(view));
+        }
+
+        // If ShowWindow was already called (pending_show), show immediately.
+        // Otherwise, wait for ShowWindow command (like macOS: CreateWindow doesn't show).
+        if pending_show {
+            ios_log(&format!("setup_window_in_scene: pending_show=true, showing now"));
+            let _: () = msg_send![win, setHidden: false];
+            let _: () = msg_send![win, makeKeyAndVisible];
+            WINDOWS.with(|w| {
+                if let Some(info) = w.borrow_mut().get_mut(&native_id) {
+                    info.visible = true;
+                    info.pending_show = false;
+                }
+            });
+            become_first_responder_deferred(view);
+            if x11_id != 0 {
+                send_display_event(DisplayEvent::FocusIn { window: x11_id });
+            }
+        }
+
+        ios_log(&format!("setup_window_in_scene: created UIWindow {:.0}x{:.0} x11=0x{:08x} scene={:p}",
+            pt_w, pt_h, x11_id, scene));
+    }
 }
 
 /// Map from native_window_id → UIWindowScene pointer, for scene_will_connect to find.
@@ -1966,7 +2595,8 @@ unsafe fn resize_scene_to_x11(ui_window: *mut AnyObject, width: u16, height: u16
     let scene: *mut AnyObject = msg_send![ui_window, windowScene];
     if scene.is_null() { return; }
 
-    // Set sizeRestrictions to pin min==max to X11 window size
+    // Set sizeRestrictions: minimumSize = X11 window size, maximumSize = screen size.
+    // This allows Stage Manager resize and fullscreen while starting at X11 size.
     let restrictions: *mut AnyObject = msg_send![scene, sizeRestrictions];
     if !restrictions.is_null() {
         use objc2::encode::{Encode, Encoding};
@@ -1976,10 +2606,16 @@ unsafe fn resize_scene_to_x11(ui_window: *mut AnyObject, width: u16, height: u16
         unsafe impl Encode for CGSize {
             const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
         }
-        let size = CGSize { width: width as f64, height: height as f64 };
-        let _: () = msg_send![restrictions, setMinimumSize: size];
-        let _: () = msg_send![restrictions, setMaximumSize: size];
-        info!("resize_scene_to_x11: set sizeRestrictions {}x{}", width, height);
+        let min_size = CGSize { width: 320.0, height: 240.0 };
+        let screen_w = SCREEN_WIDTH.with(|sw| sw.get());
+        let screen_h = SCREEN_HEIGHT.with(|sh| sh.get());
+        let max_size = CGSize {
+            width: if screen_w > 0.0 { screen_w } else { 2732.0 },
+            height: if screen_h > 0.0 { screen_h } else { 2048.0 },
+        };
+        let _: () = msg_send![restrictions, setMinimumSize: min_size];
+        let _: () = msg_send![restrictions, setMaximumSize: max_size];
+        info!("resize_scene_to_x11: sizeRestrictions min=320x240 max={:.0}x{:.0}", max_size.width, max_size.height);
     }
 
     // Request geometry update (triggers sizeRestrictions enforcement on real device)
@@ -2084,6 +2720,9 @@ extern "C" fn timer_callback(_timer: *mut c_void, _info: *mut c_void) {
     }
 
     process_commands();
+
+    // Check if AudioQueue needs initialization (triggered by PA server)
+    unsafe { crate::audio::check_audio_init(); }
 
     // Apply pending keyboard resize (deferred to allow child windows to exist)
     if let Some((w, h)) = PENDING_RESIZE.with(|pr| pr.get()) {
@@ -2285,70 +2924,49 @@ fn handle_command(cmd: DisplayCommand) {
                     title,
                     override_redirect,
                     ca_layer: std::ptr::null_mut(),
+                    container_layer: std::ptr::null_mut(),
                     ui_window: std::ptr::null_mut(),
                     ui_view: std::ptr::null_mut(),
+                    title_bar: std::ptr::null_mut(),
+                    is_fullscreen: false,
                     pending_show: false,
                 });
             });
 
-            // Single-scene approach: all X11 windows share the initial scene.
-            // Each window gets its own CALayer positioned at (x11_x, x11_y) as a sublayer
-            // of the main view's layer. First window creates UIWindow in the scene;
-            // subsequent windows just add a sublayer.
-            let first_window = WINDOWS.with(|w| w.borrow().len() == 1);
-
-            if first_window {
-                // First X11 window: create UIWindow in the initial scene.
-                setup_window_in_scene(id);
-                ios_log(&format!("CreateWindow: id={} x11=0x{:08X} {}x{} (initial scene)",
-                    id, x11_id, width, height));
-            } else {
-                // Subsequent X11 windows: add a sublayer to the existing main view.
-                add_window_sublayer(id);
-                ios_log(&format!("CreateWindow: id={} x11=0x{:08X} {}x{} (sublayer)",
-                    id, x11_id, width, height));
-            }
+            // All windows use MAIN_SCENE — setup UIWindow immediately.
+            // (Like macOS: every X11 window gets its own NSWindow)
+            setup_window_in_scene(id);
+            ios_log(&format!("CreateWindow: id={} x11=0x{:08X} {}x{} (main scene)",
+                id, x11_id, width, height));
 
             info!("Created window {} for X11 0x{:08X} ({}x{}) [iOS]", id, x11_id, width, height);
             let _ = reply.send(NativeWindowHandle { id });
         }
 
         DisplayCommand::ShowWindow { handle, visible } => {
+            // Per-window design: ShowWindow → makeKeyAndVisible on per-window UIWindow (like macOS makeKeyAndOrderFront)
             let show_info = WINDOWS.with(|w| {
                 if let Some(info) = w.borrow_mut().get_mut(&handle.id) {
                     info.visible = visible;
                     if visible {
-                        if !info.ca_layer.is_null() {
-                            // Window has a layer (either UIWindow-based or sublayer)
-                            if !info.ui_window.is_null() {
-                                unsafe {
-                                    let _: () = msg_send![info.ui_window, setHidden: false];
-                                    let _: () = msg_send![info.ui_window, makeKeyAndVisible];
-                                }
-                            } else {
-                                // Sublayer: make it visible
-                                unsafe {
-                                    let _: () = msg_send![info.ca_layer, setHidden: false];
-                                }
+                        if !info.ui_window.is_null() {
+                            // UIWindow exists — show it (like macOS makeKeyAndOrderFront)
+                            unsafe {
+                                let _: () = msg_send![info.ui_window, setHidden: false];
+                                let _: () = msg_send![info.ui_window, makeKeyAndVisible];
                             }
                             flush_window_to_layer(info.ca_layer, info.display_surface);
                             Some((info.x11_id, info.width, info.height, info.ui_view))
                         } else {
-                            // No layer yet — defer
+                            // UIWindow not yet created — defer
                             info.pending_show = true;
-                            ios_log(&format!("ShowWindow: id={} deferred (no layer yet)", handle.id));
-                            Some((info.x11_id, info.width, info.height, std::ptr::null_mut::<AnyObject>()))
+                            ios_log(&format!("ShowWindow: id={} deferred (no UIWindow yet)", handle.id));
+                            None
                         }
                     } else {
-                        // Hide
+                        // Hide (like macOS orderOut)
                         if !info.ui_window.is_null() {
-                            unsafe {
-                                let _: () = msg_send![info.ui_window, setHidden: true];
-                            }
-                        } else if !info.ca_layer.is_null() {
-                            unsafe {
-                                let _: () = msg_send![info.ca_layer, setHidden: true];
-                            }
+                            unsafe { let _: () = msg_send![info.ui_window, setHidden: true]; }
                         }
                         None
                     }
@@ -2438,8 +3056,8 @@ fn handle_command(cmd: DisplayCommand) {
                         info.height = height;
                     }
 
-                    // Update sublayer frame position/size
-                    if !info.ca_layer.is_null() && info.ui_window.is_null() {
+                    // Update container_layer frame (panel position/size including title bar).
+                    if !info.container_layer.is_null() {
                         unsafe {
                             use objc2::encode::{Encode, Encoding};
                             #[repr(C)]
@@ -2451,11 +3069,12 @@ fn handle_command(cmd: DisplayCommand) {
                                     Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
                                 ]);
                             }
+                            let panel_h = info.height as f64 + TITLE_BAR_HEIGHT as f64;
                             let frame = CGRect {
                                 origin: [info.x11_x as f64, info.x11_y as f64],
-                                size: [info.width as f64, info.height as f64],
+                                size: [info.width as f64, panel_h],
                             };
-                            let _: () = msg_send![info.ca_layer, setFrame: frame];
+                            let _: () = msg_send![info.container_layer, setFrame: frame];
                         }
                     }
 
@@ -2744,6 +3363,9 @@ fn get_fullscreen_vc_class() -> &'static AnyClass {
             // prefersHomeIndicatorAutoHidden → YES
             class_addMethod(raw_cls, objc2::sel!(prefersHomeIndicatorAutoHidden),
                 vc_prefers_status_bar_hidden as *const c_void, c"B@:".as_ptr() as _);
+            // viewDidLayoutSubviews — detect Stage Manager resize and update X11 window
+            class_addMethod(raw_cls, objc2::sel!(viewDidLayoutSubviews),
+                vc_view_did_layout_subviews as *const c_void, c"v@:".as_ptr() as _);
             CLASS = raw_cls as *const AnyClass;
         }
     });
@@ -2753,6 +3375,126 @@ fn get_fullscreen_vc_class() -> &'static AnyClass {
 
 unsafe extern "C" fn vc_prefers_status_bar_hidden(_this: *mut AnyObject, _sel: Sel) -> Bool {
     Bool::YES
+}
+
+/// viewDidLayoutSubviews — called when Stage Manager resizes the window.
+/// Detects actual view size and resizes the X11 window (IOSurface + ConfigureNotify) to match.
+unsafe extern "C" fn vc_view_did_layout_subviews(this: *mut AnyObject, _sel: Sel) {
+    // Call super
+    let superclass = objc2::class!(UIViewController);
+    let _: () = msg_send![super(this, superclass), viewDidLayoutSubviews];
+
+    let view: *mut AnyObject = msg_send![this, view];
+    if view.is_null() { return; }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGRect { origin: [f64; 2], size: [f64; 2] }
+    unsafe impl objc2::encode::Encode for CGRect {
+        const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Struct("CGRect", &[
+            objc2::encode::Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]),
+            objc2::encode::Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
+        ]);
+    }
+
+    let bounds: CGRect = msg_send![view, bounds];
+    let new_w = bounds.size[0] as u16;
+    // Subtract title bar height — the view is the container (title bar + content)
+    let raw_h = bounds.size[1] - IOS_TITLE_BAR_HEIGHT;
+    let new_h = if raw_h > 0.0 { raw_h as u16 } else { return; };
+    if new_w == 0 || new_h == 0 { return; }
+
+    // Find the window by matching the UIWindow from the VC
+    let ui_window: *mut AnyObject = msg_send![view, window];
+    if ui_window.is_null() { return; }
+
+    // Find native_id by matching ui_window in WINDOWS
+    // Use try_borrow to avoid panic if WINDOWS is already borrowed (e.g. timer_callback)
+    let needs_resize = WINDOWS.with(|w| {
+        let ws = match w.try_borrow() {
+            Ok(ws) => ws,
+            Err(_) => return None, // Already borrowed — skip this layout pass
+        };
+        for (id, info) in ws.iter() {
+            if info.ui_window == ui_window {
+                if info.width != new_w || info.height != new_h {
+                    return Some((*id, info.x11_id, info.width, info.height));
+                }
+                return None;
+            }
+        }
+        None
+    });
+
+    if let Some((native_id, x11_id, old_w, old_h)) = needs_resize {
+        ios_log(&format!("viewDidLayoutSubviews: Stage Manager resize {}x{} -> {}x{} x11=0x{:08X}",
+            old_w, old_h, new_w, new_h, x11_id));
+
+        // Also resize the PSLXView (content view) to match
+        WINDOWS.with(|w| {
+            let mut ws = match w.try_borrow_mut() {
+                Ok(ws) => ws,
+                Err(_) => return, // Already borrowed — skip
+            };
+            if let Some(info) = ws.get_mut(&native_id) {
+                let new_surface = create_iosurface(new_w, new_h);
+                let new_display = create_iosurface(new_w, new_h);
+                if new_surface.is_null() || new_display.is_null() { return; }
+
+                // Copy old content to new surfaces
+                for (old_s, new_s) in [(info.surface, new_surface), (info.display_surface, new_display)] {
+                    IOSurfaceLock(new_s, 0, std::ptr::null_mut());
+                    IOSurfaceLock(old_s, 0, std::ptr::null_mut());
+                    let src = IOSurfaceGetBaseAddress(old_s) as *const u8;
+                    let dst = IOSurfaceGetBaseAddress(new_s) as *mut u8;
+                    let src_stride = IOSurfaceGetBytesPerRow(old_s);
+                    let dst_stride = IOSurfaceGetBytesPerRow(new_s);
+                    let copy_h = old_h.min(new_h) as usize;
+                    let copy_w = (old_w.min(new_w) as usize) * 4;
+                    for row in 0..copy_h {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(row * src_stride),
+                            dst.add(row * dst_stride),
+                            copy_w,
+                        );
+                    }
+                    IOSurfaceUnlock(old_s, 0, std::ptr::null_mut());
+                    IOSurfaceUnlock(new_s, 0, std::ptr::null_mut());
+                }
+
+                CFRelease(info.surface);
+                CFRelease(info.display_surface);
+                info.surface = new_surface;
+                info.display_surface = new_display;
+                info.width = new_w;
+                info.height = new_h;
+
+                // Resize the PSLXView frame to match new content size
+                if !info.ui_view.is_null() {
+                    let content_frame = CGRect {
+                        origin: [0.0, IOS_TITLE_BAR_HEIGHT],
+                        size: [new_w as f64, new_h as f64],
+                    };
+                    let _: () = msg_send![info.ui_view, setFrame: content_frame];
+                }
+
+                // Update layer contents
+                flush_window_to_layer(info.ca_layer, info.display_surface);
+            }
+        });
+
+        // Notify X11 client of new size
+        send_display_event(DisplayEvent::ConfigureNotify {
+            window: x11_id,
+            x: 0, y: 0,
+            width: new_w, height: new_h,
+        });
+        send_display_event(DisplayEvent::Expose {
+            window: x11_id,
+            x: 0, y: 0,
+            width: new_w, height: new_h, count: 0,
+        });
+    }
 }
 
 /// Scene connected — called for both initial scene and requestSceneSessionActivation scenes.
@@ -3120,3 +3862,5 @@ pub fn run_ios_app(
         );
     }
 }
+
+// Old audio code removed — now in src/audio.rs (PulseAudio native protocol server)

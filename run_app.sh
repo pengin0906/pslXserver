@@ -1,17 +1,17 @@
 #!/bin/bash
-# Build and run pslXserver as a proper .app bundle
+# Build and run Xerver as a proper .app bundle
 # This ensures macOS treats it as a real GUI app, enabling proper focus management
 
 set -e
 ~/.cargo/bin/cargo build --release
 
 # Update .app bundle binary
-mkdir -p pslXserver.app/Contents/MacOS
-cp target/release/pslXserver pslXserver.app/Contents/MacOS/
+mkdir -p Xerver.app/Contents/MacOS
+cp target/release/Xerver Xerver.app/Contents/MacOS/
 
 # Kill old instance if running
-pkill -f pslXserver.app || true
+pkill -f Xerver.app || true
 sleep 0.5
 
 # Launch via 'open' — macOS handles activation policy correctly this way
-open pslXserver.app --args "$@"
+open Xerver.app --args "$@"

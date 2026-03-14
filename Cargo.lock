@@ -3,6 +3,34 @@
 version = 4
 
 [[package]]
+name = "Xerver"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "block2",
+ "bytes",
+ "clap",
+ "core-foundation 0.10.1",
+ "core-graphics 0.24.0",
+ "core-text",
+ "crossbeam-channel",
+ "dashmap",
+ "encoding_rs",
+ "env_logger",
+ "log",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-ui-kit",
+ "parking_lot",
+ "thiserror",
+ "tokio",
+ "unicode-width",
+ "x11rb-protocol",
+ "zstd",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -717,34 +745,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "pslXserver"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.11.0",
- "block2",
- "bytes",
- "clap",
- "core-foundation 0.10.1",
- "core-graphics 0.24.0",
- "core-text",
- "crossbeam-channel",
- "dashmap",
- "encoding_rs",
- "env_logger",
- "log",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "objc2-ui-kit",
- "parking_lot",
- "thiserror",
- "tokio",
- "unicode-width",
- "x11rb-protocol",
- "zstd",
 ]
 
 [[package]]
