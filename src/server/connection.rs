@@ -3770,10 +3770,10 @@ async fn handle_get_keyboard_mapping<S: AsyncRead + AsyncWrite + Unpin>(
     for i in 0..count {
         let keycode = first_keycode + i;
 
-        if keycode >= 136 {
-            // Virtual keycodes 136+ for IME input (Unicode keysyms)
+        if keycode >= 120 {
+            // Virtual keycodes 120+ for IME input (Unicode keysyms)
             let vk = server.virtual_keysyms.read();
-            let idx = (keycode - 136) as usize;
+            let idx = (keycode - 120) as usize;
             let ks = if idx < vk.len() { vk[idx] } else { 0 };
             if ks != 0 {
                 log::info!("GetKeyboardMapping: keycode={} → keysym 0x{:08x} (U+{:04X})",
@@ -3828,6 +3828,8 @@ pub(crate) fn evdev_keycode_to_keysym(evdev: u32) -> (u32, u32) {
         125 | 126 => 55, // Meta → Command
         // Arrow keys
         105 => 123, 106 => 124, 108 => 125, 103 => 126,
+        // Navigation keys
+        102 => 115, 107 => 119, 104 => 116, 109 => 121, 111 => 117,
         // Function keys
         59 => 122, 60 => 120, 61 => 99, 62 => 118, 63 => 96, 64 => 97, 65 => 98,
         66 => 100, 67 => 101, 68 => 109, 87 => 103, 88 => 111,

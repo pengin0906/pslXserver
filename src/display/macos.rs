@@ -288,6 +288,12 @@ fn macos_keycode_to_x11(mac: u16) -> u8 {
         124 => 106, // Right → KEY_RIGHT
         125 => 108, // Down → KEY_DOWN
         126 => 103, // Up → KEY_UP
+        // Navigation keys
+        115 => 102, // Home → KEY_HOME
+        119 => 107, // End → KEY_END (Delete/Forward Delete on some Mac keyboards)
+        116 => 104, // PageUp → KEY_PAGEUP
+        121 => 109, // PageDown → KEY_PAGEDOWN
+        117 => 111, // Delete (Forward) → KEY_DELETE
         // JIS keys
         102 => 100, // Eisu (英数)
         104 => 92,  // Kana (かな) → KEY_HENKAN

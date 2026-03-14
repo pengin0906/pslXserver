@@ -1069,7 +1069,7 @@ fn find_conn_for_window(server: &XServer, window: Xid) -> Option<u32> {
 ///
 /// Requires xterm to be launched with UTF-8 locale (LANG=ja_JP.UTF-8).
 async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
-    const VIRTUAL_BASE: u8 = 86;
+    const VIRTUAL_BASE: u8 = 120;
     info!("send_ime_text: window=0x{:08x} text='{}'", window, text);
 
     let focus = server.focus_window.load(Ordering::Relaxed);
@@ -1145,7 +1145,7 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     // ASCII chars use standard keycodes. Non-ASCII chars use virtual keycodes.
     // Virtual keycodes 86-255 = 170 slots per batch.
     // If more than 170 unique non-ASCII chars, we send multiple batches.
-    const MAX_VIRTUAL: usize = 170;
+    const MAX_VIRTUAL: usize = 136; // keycodes 120-255
 
     // Classify each char
     struct CharEntry { ch: char, is_ascii: bool }
