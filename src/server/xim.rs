@@ -618,7 +618,7 @@ impl XimServer {
         mask_msg.extend_from_slice(&im_id.to_le_bytes());
         mask_msg.extend_from_slice(&ic_id.to_le_bytes());
         mask_msg.extend_from_slice(&forward_mask.to_le_bytes()); // forward_event_mask
-        mask_msg.extend_from_slice(&forward_mask.to_le_bytes()); // synchronous_event_mask
+        mask_msg.extend_from_slice(&0u32.to_le_bytes()); // synchronous_event_mask (0 = async, avoids blocking clicks)
         self.send_xim_message(im_id, &mask_msg, conn);
     }
 

@@ -1,8 +1,11 @@
 #!/bin/bash
 # Build and run Xserver as a proper .app bundle
 # This ensures macOS treats it as a real GUI app, enabling proper focus management
+# IMPORTANT: Must launch via 'open Xserver.app' for correct screen resolution detection.
+#            Direct binary execution (nohup target/release/Xserver) causes wrong resolution.
 
 set -e
+cd "$(dirname "$0")"
 ~/.cargo/bin/cargo build --release
 
 # Update .app bundle binary
