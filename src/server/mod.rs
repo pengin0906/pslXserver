@@ -332,7 +332,7 @@ pub async fn run_server(
         if let Some(mut res) = server.resources.get_mut(&root_id) {
             if let resources::Resource::Window(ref w) = res.value() {
                 let mut w = w.write();
-                // XIM_SERVERS property: array of ATOM containing @server=xerver
+                // XIM_SERVERS property: array of ATOM containing @server=xserver
                 w.properties.push(resources::Property {
                     name: xim_servers_atom,
                     type_atom: 4, // ATOM
@@ -341,9 +341,9 @@ pub async fn run_server(
                 });
             }
         }
-        // Own the @server=xerver selection
+        // Own the @server=xserver selection
         server.selections.insert(server_atom, (root_id, server.startup_time));
-        info!("XIM: advertised @server=xerver on root window, owned selection atom={}", server_atom);
+        info!("XIM: advertised @server=xserver on root window, owned selection atom={}", server_atom);
     }
 
     let server = Arc::new(server);

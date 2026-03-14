@@ -1,4 +1,4 @@
-// pslXserver iOS — Swift entry point
+// Xserver iOS — Swift entry point
 // Calls into the Rust static library to start the X11 server.
 
 import UIKit

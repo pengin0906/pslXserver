@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""pslx-proxy: X11 compression proxy for pslXserver.
+"""pslx-proxy: X11 compression proxy for Xserver.
 
 Runs on the REMOTE machine. Accepts plain X11 connections and forwards
-them to pslXserver via zstd-compressed TCP using a simple frame protocol:
+them to Xserver via zstd-compressed TCP using a simple frame protocol:
   [4-byte LE length][zstd-compressed data]
 
 Usage:
   python3 pslx_proxy.py <pslxserver_host> [--listen-port 6001] [--server-port 6100]
 
 Then: DISPLAY=localhost:1 chromium --no-sandbox ...
-pslXserver: --tcp --compress-port 6100
+Xserver: --tcp --compress-port 6100
 """
 
 import asyncio

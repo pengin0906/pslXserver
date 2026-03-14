@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-iOS Simulator automated test for pslXserver-iOS.
+iOS Simulator automated test for Xserver-iOS.
 
 Tests:
 1. Start xterm connected to the simulator (DISPLAY=127.0.0.1:1)
@@ -10,13 +10,13 @@ Tests:
 
 Prerequisites:
 - iOS simulator running: xcrun simctl boot FBB5C54D-DB2C-4E6C-BFCB-0147CEDB3BFB
-- pslXserver-iOS installed and launched on the simulator
+- Xserver-iOS installed and launched on the simulator
 - xterm running: DISPLAY=127.0.0.1:1 xterm -u8 ...
 - python-xlib installed: pip3 install python-xlib
 
 Usage:
     # 1. Launch simulator app
-    xcrun simctl launch FBB5C54D-DB2C-4E6C-BFCB-0147CEDB3BFB com.pslx.pslXserver-iOS
+    xcrun simctl launch FBB5C54D-DB2C-4E6C-BFCB-0147CEDB3BFB com.pslx.Xserver-iOS
     # 2. Connect xterm
     DISPLAY=127.0.0.1:1 /opt/homebrew/bin/xterm -u8 &
     # 3. Run this test
@@ -246,7 +246,7 @@ def test_window_visible():
         return False
 
 def main():
-    print("pslXserver iOS Simulator Test")
+    print("Xserver iOS Simulator Test")
     print("=" * 40)
     print(f"Display: {DISPLAY_ADDR}")
     print(f"Simulator: {SIMULATOR_UDID}")
@@ -259,7 +259,7 @@ def main():
         print("Waiting for xterm to connect...")
         if not wait_for_xterm(timeout=15):
             print("ERROR: xterm did not connect within 15 seconds")
-            print("Make sure pslXserver-iOS is running on the simulator")
+            print("Make sure Xserver-iOS is running on the simulator")
             if xterm_proc:
                 xterm_proc.terminate()
             sys.exit(1)
