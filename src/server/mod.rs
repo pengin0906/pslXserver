@@ -1145,8 +1145,8 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
     let new_keysyms_added;
     {
         let mut vk = server.virtual_keysyms.write();
-        // If slots are full, reset kanji slots so new chars can be registered.
-        // This triggers one MappingNotify+50ms, but only happens after 33 unique kanji.
+        // If slots are full, reset non-hiragana slots so new chars can be registered.
+        // Keeps 86 pre-populated hiragana, frees 33 kanji/katakana slots.
         if vk.len() >= MAX_VIRTUAL {
             vk.truncate(86);
         }
