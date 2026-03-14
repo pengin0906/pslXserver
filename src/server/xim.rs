@@ -59,10 +59,18 @@ const XIM_PREEDIT_DONE: u8 = 78;
 const XIM_LOOKUP_CHARS: u16 = 0x0002;
 const XIM_LOOKUP_KEYSYM: u16 = 0x0004;
 
-// Input styles
-const XIM_PREEDIT_CALLBACKS: u32 = 0x0002;
-const XIM_PREEDIT_NOTHING: u32 = 0x0008;
-const XIM_STATUS_NOTHING: u32 = 0x0400;
+// Preedit styles (XIMPreedit*)
+const XIM_PREEDIT_AREA: u32      = 0x0001;  // off-the-spot
+const XIM_PREEDIT_CALLBACKS: u32 = 0x0002;  // app draws preedit
+const XIM_PREEDIT_POSITION: u32  = 0x0004;  // over-the-spot (server positions)
+const XIM_PREEDIT_NOTHING: u32   = 0x0008;  // root window / no preedit
+const XIM_PREEDIT_NONE: u32      = 0x0010;  // no input method
+
+// Status styles (XIMStatus*)
+const XIM_STATUS_AREA: u32       = 0x0100;
+const XIM_STATUS_CALLBACKS: u32  = 0x0200;
+const XIM_STATUS_NOTHING: u32    = 0x0400;
+const XIM_STATUS_NONE: u32       = 0x0800;
 
 // IC attribute IDs we assign
 const IC_ATTR_INPUT_STYLE: u16 = 0;
@@ -366,12 +374,13 @@ impl XimServer {
         let im_attr_list_len = im_attr_entry_len;
 
         // IC attributes we support
-        // Type values from libX11 imExt.h: CARD32=0x000A, Window=3, XPoint=6, XIMStyles=0x000D
+        // Type values per XIM spec (XimProto.h):
+        //   CARD32=3, STRING8=4, Window=5, XIMStyles=10, XRectangle=11, XPoint=12, XFontSet=13
         let ic_attrs: &[(u16, u16, &[u8])] = &[
-            (IC_ATTR_INPUT_STYLE, 0x000A, b"inputStyle"),     // XimType_CARD32
-            (IC_ATTR_CLIENT_WINDOW, 3, b"clientWindow"),       // XimType_Window
-            (IC_ATTR_FOCUS_WINDOW, 3, b"focusWindow"),         // XimType_Window
-            (IC_ATTR_SPOT_LOCATION, 6, b"spotLocation"),       // XimType_XPoint
+            (IC_ATTR_INPUT_STYLE, 3, b"inputStyle"),           // XimType_CARD32
+            (IC_ATTR_CLIENT_WINDOW, 5, b"clientWindow"),       // XimType_Window
+            (IC_ATTR_FOCUS_WINDOW, 5, b"focusWindow"),         // XimType_Window
+            (IC_ATTR_SPOT_LOCATION, 12, b"spotLocation"),      // XimType_XPoint
         ];
 
         let mut ic_attr_data = Vec::new();
@@ -404,7 +413,7 @@ impl XimServer {
 
         // IM attribute: queryInputStyle
         reply.extend_from_slice(&IM_ATTR_QUERY_INPUT_STYLE.to_le_bytes()); // attr_id = 0
-        reply.extend_from_slice(&0x000Du16.to_le_bytes()); // type = XimType_XIMStyles
+        reply.extend_from_slice(&0x000Au16.to_le_bytes()); // type = XimType_XIMStyles (10)
         reply.extend_from_slice(&(im_attr_name.len() as u16).to_le_bytes());
         reply.extend_from_slice(im_attr_name);
         for _ in 0..im_attr_pad {
@@ -464,17 +473,44 @@ impl XimServer {
         self.send_xim_message(im_id, &reply, conn);
     }
 
-    fn handle_get_im_values(&self, im_id: u16, _data: &[u8], conn: &ClientConnection) {
-        debug!("XIM: GetIMValues im_id={}", im_id);
+    fn handle_get_im_values(&self, im_id: u16, data: &[u8], conn: &ClientConnection) {
+        // Log requested attribute IDs
+        if data.len() > 8 {
+            let req_im_id = u16::from_le_bytes([data[4], data[5]]);
+            let list_len = u16::from_le_bytes([data[6], data[7]]) as usize;
+            let mut attr_ids = Vec::new();
+            let mut pos = 8;
+            while pos + 2 <= data.len() && pos < 8 + list_len {
+                attr_ids.push(u16::from_le_bytes([data[pos], data[pos + 1]]));
+                pos += 2;
+            }
+            info!("XIM: GetIMValues im_id={} req_im_id={} requested_attrs={:?}", im_id, req_im_id, attr_ids);
+        } else {
+            info!("XIM: GetIMValues im_id={} (short data, len={})", im_id, data.len());
+        }
 
-        // Parse requested attribute IDs
-        // [4-5] = im_id, [6-7] = byte length of attr ID list, [8..] = attr IDs (u16 each)
-        // Build reply with queryInputStyle if requested
-
-        // Supported input styles
+        // Supported input styles — full set
         let styles: &[u32] = &[
-            XIM_PREEDIT_CALLBACKS | XIM_STATUS_NOTHING,  // 0x0402
-            XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING,    // 0x0408
+            XIM_PREEDIT_CALLBACKS | XIM_STATUS_AREA,       // 0x0102
+            XIM_PREEDIT_CALLBACKS | XIM_STATUS_CALLBACKS,  // 0x0202
+            XIM_PREEDIT_CALLBACKS | XIM_STATUS_NOTHING,    // 0x0402
+            XIM_PREEDIT_CALLBACKS | XIM_STATUS_NONE,       // 0x0802
+            XIM_PREEDIT_POSITION | XIM_STATUS_AREA,        // 0x0104
+            XIM_PREEDIT_POSITION | XIM_STATUS_CALLBACKS,   // 0x0204
+            XIM_PREEDIT_POSITION | XIM_STATUS_NOTHING,     // 0x0404
+            XIM_PREEDIT_POSITION | XIM_STATUS_NONE,        // 0x0804
+            XIM_PREEDIT_AREA | XIM_STATUS_AREA,            // 0x0101
+            XIM_PREEDIT_AREA | XIM_STATUS_CALLBACKS,       // 0x0201
+            XIM_PREEDIT_AREA | XIM_STATUS_NOTHING,         // 0x0401
+            XIM_PREEDIT_AREA | XIM_STATUS_NONE,            // 0x0801
+            XIM_PREEDIT_NOTHING | XIM_STATUS_AREA,         // 0x0108
+            XIM_PREEDIT_NOTHING | XIM_STATUS_CALLBACKS,    // 0x0208
+            XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING,      // 0x0408
+            XIM_PREEDIT_NOTHING | XIM_STATUS_NONE,         // 0x0808
+            XIM_PREEDIT_NONE | XIM_STATUS_AREA,            // 0x0110
+            XIM_PREEDIT_NONE | XIM_STATUS_CALLBACKS,       // 0x0210
+            XIM_PREEDIT_NONE | XIM_STATUS_NOTHING,         // 0x0410
+            XIM_PREEDIT_NONE | XIM_STATUS_NONE,            // 0x0810
         ];
 
         // Build the XIMStyles value:
@@ -503,6 +539,7 @@ impl XimServer {
             reply.push(0);
         }
 
+        info!("XIM: GetIMValues reply {} bytes: {:02x?}", reply.len(), &reply);
         self.send_xim_message(im_id, &reply, conn);
     }
 
@@ -573,14 +610,15 @@ impl XimServer {
         reply.extend_from_slice(&ic_id.to_le_bytes());
         self.send_xim_message(im_id, &reply, conn);
 
-        // Send XIM_SET_EVENT_MASK to tell the client which events we want.
-        // forward_event_mask = 0 (we don't want the client to forward any key events to us)
-        // synchronous_event_mask = 0
+        // Send XIM_SET_EVENT_MASK: tell the client to forward KeyPress/KeyRelease to us.
+        // We act as gatekeeper: non-IME keys are returned via XIM_FORWARD_EVENT,
+        // IME text is delivered via XIM_COMMIT/XIM_PREEDIT_DRAW.
+        let forward_mask: u32 = 0x0000_0003; // KeyPressMask(1) | KeyReleaseMask(2)
         let mut mask_msg = vec![XIM_SET_EVENT_MASK, 0, 3, 0]; // length=3 words (12 bytes)
         mask_msg.extend_from_slice(&im_id.to_le_bytes());
         mask_msg.extend_from_slice(&ic_id.to_le_bytes());
-        mask_msg.extend_from_slice(&0u32.to_le_bytes()); // forward_event_mask = 0
-        mask_msg.extend_from_slice(&0u32.to_le_bytes()); // synchronous_event_mask = 0
+        mask_msg.extend_from_slice(&forward_mask.to_le_bytes()); // forward_event_mask
+        mask_msg.extend_from_slice(&forward_mask.to_le_bytes()); // synchronous_event_mask
         self.send_xim_message(im_id, &mask_msg, conn);
     }
 
@@ -683,14 +721,37 @@ impl XimServer {
         let flag = u16::from_le_bytes([data[8], data[9]]);
         let event_data = &data[12..44];
 
-        debug!("XIM: ForwardEvent im_id={} ic_id={} flag={} event_type={}", im_id, ic_id, flag, event_data[0]);
+        let composing = crate::display::IME_COMPOSING.load(std::sync::atomic::Ordering::Relaxed);
+        debug!("XIM: ForwardEvent im_id={} ic_id={} flag={} event_type={} composing={}",
+            im_id, ic_id, flag, event_data[0], composing);
 
-        // Forward the key event to the client's event queue directly
-        let mut event_buf = [0u8; 32];
-        event_buf.copy_from_slice(event_data);
-        let _ = conn.event_tx.send(event_buf.into());
+        if composing {
+            // IME is composing — swallow the key event.
+            // macOS IME will handle it and produce ImeCommit/ImePreeditDraw.
+            // Still send sync reply if requested.
+            if flag & 0x0001 != 0 {
+                let mut sync = vec![XIM_SYNC_REPLY, 0, 1, 0];
+                sync.extend_from_slice(&im_id.to_le_bytes());
+                sync.extend_from_slice(&ic_id.to_le_bytes());
+                self.send_xim_message(im_id, &sync, conn);
+            }
+            return;
+        }
 
-        // Send sync reply if synchronous flag is set
+        // Not composing — return the key event to the client via XIM_FORWARD_EVENT.
+        // The client's XFilterEvent will return False, allowing normal key processing.
+        let mut reply = Vec::with_capacity(48);
+        reply.push(XIM_FORWARD_EVENT);
+        reply.push(0);
+        reply.extend_from_slice(&(10u16).to_le_bytes()); // length = 10 words (40 bytes)
+        reply.extend_from_slice(&im_id.to_le_bytes());
+        reply.extend_from_slice(&ic_id.to_le_bytes());
+        reply.extend_from_slice(&0u16.to_le_bytes()); // flag = 0 (not synchronous, not filtered)
+        reply.extend_from_slice(&0u16.to_le_bytes()); // serial
+        reply.extend_from_slice(event_data); // 32-byte X event
+        self.send_xim_message(im_id, &reply, conn);
+
+        // Send sync reply for the original request if synchronous
         if flag & 0x0001 != 0 {
             let mut sync = vec![XIM_SYNC_REPLY, 0, 1, 0];
             sync.extend_from_slice(&im_id.to_le_bytes());
@@ -726,9 +787,11 @@ impl XimServer {
             let xim_conn = conn_entry.value();
             for ctx_entry in xim_conn.contexts.iter() {
                 let ctx = ctx_entry.value();
-                // Match by focus_window or client_window
+                // Match by focus_window or client_window (both directions of ancestry)
                 if ctx.focus_window == focus_window || ctx.client_window == focus_window
                     || self.window_is_descendant(server, focus_window, ctx.client_window)
+                    || self.window_is_descendant(server, ctx.focus_window, focus_window)
+                    || self.window_is_descendant(server, ctx.client_window, focus_window)
                 {
                     if let Some(conn) = server.connections.get(&xim_conn.conn_id) {
                         self.send_xim_commit(
@@ -818,12 +881,15 @@ impl XimServer {
     }
 
     /// Check if any XIM client has an IC matching the given window.
+    /// Matches if: target == IC's focus/client window, OR target is ancestor/descendant of IC's windows.
     pub fn has_xim_client(&self, server: &XServer, focus_window: Xid) -> bool {
         for conn_entry in self.connections.iter() {
             for ctx_entry in conn_entry.value().contexts.iter() {
                 let ctx = ctx_entry.value();
                 if ctx.focus_window == focus_window || ctx.client_window == focus_window
                     || self.window_is_descendant(server, focus_window, ctx.client_window)
+                    || self.window_is_descendant(server, ctx.focus_window, focus_window)
+                    || self.window_is_descendant(server, ctx.client_window, focus_window)
                 {
                     return true;
                 }
@@ -860,6 +926,8 @@ impl XimServer {
                 let ctx = ctx_entry.value();
                 if ctx.focus_window == focus_window || ctx.client_window == focus_window
                     || self.window_is_descendant(server, focus_window, ctx.client_window)
+                    || self.window_is_descendant(server, ctx.focus_window, focus_window)
+                    || self.window_is_descendant(server, ctx.client_window, focus_window)
                 {
                     if let Some(conn) = server.connections.get(&xim_conn.conn_id) {
                         f(xim_conn, &ctx, &conn);
@@ -1048,6 +1116,7 @@ fn encode_compound_text(text: &str) -> Vec<u8> {
 }
 
 /// Build a 32-byte ClientMessage event with format=32 (5 x u32 data).
+/// send_event bit (bit 7 of byte 0) is set because XIM replies come via SendEvent.
 fn build_client_message_32(
     message_type: u32,
     window: Xid,
@@ -1055,7 +1124,7 @@ fn build_client_message_32(
     byte_order: &ByteOrder,
 ) -> [u8; 32] {
     let mut event = [0u8; 32];
-    event[0] = 33; // ClientMessage
+    event[0] = 33 | 0x80; // ClientMessage + send_event bit
     event[1] = 32; // format
     // sequence at 2-3 = 0
     match byte_order {
@@ -1080,6 +1149,7 @@ fn build_client_message_32(
 }
 
 /// Build a 32-byte ClientMessage event with format=8 (up to 20 bytes data).
+/// send_event bit (bit 7 of byte 0) is set because XIM replies come via SendEvent.
 fn build_client_message_8(
     message_type: u32,
     window: Xid,
@@ -1087,7 +1157,7 @@ fn build_client_message_8(
     byte_order: &ByteOrder,
 ) -> [u8; 32] {
     let mut event = [0u8; 32];
-    event[0] = 33; // ClientMessage
+    event[0] = 33 | 0x80; // ClientMessage + send_event bit
     event[1] = 8;  // format
     // sequence at 2-3 = 0
     match byte_order {

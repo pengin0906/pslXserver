@@ -237,10 +237,25 @@ impl XServer {
             focus_window: AtomicU32::new(1), // PointerRoot by default
             focus_revert_to: AtomicU32::new(1), // PointerRoot
             virtual_keysyms: parking_lot::RwLock::new({
-                // Pre-populate hiragana keysyms (86 chars) — leaves 33 slots for kanji
-                let mut v = Vec::with_capacity(119);
-                // All hiragana U+3041-U+3096 (86 chars: ぁ-ゖ)
-                for cp in 0x3041u32..=0x3096u32 {
+                // Pre-populate basic hiragana keysyms (46 chars: あ-ん)
+                // Leaves 4 slots for kanji/katakana rotation
+                let mut v = Vec::with_capacity(50);
+                // Basic hiragana: あ(3042) い(3044) う(3046) え(3048) お(304A)
+                // か-こ き-く け-こ さ-そ た-と な-の は-ほ ま-も や ゆ よ ら-ろ わ を ん
+                for &cp in &[
+                    0x3042u32, 0x3044, 0x3046, 0x3048, 0x304A, // あいうえお
+                    0x304B, 0x304D, 0x304F, 0x3051, 0x3053, // かきくけこ
+                    0x3055, 0x3057, 0x3059, 0x305B, 0x305D, // さしすせそ
+                    0x305F, 0x3061, 0x3064, 0x3066, 0x3068, // たちつてと
+                    0x306A, 0x306B, 0x306C, 0x306D, 0x306E, // なにぬねの
+                    0x306F, 0x3072, 0x3075, 0x3078, 0x307B, // はひふへほ
+                    0x307E, 0x307F, 0x3080, 0x3081, 0x3082, // まみむめも
+                    0x3084, 0x3086, 0x3088,                   // やゆよ
+                    0x3089, 0x308A, 0x308B, 0x308C, 0x308D, // らりるれろ
+                    0x308F, 0x3092, 0x3093,                   // わをん
+                    // Dakuten/handakuten variants (common)
+                    0x304C, 0x3060,                           // が だ
+                ] {
                     v.push(0x01000000 | cp);
                 }
                 v
@@ -307,10 +322,9 @@ pub async fn run_server(
     let mut server = XServer::new(display_number, cmd_tx, screen_width, screen_height);
     server.render_mailbox = render_mailbox;
 
-    // XIM disabled: macOS IME handles all input processing.
-    // Without XIM, apps use Xutf8LookupString which converts Unicode keysyms to UTF-8.
-    // With XIM enabled, Chrome's XFilterEvent consumes all key events, breaking input.
-    if false {
+    // XIM enabled: pslXserver acts as XIM server for Chrome/Electron apps.
+    // Chrome uses XIM for commit/preedit; xterm uses XMODIFIERS=@im=none (bypasses XIM).
+    {
         let root_id = server.screens[0].root_window;
         let xim_servers_atom = server.xim.atoms.xim_servers;
         let server_atom = server.xim.atoms.server_atom;
@@ -637,15 +651,10 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 send_key_event(&server, protocol::event_type::KEY_RELEASE, window, keycode, state, time);
             }
             DisplayEvent::ImeCommit { window, text } => {
-                // Try XIM first (for GTK/Electron apps with XIM connections)
                 let focus = server.focus_window.load(Ordering::Relaxed);
                 let target = if focus > 1 { focus } else { window };
                 eprintln!("ImeCommit: focus=0x{:x} window=0x{:x} target=0x{:x} text='{}' preedit_injected={}", focus, window, target, text, preedit_injected);
-                if server.xim.has_xim_client(&server, target) {
-                    server.xim.send_preedit_done(&server, target);
-                    server.xim.send_commit(&server, target, &text);
-                    info!("ImeCommit via XIM: '{}' to window 0x{:08x}", text, target);
-                } else if preedit_injected {
+                if preedit_injected {
                     // xterm: preedit was injected inline — erase it and send committed text
                     if !preedit_text.is_empty() && text.starts_with(&*preedit_text) {
                         // Incremental: only send the new suffix (preedit already in xterm)
@@ -673,17 +682,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 let focus = server.focus_window.load(Ordering::Relaxed);
                 let target = if focus > 1 { focus } else { window };
 
-                if server.xim.has_xim_client(&server, target) {
-                    // Send preedit via XIM protocol
-                    if preedit_char_count == 0 && new_count > 0 {
-                        server.xim.send_preedit_start(&server, target);
-                    }
-                    if new_count > 0 {
-                        server.xim.send_preedit_draw(&server, target, &text, new_count as u32);
-                    } else if preedit_char_count > 0 {
-                        server.xim.send_preedit_done(&server, target);
-                    }
-                } else {
+                {
                     // All apps: inject preedit inline via BS + Unicode keysym KeyPress.
                     // macOS IME handles conversion; we relay via Unicode keysyms.
                     // Without XIM, apps use Xutf8LookupString to convert keysyms to UTF-8.
@@ -723,9 +722,7 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
             DisplayEvent::ImePreeditDone { window } => {
                 let focus = server.focus_window.load(Ordering::Relaxed);
                 let target = if focus > 1 { focus } else { window };
-                if server.xim.has_xim_client(&server, target) && preedit_char_count > 0 {
-                    server.xim.send_preedit_done(&server, target);
-                } else if preedit_injected && preedit_char_count > 0 {
+                if preedit_injected && preedit_char_count > 0 {
                     // xterm: erase injected preedit on cancel
                     send_backspaces(&server, target, preedit_char_count);
                 }
@@ -1072,7 +1069,7 @@ fn find_conn_for_window(server: &XServer, window: Xid) -> Option<u32> {
 ///
 /// Requires xterm to be launched with UTF-8 locale (LANG=ja_JP.UTF-8).
 async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
-    const VIRTUAL_BASE: u8 = 136;
+    const VIRTUAL_BASE: u8 = 86;
     info!("send_ime_text: window=0x{:08x} text='{}'", window, text);
 
     let focus = server.focus_window.load(Ordering::Relaxed);
@@ -1135,112 +1132,109 @@ async fn send_ime_text(server: &XServer, window: Xid, text: &str) {
         .unwrap_or_default()
         .as_millis() as u32;
 
-    // Unicode keysym approach: for each non-ASCII character, use keysym 0x01000000 | codepoint
-    // on virtual keycodes 200+. Send MappingNotify first, then KeyPress events.
-    let chars: Vec<char> = text.chars().collect();
-    let mut virtual_idx = 0usize;
-    let mut char_keys: Vec<(u8, u16)> = Vec::with_capacity(chars.len());
-    const MAX_VIRTUAL: usize = 119; // keycodes 136-254
+    // Normalize chars: fullwidth → ASCII, ¥ → backslash
+    let chars: Vec<char> = text.chars().map(|ch| {
+        if ch >= '\u{FF01}' && ch <= '\u{FF5E}' {
+            char::from_u32(ch as u32 - 0xFF01 + 0x0021).unwrap_or(ch)
+        } else if ch == '\u{3000}' { ' ' }
+        else if ch == '\u{00A5}' { '\\' }
+        else { ch }
+    }).collect();
 
-    let new_keysyms_added;
-    {
-        let mut vk = server.virtual_keysyms.write();
-        // If slots are full, reset non-hiragana slots so new chars can be registered.
-        // Keeps 86 pre-populated hiragana, frees 33 kanji/katakana slots.
-        if vk.len() >= MAX_VIRTUAL {
-            vk.truncate(86);
-        }
-        let prev_len = vk.len();
-        for &ch in &chars {
-            let ch = if ch >= '\u{FF01}' && ch <= '\u{FF5E}' {
-                char::from_u32(ch as u32 - 0xFF01 + 0x0021).unwrap_or(ch)
-            } else if ch == '\u{3000}' {
-                ' '
-            } else if ch == '\u{00A5}' {
-                '\\' // Japanese keyboard ¥ → backslash
+    // Split chars into (keycode, state) entries.
+    // ASCII chars use standard keycodes. Non-ASCII chars use virtual keycodes.
+    // Virtual keycodes 86-255 = 170 slots per batch.
+    // If more than 170 unique non-ASCII chars, we send multiple batches.
+    const MAX_VIRTUAL: usize = 170;
+
+    // Classify each char
+    struct CharEntry { ch: char, is_ascii: bool }
+    let entries: Vec<CharEntry> = chars.iter().map(|&ch| CharEntry {
+        ch, is_ascii: ch.is_ascii(),
+    }).collect();
+
+    // Process in batches: accumulate until we hit MAX_VIRTUAL unique non-ASCII, then flush
+    let mut batch_start = 0;
+    while batch_start < entries.len() {
+        let mut batch_keys: Vec<(u8, u16)> = Vec::new();
+        let mut batch_keysyms: Vec<u32> = Vec::new(); // unique non-ASCII keysyms in this batch
+        let mut batch_end = batch_start;
+
+        for i in batch_start..entries.len() {
+            let e = &entries[i];
+            if e.is_ascii {
+                let keycode = ascii_to_x11_keycode(e.ch as u32);
+                let state = if needs_shift(e.ch) { 0x0001u16 } else { 0u16 };
+                batch_keys.push((keycode, state));
+                batch_end = i + 1;
             } else {
-                ch
-            };
-
-            if ch.is_ascii() {
-                let keycode = ascii_to_x11_keycode(ch as u32);
-                let state = if needs_shift(ch) { 0x0001u16 } else { 0u16 };
-                char_keys.push((keycode, state));
-            } else if vk.len() < MAX_VIRTUAL {
-                let keysym = 0x01000000 | (ch as u32);
-                // Reuse existing slot if this keysym was registered before
-                let slot = if let Some(pos) = vk.iter().position(|&k| k == keysym) {
+                let keysym = 0x01000000 | (e.ch as u32);
+                // Check if already in this batch
+                let slot = if let Some(pos) = batch_keysyms.iter().position(|&k| k == keysym) {
                     pos
                 } else {
-                    let pos = vk.len();
-                    vk.push(keysym);
+                    if batch_keysyms.len() >= MAX_VIRTUAL {
+                        break; // batch full, flush what we have
+                    }
+                    let pos = batch_keysyms.len();
+                    batch_keysyms.push(keysym);
                     pos
                 };
-                info!("send_ime_text: char '{}' U+{:04X} → keysym 0x{:08X} on keycode {}",
-                    ch, ch as u32, keysym, VIRTUAL_BASE + slot as u8);
-                char_keys.push((VIRTUAL_BASE + slot as u8, 0));
-                virtual_idx += 1;
+                batch_keys.push((VIRTUAL_BASE + slot as u8, 0));
+                batch_end = i + 1;
             }
         }
-        new_keysyms_added = vk.len() > prev_len;
-    }
-    let total_virtual = server.virtual_keysyms.read().len();
 
-    // Send MappingNotify only when new keysyms were added (avoids unnecessary round-trips)
-    if new_keysyms_added {
-        info!("send_ime_text: {} total keysyms on virtual keycodes ({}..{})", total_virtual, VIRTUAL_BASE, VIRTUAL_BASE as usize + total_virtual);
-        // Save generation before sending MappingNotify — we wait for it to increment,
-        // meaning the client has sent GetKeyboardMapping and fetched the updated keymap.
-        let gen_before = conn_ref.mapping_gen.load(std::sync::atomic::Ordering::Acquire);
-        for conn_entry in server.connections.iter() {
-            let c = conn_entry.value();
-            let mut mapping_notify = [0u8; 32];
-            mapping_notify[0] = 34; // MappingNotify type
-            // [1] = 0 (unused per X11 wire protocol)
-            // [2-3] = 0 (sequence number)
-            mapping_notify[4] = 1;  // request = MappingKeyboard (1)
-            mapping_notify[5] = VIRTUAL_BASE;        // first_keycode
-            mapping_notify[6] = total_virtual as u8; // count
-            let _ = c.event_tx.send(mapping_notify.into());
-        }
-        // Wait for client to process MappingNotify → GetKeyboardMapping round-trip.
-        // Poll mapping_gen with 1ms intervals; timeout at 200ms to avoid hanging.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
-        loop {
-            if conn_ref.mapping_gen.load(std::sync::atomic::Ordering::Acquire) != gen_before {
-                break; // client fetched new keymap
+        // Update keymap and send MappingNotify if this batch has non-ASCII
+        if !batch_keysyms.is_empty() {
+            {
+                let mut vk = server.virtual_keysyms.write();
+                vk.clear();
+                vk.extend_from_slice(&batch_keysyms);
             }
-            if tokio::time::Instant::now() >= deadline {
-                // Timeout: client didn't respond, wait a bit anyway to be safe
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                break;
+            let total = batch_keysyms.len();
+            let gen_before = conn_ref.mapping_gen.load(std::sync::atomic::Ordering::Acquire);
+            for conn_entry in server.connections.iter() {
+                let c = conn_entry.value();
+                let mut mn = [0u8; 32];
+                mn[0] = 34; // MappingNotify
+                mn[4] = 1;  // MappingKeyboard
+                mn[5] = VIRTUAL_BASE;
+                mn[6] = total as u8;
+                let _ = c.event_tx.send(mn.into());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            // Wait for client to fetch updated keymap
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+            loop {
+                if conn_ref.mapping_gen.load(std::sync::atomic::Ordering::Acquire) != gen_before {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-    }
 
-    // Small delay to ensure client has processed any pending MappingNotify
-    // from a previous send_ime_text call. Without this, rapid preedit updates
-    // can arrive before the client re-reads the keymap, causing characters to be dropped.
-    if char_keys.iter().any(|&(kc, _)| kc >= VIRTUAL_BASE) {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+        // Send KeyPress + KeyRelease for this batch
+        for &(keycode, state) in &batch_keys {
+            let press = events::build_key_event(
+                conn, protocol::event_type::KEY_PRESS, keycode, time,
+                server.screens[0].root_window, event_window, child,
+                0, 0, 0, 0, state, true,
+            );
+            let _ = conn.event_tx.send(press.into());
+            let release = events::build_key_event(
+                conn, protocol::event_type::KEY_RELEASE, keycode, time,
+                server.screens[0].root_window, event_window, child,
+                0, 0, 0, 0, state, true,
+            );
+            let _ = conn.event_tx.send(release.into());
+        }
 
-    // Send KeyPress + KeyRelease for each character
-    for &(keycode, state) in &char_keys {
-        let press = events::build_key_event(
-            conn, protocol::event_type::KEY_PRESS, keycode, time,
-            server.screens[0].root_window, event_window, child,
-            0, 0, 0, 0, state, true,
-        );
-        let _ = conn.event_tx.send(press.into());
-
-        let release = events::build_key_event(
-            conn, protocol::event_type::KEY_RELEASE, keycode, time,
-            server.screens[0].root_window, event_window, child,
-            0, 0, 0, 0, state, true,
-        );
-        let _ = conn.event_tx.send(release.into());
+        batch_start = batch_end;
     }
 }
 
