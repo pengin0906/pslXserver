@@ -22,6 +22,7 @@ pub async fn handle_xkb_request<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
 ) -> Result<(), ServerError> {
     let sub_opcode = data[1];
+    eprintln!("XKB request sub_opcode={}", sub_opcode);
     match sub_opcode {
         0 => handle_use_extension(server, conn, data, stream).await,
         1 => handle_select_events(server, conn, data, stream).await,
@@ -38,8 +39,16 @@ pub async fn handle_xkb_request<S: AsyncRead + AsyncWrite + Unpin>(
         17 => handle_get_names(server, conn, data, stream).await,
         21 => handle_per_client_flags(server, conn, data, stream).await,
         _ => {
-            info!("XKB: unhandled sub-opcode {}", sub_opcode);
-            Ok(()) // silently ignore unknown XKB requests
+            eprintln!("XKB: unhandled sub-opcode {} — sending error", sub_opcode);
+            // Send X11 error reply so client doesn't hang waiting for a response
+            let seq = conn.current_request_sequence();
+            let mut err = [0u8; 32];
+            err[0] = 0; // error
+            err[1] = 17; // BadAccess (generic error for unsupported request)
+            err[2] = (seq & 0xFF) as u8;
+            err[3] = ((seq >> 8) & 0xFF) as u8;
+            stream.write_all(&err).await?;
+            Ok(())
         }
     }
 }
@@ -179,27 +188,20 @@ async fn handle_get_map<S: AsyncRead + AsyncWrite + Unpin>(
     let want_types = (full & 0x01) != 0;
     let want_syms = (full & 0x02) != 0;
     let want_modmap = (full & 0x04) != 0;
+    eprintln!("XKB GetMap: full=0x{:04x} want_types={} want_syms={} want_modmap={} data_len={}",
+              full, want_types, want_syms, want_modmap, data.len());
 
     // Build body components
     let mut types_data = Vec::new();
     let n_types: u8;
     let total_types: u8;
     if want_types {
-        n_types = 3;
-        total_types = 3;
-        // Type 0: ONE_LEVEL — no modifiers, 1 level
-        types_data.push(0);   // mods_mask
-        types_data.push(0);   // mods_mods
-        write_u16_to(conn, &mut types_data, 0); // mods_vmods
-        types_data.push(1);   // num_levels
-        types_data.push(0);   // n_map_entries
-        types_data.push(0);   // has_preserve (bool)
-        types_data.push(0);   // pad
-
-        // Type 1: TWO_LEVEL — Shift modifier, 2 levels
+        n_types = 1;
+        total_types = 1;
+        // Type 0: TWO_LEVEL — Shift modifier, 2 levels (used by all keys)
         types_data.push(1);   // mods_mask = ShiftMask
         types_data.push(1);   // mods_mods = ShiftMask
-        write_u16_to(conn, &mut types_data, 0);
+        write_u16_to(conn, &mut types_data, 0); // mods_vmods
         types_data.push(2);   // num_levels
         types_data.push(1);   // n_map_entries
         types_data.push(0);   // has_preserve
@@ -211,21 +213,6 @@ async fn handle_get_map<S: AsyncRead + AsyncWrite + Unpin>(
         types_data.push(1);   // mods_mods = ShiftMask
         write_u16_to(conn, &mut types_data, 0); // mods_vmods
         write_u16_to(conn, &mut types_data, 0); // pad
-
-        // Type 2: ALPHABETIC — Shift + Lock, 2 levels
-        types_data.push(3);   // mods_mask = Shift|Lock
-        types_data.push(3);   // mods_mods
-        write_u16_to(conn, &mut types_data, 0);
-        types_data.push(2);   // num_levels
-        types_data.push(2);   // n_map_entries
-        types_data.push(0);   // has_preserve
-        types_data.push(0);   // pad
-        // Entry 1: Shift → level 2
-        types_data.push(1); types_data.push(1); types_data.push(1); types_data.push(1);
-        write_u16_to(conn, &mut types_data, 0); write_u16_to(conn, &mut types_data, 0);
-        // Entry 2: Lock → level 2
-        types_data.push(1); types_data.push(2); types_data.push(1); types_data.push(2);
-        write_u16_to(conn, &mut types_data, 0); write_u16_to(conn, &mut types_data, 0);
     } else {
         n_types = 0;
         total_types = 0;
@@ -255,7 +242,7 @@ async fn handle_get_map<S: AsyncRead + AsyncWrite + Unpin>(
             let shifted_ks = if shifted != 0 { shifted } else { normal };
 
             // kt_index[4] — key type for each of 4 groups
-            syms_data.push(1); // type 1 = TWO_LEVEL for all
+            syms_data.push(0); // type 0 = TWO_LEVEL (only type defined)
             syms_data.push(0);
             syms_data.push(0);
             syms_data.push(0);
@@ -351,6 +338,11 @@ async fn handle_get_map<S: AsyncRead + AsyncWrite + Unpin>(
     // Pad to 4-byte boundary
     reply.extend(std::iter::repeat(0).take(pad_len));
 
+    eprintln!("XKB GetMap: reply_len={} header=40 types={} syms={} modmap={} body={} pad={} additional_words={}",
+          reply.len(), types_data.len(), syms_data.len(), modmap_data.len(), body_len, pad_len, additional_words);
+    // Dump first 48 bytes of reply (header + start of body)
+    let dump: Vec<String> = reply.iter().take(48).map(|b| format!("{:02x}", b)).collect();
+    eprintln!("XKB GetMap header: {}", dump.join(" "));
     stream.write_all(&reply).await?;
     info!("XKB GetMap: present=0x{:04x} types={} syms={} modmap={} body={}",
           present, n_types, total_syms, n_mod_map_keys, body_len);
