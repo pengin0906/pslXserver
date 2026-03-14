@@ -615,8 +615,31 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
                 let (target, cx, cy) = if grab_window != 0 {
                     let cx = x - grab_offset_x;
                     let cy = y - grab_offset_y;
-                    if cy < 0 || cx < 0 {
-                        log::debug!("Grab motion OOB: win=0x{:08x} cx={} cy={} state=0x{:04x}", grab_window, cx, cy, state);
+                    // xterm's Xt auto-scroll timer does not fire on macOS (Homebrew Xt).
+                    // Workaround: inject Button4/5 scroll events when pointer goes OOB.
+                    // This scrolls content but resets selection — an acceptable trade-off
+                    // since the alternative is no scroll at all.
+                    let win_h = if let Some(res) = server.resources.get(&grab_window) {
+                        if let Resource::Window(win) = res.value() { win.read().height as i16 } else { 10000 }
+                    } else { 10000 };
+                    if cy < 0 && last_autoscroll.elapsed().as_millis() >= 60 {
+                        let speed = std::cmp::min((-cy / 10) as u32 + 1, 3);
+                        for _ in 0..speed {
+                            send_button_event(&server, protocol::event_type::BUTTON_PRESS,
+                                grab_window, 4, cx, 0, root_x, root_y, state & !0x100, time);
+                            send_button_event(&server, protocol::event_type::BUTTON_RELEASE,
+                                grab_window, 4, cx, 0, root_x, root_y, state & !0x100, time);
+                        }
+                        last_autoscroll = std::time::Instant::now();
+                    } else if cy > win_h && last_autoscroll.elapsed().as_millis() >= 60 {
+                        let speed = std::cmp::min(((cy - win_h) / 10) as u32 + 1, 3);
+                        for _ in 0..speed {
+                            send_button_event(&server, protocol::event_type::BUTTON_PRESS,
+                                grab_window, 5, cx, win_h, root_x, root_y, state & !0x100, time);
+                            send_button_event(&server, protocol::event_type::BUTTON_RELEASE,
+                                grab_window, 5, cx, win_h, root_x, root_y, state & !0x100, time);
+                        }
+                        last_autoscroll = std::time::Instant::now();
                     }
                     (grab_window, cx, cy)
                 } else {
