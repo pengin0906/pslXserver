@@ -270,12 +270,12 @@ impl XServer {
         server
     }
 
-    /// Return the minimal set of font names Xerver advertises.
+    /// Return the minimal set of font names Xserver advertises.
     /// We use CoreText for all rendering, so these are just names clients can OpenFont.
     fn load_font_names() -> Vec<String> {
         // Only advertise fonts we actually handle. 4600+ system fonts cause
         // huge ListFonts responses that slow xterm startup significantly.
-        // All fonts are iso10646 (Unicode BMP). No iso8859 — Xerver uses
+        // All fonts are iso10646 (Unicode BMP). No iso8859 — Xserver uses
         // CoreText for all rendering, so every font can display CJK.
         let names: &[&str] = &[
             "fixed",
@@ -322,7 +322,7 @@ pub async fn run_server(
     let mut server = XServer::new(display_number, cmd_tx, screen_width, screen_height);
     server.render_mailbox = render_mailbox;
 
-    // XIM enabled: Xerver acts as XIM server for Chrome/Electron apps.
+    // XIM enabled: Xserver acts as XIM server for Chrome/Electron apps.
     // Chrome uses XIM for commit/preedit; xterm uses XMODIFIERS=@im=none (bypasses XIM).
     {
         let root_id = server.screens[0].root_window;

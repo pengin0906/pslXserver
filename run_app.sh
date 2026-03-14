@@ -1,17 +1,17 @@
 #!/bin/bash
-# Build and run Xerver as a proper .app bundle
+# Build and run Xserver as a proper .app bundle
 # This ensures macOS treats it as a real GUI app, enabling proper focus management
 
 set -e
 ~/.cargo/bin/cargo build --release
 
 # Update .app bundle binary
-mkdir -p Xerver.app/Contents/MacOS
-cp target/release/Xerver Xerver.app/Contents/MacOS/
+mkdir -p Xserver.app/Contents/MacOS
+cp target/release/Xserver Xserver.app/Contents/MacOS/
 
 # Kill old instance if running
-pkill -f Xerver.app || true
+pkill -f Xserver.app || true
 sleep 0.5
 
 # Launch via 'open' — macOS handles activation policy correctly this way
-open Xerver.app --args "$@"
+open Xserver.app --args "$@"

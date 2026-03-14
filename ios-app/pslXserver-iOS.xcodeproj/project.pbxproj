@@ -8,7 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		A1000001 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001; };
-		A1000002 /* libXerver.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000002; };
+		A1000002 /* libXserver.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000002; };
 		A1000003 /* IOSurface.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000003; };
 		A1000004 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000004; };
 		A1000005 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000005; };
@@ -22,16 +22,16 @@
 
 /* Begin PBXFileReference section */
 		A2000001 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
-		A2000002 /* libXerver.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libXerver.a; path = "../../target/aarch64-apple-ios-sim/release/libXerver.a"; sourceTree = "<group>"; };
+		A2000002 /* libXserver.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libXserver.a; path = "../../target/aarch64-apple-ios-sim/release/libXserver.a"; sourceTree = "<group>"; };
 		A2000003 /* IOSurface.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOSurface.framework; path = System/Library/Frameworks/IOSurface.framework; sourceTree = SDKROOT; };
 		A2000004 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
 		A2000005 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		A2000006 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
 		A2000007 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		A2000008 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
-		A2000009 /* Xerver-iOS-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Xerver-iOS-Bridging-Header.h"; sourceTree = "<group>"; };
+		A2000009 /* Xserver-iOS-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Xserver-iOS-Bridging-Header.h"; sourceTree = "<group>"; };
 		A200000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		A200000B /* Xerver-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Xerver-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A200000B /* Xserver-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Xserver-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		A200000C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A200000D /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
 		A200000E /* AVFAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFAudio.framework; path = System/Library/Frameworks/AVFAudio.framework; sourceTree = SDKROOT; };
@@ -66,7 +66,7 @@
 			);
 			sourceTree = "<group>";
 		};
-		A4000002 /* Xerver-iOS */ = {
+		A4000002 /* Xserver-iOS */ = {
 			isa = PBXGroup;
 			children = (
 				A2000001,
@@ -74,7 +74,7 @@
 				A200000A,
 				A200000C,
 			);
-			path = "Xerver-iOS";
+			path = "Xserver-iOS";
 			sourceTree = "<group>";
 		};
 		A4000003 /* Frameworks */ = {
@@ -96,7 +96,7 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		A5000001 /* Xerver-iOS */ = {
+		A5000001 /* Xserver-iOS */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = A6000003;
 			buildPhases = (
@@ -109,8 +109,8 @@
 			);
 			dependencies = (
 			);
-			name = "Xerver-iOS";
-			productName = "Xerver-iOS";
+			name = "Xserver-iOS";
+			productName = "Xserver-iOS";
 			productReference = A200000B;
 			productType = "com.apple.product-type.application";
 		};
@@ -214,7 +214,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = 7ZKWW636GM;
-				INFOPLIST_FILE = "Xerver-iOS/Info.plist";
+				INFOPLIST_FILE = "Xserver-iOS/Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -225,9 +225,9 @@
 				OTHER_LDFLAGS = (
 					"-lresolv",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.pslx.Xerver-iOS";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.pslx.Xserver-iOS";
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SWIFT_BRIDGING_HEADER = "Xerver-iOS/Xerver-iOS-Bridging-Header.h";
+				SWIFT_BRIDGING_HEADER = "Xserver-iOS/Xserver-iOS-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};

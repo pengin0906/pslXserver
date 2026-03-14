@@ -25,7 +25,7 @@ pub extern "C" fn pslx_start(display_num: u32, tcp_port: u16) {
         .target(env_logger::Target::Stderr)
         .init();
 
-    info!("Xerver (iOS) starting on display :{}", display_num);
+    info!("Xserver (iOS) starting on display :{}", display_num);
 
     let (screen_width, screen_height) = display::hidpi::get_screen_dimensions_pixels();
 

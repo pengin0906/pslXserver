@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start Xerver with PulseAudio TCP forwarding for remote browser audio
+# Start Xserver with PulseAudio TCP forwarding for remote browser audio
 #
 # Usage: ./scripts/start-with-audio.sh [--tcp]
 #
@@ -31,5 +31,5 @@ fi
 echo "PulseAudio TCP ready on port 4713"
 echo "Remote clients: export PULSE_SERVER=tcp:$(hostname -s).local:4713"
 
-# Start Xerver
-exec ./target/release/Xerver "$@"
+# Start Xserver
+exec ./target/release/Xserver "$@"

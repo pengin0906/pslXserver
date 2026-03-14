@@ -184,7 +184,7 @@ thread_local! {
     static LAST_KEY_WINDOW_X11: std::cell::Cell<crate::display::Xid> = const { std::cell::Cell::new(0) };
     /// X11 window id of the window the mouse cursor is currently inside.
     /// Used for proactive FocusIn on EnterNotify — sent every frame even when
-    /// Xerver is not the active macOS app.
+    /// Xserver is not the active macOS app.
     static LAST_ENTER_WINDOW_X11: std::cell::Cell<crate::display::Xid> = const { std::cell::Cell::new(0) };
     /// Frames remaining to suppress button polling after app activation.
     /// activateIgnoringOtherApps:YES causes macOS to synthesize button events;
@@ -433,7 +433,7 @@ fn get_input_view_class() -> &'static AnyClass {
             class_addMethod(raw_cls, objc2::sel!(updateTrackingAreas),
                 update_tracking_areas as *const std::ffi::c_void, c"v@:".as_ptr() as _);
             // mouseEntered: — called by NSTrackingArea (NSTrackingActiveAlways) even
-            // when Xerver is backgrounded; activates window without spurious clicks.
+            // when Xserver is backgrounded; activates window without spurious clicks.
             class_addMethod(raw_cls, objc2::sel!(mouseEntered:),
                 mouse_entered as *const std::ffi::c_void, c"v@:@".as_ptr() as _);
 
@@ -455,14 +455,14 @@ unsafe extern "C" fn accepts_first_responder(_this: *mut AnyObject, _sel: Sel) -
 
 /// acceptsFirstMouse: — return YES so the first click on an inactive window is delivered
 /// to this view (not consumed by macOS just to activate the app).
-/// Without this, clicking xterm content only activates Xerver but the click itself
+/// Without this, clicking xterm content only activates Xserver but the click itself
 /// is swallowed by macOS → our mouseDown handler is never called → no ButtonPress/FocusIn.
 unsafe extern "C" fn accepts_first_mouse(_this: *mut AnyObject, _sel: Sel, _event: *mut AnyObject) -> Bool {
     Bool::YES
 }
 
 /// updateTrackingAreas — replace the NSTrackingArea each time the view is resized.
-/// NSTrackingActiveAlways: tracking fires even when Xerver is NOT the active app.
+/// NSTrackingActiveAlways: tracking fires even when Xserver is NOT the active app.
 /// NSTrackingMouseEnteredAndExited (0x01) + NSTrackingActiveAlways (0x80) + NSTrackingInVisibleRect (0x200)
 unsafe extern "C" fn update_tracking_areas(this: *mut AnyObject, _sel: Sel) {
     // Remove all existing tracking areas
@@ -488,8 +488,8 @@ unsafe extern "C" fn update_tracking_areas(this: *mut AnyObject, _sel: Sel) {
 }
 
 /// mouseEntered: — NSTrackingArea callback (NSTrackingActiveAlways).
-/// When Xerver IS active: handle normal focus-follows-mouse between X11 windows.
-/// When Xerver is NOT active: do NOT call activate_app and do NOT set
+/// When Xserver IS active: handle normal focus-follows-mouse between X11 windows.
+/// When Xserver is NOT active: do NOT call activate_app and do NOT set
 /// LAST_ENTER_WINDOW_X11 — let the NSEvent global monitor handle activation.
 /// Reason: activateIgnoringOtherApps is ignored by Sequoia from NSTrackingArea context,
 /// and setting LAST_ENTER_WINDOW_X11 here would prevent the global monitor from firing.
@@ -512,7 +512,7 @@ unsafe extern "C" fn mouse_entered(this: *mut AnyObject, _sel: Sel, _event: *mut
     let is_active: bool = msg_send![&*app, isActive];
 
     if is_active {
-        // Normal case: Xerver already has focus, user moved to a different X11 window.
+        // Normal case: Xserver already has focus, user moved to a different X11 window.
         LAST_ENTER_WINDOW_X11.with(|le| le.set(x11_id));
         info!("mouseEntered (active) → FocusIn x11=0x{:08x}", x11_id);
         send_display_event(DisplayEvent::FocusIn { window: x11_id });
@@ -1338,8 +1338,8 @@ fn check_window_resizes() {
     }
 }
 
-/// Activate Xerver so PSLXInputView receives keyDown: events.
-/// Activate Xerver and bring the given window to front.
+/// Activate Xserver so PSLXInputView receives keyDown: events.
+/// Activate Xserver and bring the given window to front.
 /// MUST be called from a real user-event handler (mouseEntered:, mouseDown:, etc.)
 /// macOS Sequoia ignores activation calls from timer/background contexts.
 /// CGEventTap callback — fires on main thread for every mouse event at WindowServer level.
@@ -1414,7 +1414,7 @@ unsafe extern "C" fn cg_mouse_tap_callback(
     event // passive listener: return event unchanged
 }
 
-/// Activate Xerver and bring the given NSWindow to key.
+/// Activate Xserver and bring the given NSWindow to key.
 /// Must be called from a user-event context (CGEventTap or NSEvent global monitor handler).
 /// activateIgnoringOtherApps:YES is deprecated but still respected by Sequoia in user-event context.
 unsafe fn activate_app(ns_window: *mut AnyObject) {
@@ -1431,7 +1431,7 @@ unsafe fn activate_app(ns_window: *mut AnyObject) {
 
 /// Poll mouse position each frame; implement X11 focus-follows-pointer in macOS terms.
 /// When cursor enters one of our windows:
-///   1. Make the NSWindow key + activate Xerver (macOS side: delivers KeyPress to PSLXInputView)
+///   1. Make the NSWindow key + activate Xserver (macOS side: delivers KeyPress to PSLXInputView)
 ///   2. Send X11 FocusIn to the X11 client (X11 side: xterm sets ICFocus and accepts keyboard)
 /// This harmonizes X11's focus-follows-mouse with macOS's click-to-focus model.
 fn check_enter_notify() {
@@ -1793,7 +1793,7 @@ fn process_commands() {
 
     // 1.8. Send FocusIn when mouse enters one of our windows (proactive EnterNotify).
     // Runs every frame so xterm gets FocusIn as soon as cursor enters, without
-    // needing to click or drag — works even when Xerver is not the active app.
+    // needing to click or drag — works even when Xserver is not the active app.
     check_enter_notify();
 
     // 2. Drain render mailbox + render — targeted get_mut per window (avoids iter_mut's 16-shard scan)
@@ -2400,7 +2400,7 @@ pub fn run_cocoa_app(
     unsafe {
         use block2::RcBlock;
         let handler = RcBlock::new(move |_event: *mut AnyObject| {
-            // Only fire when Xerver is NOT the active app.
+            // Only fire when Xserver is NOT the active app.
             let mtm = MainThreadMarker::new().unwrap();
             let app = NSApplication::sharedApplication(mtm);
             let is_active: bool = msg_send![&*app, isActive];

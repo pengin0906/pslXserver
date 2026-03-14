@@ -438,7 +438,7 @@ where
 /// Build the X11 connection setup success reply.
 fn build_setup_reply(server: &XServer, conn: &ClientConnection) -> Vec<u8> {
     let screen = &server.screens[0];
-    let vendor = b"Xerver";
+    let vendor = b"Xserver";
     let vendor_pad = (4 - (vendor.len() % 4)) % 4;
 
     // Build the reply buffer
@@ -3425,7 +3425,7 @@ async fn handle_open_font<S: AsyncRead + AsyncWrite + Unpin>(
     };
     info!("OpenFont: 0x{:08X} '{}' is_2byte={}", fid, name, name.contains("iso10646"));
 
-    // Xerver uses CoreText for all rendering, so any font can display CJK.
+    // Xserver uses CoreText for all rendering, so any font can display CJK.
     // Only treat as 1-byte if XLFD explicitly specifies a 1-byte charset.
     let is_2byte = !name.contains("iso8859") && !name.contains("jisx0201");
     let (ascent, descent, char_width) = parse_xlfd_metrics(&name);

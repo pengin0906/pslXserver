@@ -761,10 +761,10 @@ fn handle_set_client_name(reader: &mut TagReader, tag: u32) -> Vec<u8> {
 
 fn handle_get_server_info(tag: u32) -> Vec<u8> {
     let mut w = TagWriter::new();
-    w.put_string("Xerver");         // server name (package name)
+    w.put_string("Xserver");         // server name (package name)
     w.put_string("0.1.0");              // server version
     w.put_string("penguin");            // user name
-    w.put_string("Xerver");         // hostname
+    w.put_string("Xserver");         // hostname
     w.put_sample_spec(PA_SAMPLE_S16LE, 2, 48000); // default sample spec
     w.put_string("pslx_sink");          // default sink name
     w.put_string("pslx_monitor");       // default source name
@@ -778,7 +778,7 @@ fn handle_get_sink_info_list(tag: u32) -> Vec<u8> {
     // One sink entry
     w.put_u32(0);                       // index
     w.put_string("pslx_sink");          // name
-    w.put_string("Xerver Audio Output"); // description
+    w.put_string("Xserver Audio Output"); // description
     w.put_sample_spec(PA_SAMPLE_S16LE, 2, 48000);
     w.put_channel_map(2);
     w.put_u32(0);                       // owner module index

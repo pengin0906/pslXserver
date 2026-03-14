@@ -1,5 +1,5 @@
 [package]
-name = "Xerver"
+name = "Xserver"
 version = "0.1.0"
 edition = "2021"
 description = "Native macOS X11 Server in Rust — XQuartz alternative with proper IME support"

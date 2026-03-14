@@ -1,4 +1,4 @@
-# Xerver iOS ビルド手順
+# Xserver iOS ビルド手順
 
 ## 前提条件
 
@@ -16,7 +16,7 @@
 ### 方法1: Xcodeから（推奨）
 
 ```bash
-open ios-app/Xerver-iOS.xcodeproj
+open ios-app/Xserver-iOS.xcodeproj
 ```
 
 - Xcodeが開いたらTeamを設定（Signing & Capabilities）
@@ -31,8 +31,8 @@ open ios-app/Xerver-iOS.xcodeproj
 
 # 2. Xcodeプロジェクトをビルド
 cd ios-app
-xcodebuild -project Xerver-iOS.xcodeproj \
-  -scheme Xerver-iOS \
+xcodebuild -project Xserver-iOS.xcodeproj \
+  -scheme Xserver-iOS \
   -configuration Release \
   -destination 'generic/platform=iOS' \
   CODE_SIGN_IDENTITY=- \
@@ -42,7 +42,7 @@ xcodebuild -project Xerver-iOS.xcodeproj \
 ## アーキテクチャ
 
 ```
-Mac (Xerver macOS版)     iPhone/iPad (Xerver iOS版)
+Mac (Xserver macOS版)     iPhone/iPad (Xserver iOS版)
 ┌──────────────────────┐    ┌──────────────────────────────┐
 │ server/              │    │ server/                      │
 │  connection.rs       │    │  connection.rs               │
@@ -62,7 +62,7 @@ Mac (Xerver macOS版)     iPhone/iPad (Xerver iOS版)
 
 ## 使い方
 
-iPhone上でXerverが起動すると、TCP ポート6000でX11接続を待ち受ける。
+iPhone上でXserverが起動すると、TCP ポート6000でX11接続を待ち受ける。
 
 同じWiFi上のLinuxマシンから：
 ```bash

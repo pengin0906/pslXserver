@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "Xerver"
+name = "Xserver"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
