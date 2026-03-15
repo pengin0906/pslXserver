@@ -2592,16 +2592,21 @@ thread_local! {
     static PENDING_SCENE_MAP: RefCell<Vec<(u64, *mut AnyObject)>> = RefCell::new(Vec::new());
 }
 
-/// Push IOSurface to CALayer — zero-copy (same as macOS).
-/// setContents: with IOSurface works on iOS (CALayer accepts it directly).
+/// Notify CALayer that IOSurface contents changed.
+/// setContents: is only needed on first call to bind the IOSurface pointer;
+/// subsequent calls use setContentsChanged (avoids expensive IOSurface XPC metadata sync).
 fn flush_window_to_layer(layer: *mut AnyObject, surface: *mut c_void) {
     if surface.is_null() || layer.is_null() { return; }
     unsafe {
         let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
         let _: () = msg_send![ca_cls, begin];
         let _: () = msg_send![ca_cls, setDisableActions: true];
+        // Check if layer already has this surface — skip setContents: if so
+        let current: *mut AnyObject = msg_send![layer, contents];
+        if current != surface as *mut AnyObject {
+            let _: () = msg_send![layer, setContents: surface as *mut AnyObject];
+        }
         let _: () = msg_send![layer, setContentsChanged];
-        let _: () = msg_send![layer, setContents: surface as *mut AnyObject];
         let _: () = msg_send![ca_cls, commit];
     }
 }
@@ -2771,34 +2776,6 @@ extern "C" fn timer_callback(_timer: *mut c_void, _info: *mut c_void) {
         ios_log("timer_callback: first tick");
     }
 
-    // First-responder promotion is handled by pending_show in drain_render_mailbox.
-    // The periodic timer check was removed because MAIN_VIEW can become a dangling
-    // pointer after window destruction, causing SIGSEGV in UIKit's superview chain.
-    if false {
-        MAIN_VIEW.with(|mv| {
-            if let Some(view) = *mv.borrow() {
-                unsafe {
-                    let is_fr: Bool = objc2::msg_send![&*view, isFirstResponder];
-                    let app: *mut AnyObject = objc2::msg_send![objc2::class!(UIApplication), sharedApplication];
-                    let key_win: *mut AnyObject = if !app.is_null() {
-                        objc2::msg_send![app, keyWindow]
-                    } else { std::ptr::null_mut() };
-                    let win: *mut AnyObject = objc2::msg_send![&*view, window];
-                    let is_key: bool = !key_win.is_null() && !win.is_null() && key_win == win;
-                    ios_log(&format!("timer check: isFirstResponder={} isKeyWindow={} view={:p} win={:p} keyWin={:p}",
-                        is_fr.as_bool(), is_key, view, win, key_win));
-                    if !is_fr.as_bool() {
-                        let sv: *mut AnyObject = objc2::msg_send![&*view, superview];
-                        if !sv.is_null() && !win.is_null() {
-                            ios_log("timer: re-acquiring first responder");
-                            become_first_responder_deferred(view);
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     process_commands();
 
     // Check if AudioQueue needs initialization (triggered by PA server)
@@ -2842,8 +2819,9 @@ fn process_commands() {
     // 2. Drain render mailbox + render
     drain_render_mailbox();
 
-    // Force immediate compositing after rendering
-    ca_transaction_flush();
+    // Only flush CA when something was actually rendered (avoid idle overhead)
+    // drain_render_mailbox calls flush_window_to_layer which starts a CATransaction;
+    // ca_transaction_flush is cheap (~no-op) when no transaction was opened.
 }
 
 /// Drain pending render commands from the mailbox and render to IOSurface.
