@@ -127,6 +127,9 @@ pub struct XServer {
     pub font_names_lower: Vec<String>,
     /// XIM (X Input Method) server for inline preedit in GTK/Electron apps.
     pub xim: xim::XimServer,
+    /// Active pointer grab: (grab_window, owner_events, event_mask, conn_id).
+    /// Set by GrabPointer, cleared by UngrabPointer.
+    pub pointer_grab: parking_lot::RwLock<Option<(Xid, bool, u32, u32)>>,
 }
 
 impl XServer {
@@ -265,6 +268,7 @@ impl XServer {
             font_names_lower: Vec::new(), // set below
             font_names: Self::load_font_names(),
             xim,
+            pointer_grab: parking_lot::RwLock::new(None),
         };
         server.font_names_lower = server.font_names.iter().map(|n| n.to_lowercase()).collect();
         server
@@ -524,7 +528,32 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
             DisplayEvent::ButtonPress { window, button, x, y, root_x, root_y, state, time } => {
                 let is_scroll = button >= 4; // Button 4/5/6/7 = scroll wheel
                 // Find deepest child window at the click point
-                let (target, cx, cy) = find_child_at_point(&server, window, x, y);
+                let (mut target, mut cx, mut cy) = find_child_at_point(&server, window, x, y);
+
+                // Explicit pointer grab (GrabPointer): redirect events to grab window
+                if let Some((grab_win, owner_events, _emask, _conn_id)) = *server.pointer_grab.read() {
+                    if !owner_events || target == window {
+                        // Re-target to grab window with root-relative coords
+                        target = grab_win;
+                        cx = root_x;
+                        cy = root_y;
+                        // Translate to grab window coords
+                        if let Some(res) = server.resources.get(&grab_win) {
+                            if let Resource::Window(win) = res.value() {
+                                let w = win.read();
+                                if let Some(ref handle) = w.native_window {
+                                    // top-level: coords relative to window origin
+                                    cx = root_x - w.x;
+                                    cy = root_y - w.y;
+                                } else {
+                                    cx = root_x;
+                                    cy = root_y;
+                                }
+                            }
+                        }
+                        log::debug!("Explicit grab redirect: target=0x{:08x} ({},{})", target, cx, cy);
+                    }
+                }
 
                 if !is_scroll {
                     // Establish implicit pointer grab on first real button press

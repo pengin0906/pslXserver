@@ -4218,15 +4218,27 @@ fn x11_font_pattern_match(pattern: &str, text: &str) -> bool {
 // --- Pointer, Selection, and Input handlers ---
 
 async fn handle_grab_pointer<S: AsyncRead + AsyncWrite + Unpin>(
-    _server: &Arc<XServer>,
+    server: &Arc<XServer>,
     conn: &Arc<ClientConnection>,
-    _data: &[u8],
+    data: &[u8],
     stream: &mut S,
 ) -> Result<(), ServerError> {
-    // GrabPointer reply: status = Success (0)
+    // GrabPointer: [1]=owner_events, [4-7]=grab_window, [8-9]=event_mask
+    let owner_events = data[1] != 0;
+    let grab_window = if data.len() >= 8 { read_u32(conn, &data[4..8]) } else { 0 };
+    let event_mask = if data.len() >= 10 {
+        u16::from_le_bytes([data[8], data[9]]) as u32
+    } else { 0 };
+
+    log::info!("GrabPointer: window=0x{:08x} owner_events={} event_mask=0x{:04x} conn={}",
+        grab_window, owner_events, event_mask, conn.id);
+
+    *server.pointer_grab.write() = Some((grab_window, owner_events, event_mask, conn.id));
+
+    // Reply: status = Success (0)
     let seq = conn.current_request_sequence();
     let mut reply = Vec::with_capacity(32);
-    reply.push(1); // reply
+    reply.push(1);
     reply.push(0); // status: Success
     write_u16_to(conn, &mut reply, seq);
     write_u32_to(conn, &mut reply, 0);
@@ -4236,11 +4248,13 @@ async fn handle_grab_pointer<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 async fn handle_ungrab_pointer<S: AsyncRead + AsyncWrite + Unpin>(
-    _server: &Arc<XServer>,
-    _conn: &Arc<ClientConnection>,
+    server: &Arc<XServer>,
+    conn: &Arc<ClientConnection>,
     _data: &[u8],
     _stream: &mut S,
 ) -> Result<(), ServerError> {
+    log::info!("UngrabPointer: conn={}", conn.id);
+    *server.pointer_grab.write() = None;
     Ok(())
 }
 
