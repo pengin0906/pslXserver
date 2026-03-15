@@ -39,7 +39,8 @@ echo "[4/5] Chrome起動: $URL"
 ssh "$REMOTE" "DISPLAY=${MAC_IP}:0 /opt/google/chrome/chrome \
     --no-sandbox --disable-gpu --disable-dev-shm-usage \
     --no-first-run --user-data-dir=/tmp/chrome-pslx \
-    --ozone-platform=x11 '$URL' &disown" 2>/dev/null &
+    --ozone-platform=x11 --force-device-scale-factor=1.5 \
+    --start-maximized '$URL' &disown" 2>/dev/null &
 sleep 5
 
 # 5. 音声ストリーム（9955wx → MacBookスピーカー）

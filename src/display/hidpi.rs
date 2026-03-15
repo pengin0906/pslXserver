@@ -34,8 +34,19 @@ pub fn detect_scale_factor() -> f64 {
 
     #[cfg(target_os = "ios")]
     {
-        // iOS Retina displays are typically 2x or 3x
-        2.0
+        // Query UIScreen.mainScreen.scale for actual device scale factor
+        unsafe {
+            use objc2::msg_send;
+            let screen: *mut objc2::runtime::AnyObject =
+                msg_send![objc2::class!(UIScreen), mainScreen];
+            if !screen.is_null() {
+                let scale: f64 = msg_send![screen, scale];
+                if scale > 0.0 {
+                    return scale;
+                }
+            }
+        }
+        2.0 // fallback
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -65,8 +76,8 @@ pub fn get_screen_dimensions_pixels() -> (u16, u16) {
 
     #[cfg(target_os = "ios")]
     {
-        // Query UIScreen.mainScreen.bounds for actual device dimensions.
-        // UIScreen is available even before UIApplicationMain.
+        // Query UIScreen.mainScreen.bounds × scale for actual pixel dimensions.
+        // HiDPI: X11 screen dimensions are in physical pixels (like macOS).
         use objc2::msg_send;
         use objc2::encode::{Encode, Encoding};
 
@@ -85,19 +96,17 @@ pub fn get_screen_dimensions_pixels() -> (u16, u16) {
                 msg_send![objc2::class!(UIScreen), mainScreen];
             if !screen.is_null() {
                 let bounds: CGRect = msg_send![screen, bounds];
-                // Use points (not physical pixels) as X11 screen dimensions.
-                // Since we set contentsScale=1.0 on CALayer, 1 X11 pixel = 1 UIKit point.
-                // This makes xterm create a window sized in points, which displays at
-                // the correct visual size on screen without any scaling mismatch.
-                let w = bounds.size[0] as u16;
-                let h = bounds.size[1] as u16;
+                let scale = detect_scale_factor();
+                // Multiply by scale factor for HiDPI pixel dimensions (like macOS)
+                let w = (bounds.size[0] * scale) as u16;
+                let h = (bounds.size[1] * scale) as u16;
                 if w > 0 && h > 0 {
                     return (w, h);
                 }
             }
         }
-        // Fallback: iPad Pro 13" dimensions in points
-        (1366, 1024)
+        // Fallback: iPad Pro 13" dimensions in pixels (2x)
+        (2732, 2048)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
