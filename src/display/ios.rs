@@ -477,15 +477,7 @@ unsafe extern "C" fn become_first_responder(this: *mut AnyObject, _sel: Sel) -> 
     FOCUSED_VIEW.store(this as usize, std::sync::atomic::Ordering::Relaxed);
     let x11_id = view_x11_id(this);
     ios_log(&format!("becomeFirstResponder: view={:p} x11=0x{:08x}", this, x11_id));
-    // UIKit crashes if the view is not fully attached to a window hierarchy.
-    // Check superview/window before calling super becomeFirstResponder.
-    let superview: *mut AnyObject = msg_send![this, superview];
-    let window: *mut AnyObject = msg_send![this, window];
-    if superview.is_null() || window.is_null() {
-        ios_log("becomeFirstResponder: skipping super call (detached view)");
-        return Bool::YES;
-    }
-    // Call super implementation
+    // Call super implementation — must reach UIKit so the software keyboard appears.
     let superclass = objc2::class!(UIView);
     objc2::msg_send![super(this, superclass), becomeFirstResponder]
 }
