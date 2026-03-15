@@ -2273,16 +2273,37 @@ fn drain_render_mailbox() {
 
                         flush_window(info);
 
-                        // Deferred show: make window visible after the first render
-                        // so the initial content is already drawn.
+                        // Deferred show: make window visible once real content arrives.
+                        // Check if any command has non-white content (Chrome sends
+                        // all-white PutImage as its first frame).
                         if info.pending_show {
-                            info.pending_show = false;
-                            info!("pending_show: showing window {} x11=0x{:08X} after first render", win_id, info.x11_id);
-                            let mtm = MainThreadMarker::new().unwrap();
-                            let app = NSApplication::sharedApplication(mtm);
-                            unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
-                            info.window.makeKeyAndOrderFront(None);
-                            flush_window(info);
+                            let has_real_content = commands.iter().any(|c| match c {
+                                crate::display::RenderCommand::DrawText { .. } => true,
+                                crate::display::RenderCommand::DrawLine { .. } => true,
+                                crate::display::RenderCommand::DrawRectangle { .. } => true,
+                                crate::display::RenderCommand::FillArc { .. } => true,
+                                crate::display::RenderCommand::DrawArc { .. } => true,
+                                crate::display::RenderCommand::FillPolygon { .. } => true,
+                                crate::display::RenderCommand::PutImage { data, .. } => {
+                                    // Sample pixels — if any is non-white, it's real content
+                                    data.chunks(4).step_by(64).any(|px| {
+                                        px.len() == 4 && (px[0] != 0xFF || px[1] != 0xFF || px[2] != 0xFF)
+                                    })
+                                }
+                                crate::display::RenderCommand::FillRectangle { color, .. } => {
+                                    *color != 0xFFFFFFFF && *color != 0x00FFFFFF
+                                }
+                                _ => false,
+                            });
+                            if has_real_content {
+                                info.pending_show = false;
+                                info!("pending_show: showing window {} x11=0x{:08X}", win_id, info.x11_id);
+                                let mtm = MainThreadMarker::new().unwrap();
+                                let app = NSApplication::sharedApplication(mtm);
+                                unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
+                                info.window.makeKeyAndOrderFront(None);
+                                flush_window(info);
+                            }
                         }
                     }
                 }
