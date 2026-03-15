@@ -142,6 +142,10 @@ struct WindowInfo {
     /// X11 background pixel color (BGRA). Used to fill new areas during resize
     /// instead of white, matching XQuartz's behavior of preserving content with gravity.
     background_pixel: u32,
+    /// Deferred show: window stays hidden until first render completes.
+    /// ShowWindow sets this to true, drain_render_mailbox shows the window
+    /// after rendering so the initial content is visible immediately.
+    pending_show: bool,
     /// Whether this window is visible on screen (vs hidden render-only buffer).
     visible: bool,
 }
@@ -960,18 +964,17 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
         info.height = new_h;
 
         if need_new_surface {
-            // Flush any pending render commands to old surface BEFORE replacing it.
-            // This ensures the old surface has the latest app content before copy.
+            // Flush any pending render commands to display_surface BEFORE replacing it.
             let win_id_u64 = *win_id;
             RENDER_MAILBOX.with(|mb| {
                 let mb = mb.borrow();
                 if let Some(ref mailbox) = *mb {
                     if let Some((_k, commands)) = mailbox.remove(&win_id_u64) {
                         if !commands.is_empty() {
-                            let lock_result = IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
+                            let lock_result = IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
                             if lock_result == 0 {
-                                let base = IOSurfaceGetBaseAddress(info.surface);
-                                let stride = IOSurfaceGetBytesPerRow(info.surface);
+                                let base = IOSurfaceGetBaseAddress(info.display_surface);
+                                let stride = IOSurfaceGetBytesPerRow(info.display_surface);
                                 let buf_len = stride * old_h as usize;
                                 let buffer = std::slice::from_raw_parts_mut(
                                     base as *mut u8, buf_len);
@@ -981,7 +984,7 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
                                 for c in &commands {
                                     render_to_buffer(buffer, w, h, s, c);
                                 }
-                                IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
+                                IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut());
                             }
                         }
                     }
@@ -1038,9 +1041,9 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
                 ((bg >> 16) & 0xFF) as u8,
                 0xFF,
             ];
-            IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
-            let base = IOSurfaceGetBaseAddress(info.surface) as *mut u8;
-            let stride = IOSurfaceGetBytesPerRow(info.surface);
+            IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
+            let base = IOSurfaceGetBaseAddress(info.display_surface) as *mut u8;
+            let stride = IOSurfaceGetBytesPerRow(info.display_surface);
             for row in 0..(new_h as usize) {
                 let row_base = base.add(row * stride);
                 for col in 0..(new_w as usize) {
@@ -1048,11 +1051,10 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
                     std::ptr::copy_nonoverlapping(bg_bytes.as_ptr(), row_base.add(off), 4);
                 }
             }
-            IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
+            IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut());
         }
 
-        // Swap + flush: cleared surface becomes display surface for immediate visual update.
-        std::mem::swap(&mut info.surface, &mut info.display_surface);
+        // Single-buffer: just flush display_surface (no swap needed).
         flush_window(info);
         ca_transaction_flush();
 
@@ -1293,8 +1295,7 @@ fn check_window_resizes() {
                         CFRelease(old_display as *const c_void);
                     }
 
-                    // Swap + flush so resize is visible immediately
-                    std::mem::swap(&mut info.surface, &mut info.display_surface);
+                    // Single-buffer: just flush display_surface
                     flush_window(info);
                     ca_transaction_flush();
 
@@ -1550,6 +1551,11 @@ fn process_commands() {
         rx.borrow().as_ref().map_or_else(Vec::new, |rx| rx.try_iter().collect())
     });
     for cmd in cmds {
+        // Drain render mailbox BEFORE each command so that rendering
+        // happens in the correct order relative to ShowWindow etc.
+        // Without this, ShowWindow displays a black/white surface because
+        // the render commands that preceded it haven't been processed yet.
+        drain_render_mailbox();
         handle_command(cmd);
     }
 
@@ -1776,86 +1782,8 @@ fn process_commands() {
     // needing to click or drag — works even when Xserver is not the active app.
     check_enter_notify();
 
-    // 2. Drain render mailbox + render — targeted get_mut per window (avoids iter_mut's 16-shard scan)
-    RENDER_MAILBOX.with(|mb| {
-        let mb = mb.borrow();
-        if let Some(ref mailbox) = *mb {
-            // Note: do NOT call mailbox.is_empty() — it locks all 16 DashMap shards,
-            // causing heavy contention with the protocol thread's write lock.
-            // Instead, just iterate known window IDs and check each shard individually.
-            WINDOWS.with(|w| {
-                let mut ws = w.borrow_mut();
-                let win_ids: Vec<u64> = ws.keys().copied().collect();
-                for win_id in win_ids {
-                    // get_mut locks only 1 shard (not all 16)
-                    let commands = if let Some(mut entry) = mailbox.get_mut(&win_id) {
-                        if entry.is_empty() { continue; }
-                        std::mem::take(entry.value_mut())
-                    } else {
-                        continue;
-                    };
-                    // entry guard dropped here — shard unlocked before rendering
-
-                    if let Some(info) = ws.get_mut(&win_id) {
-                        let width = info.width as u32;
-                        let height = info.height as u32;
-
-                        // Drop redundant full-window PutImage frames — keep only the last one.
-                        let commands = coalesce_putimage(commands, width, height);
-
-                        // Skip expensive display→render surface copy when first command covers all.
-                        let first_covers_all = matches!(commands.first(),
-                            Some(crate::display::RenderCommand::PutImage { x, y, width: w, height: h, .. })
-                            if *x == 0 && *y == 0 && *w as u32 >= width && *h as u32 >= height
-                        );
-
-                        unsafe {
-                            IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
-                            if !first_covers_all {
-                                IOSurfaceLock(info.display_surface, 1, std::ptr::null_mut());
-                                let src = IOSurfaceGetBaseAddress(info.display_surface) as *const u8;
-                                let dst = IOSurfaceGetBaseAddress(info.surface) as *mut u8;
-                                let src_stride = IOSurfaceGetBytesPerRow(info.display_surface);
-                                let dst_stride = IOSurfaceGetBytesPerRow(info.surface);
-                                let h = info.height as usize;
-                                if src_stride == dst_stride {
-                                    std::ptr::copy_nonoverlapping(src, dst, src_stride * h);
-                                } else {
-                                    let row_bytes = (info.width as usize) * 4;
-                                    for row in 0..h {
-                                        std::ptr::copy_nonoverlapping(
-                                            src.add(row * src_stride),
-                                            dst.add(row * dst_stride),
-                                            row_bytes,
-                                        );
-                                    }
-                                }
-                                IOSurfaceUnlock(info.display_surface, 1, std::ptr::null_mut());
-                            }
-                        }
-
-                        let base = unsafe { IOSurfaceGetBaseAddress(info.surface) };
-                        let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.surface) };
-                        let buf_len = bytes_per_row * info.height as usize;
-                        let buffer = unsafe {
-                            std::slice::from_raw_parts_mut(base as *mut u8, buf_len)
-                        };
-                        let stride = bytes_per_row as u32;
-
-                        for c in &commands {
-                            render_to_buffer(buffer, width, height, stride, c);
-                        }
-
-                        unsafe { IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut()); }
-
-                        std::mem::swap(&mut info.surface, &mut info.display_surface);
-                        flush_window(info);
-
-                    }
-                }
-            });
-        }
-    });
+    // 2. Drain render mailbox + render
+    drain_render_mailbox();
 
     // Force immediate compositing after rendering (if any windows were drawn)
     // ca_transaction_flush is cheap when no CATransaction was started
@@ -1935,9 +1863,10 @@ fn handle_command(cmd: DisplayCommand) {
                 return;
             }
 
-            // Fill both IOSurfaces with opaque black (0xFF000000 BGRA).
-            // Without this, the IOSurface is transparent and the NSWindow's white background
-            // shows through until the client draws, causing a visible white flash on startup.
+            // Fill both IOSurfaces with opaque white (0xFFFFFFFF BGRA).
+            // X11 windows default to white background. Apps like xcalc draw
+            // on top of this without explicit ClearArea, so the initial color matters.
+            // Chromium's white flash is handled by pending_show (deferred display).
             unsafe {
                 for s in [surface, display_surface] {
                     IOSurfaceLock(s, 0, std::ptr::null_mut());
@@ -1948,7 +1877,7 @@ fn handle_command(cmd: DisplayCommand) {
                     for row in 0..h {
                         let row_ptr = base.add(row * stride) as *mut u32;
                         for col in 0..w {
-                            *row_ptr.add(col) = 0xFF000000; // opaque black (BGRA)
+                            *row_ptr.add(col) = 0xFFFFFFFF; // opaque white (BGRA)
                         }
                     }
                     IOSurfaceUnlock(s, 0, std::ptr::null_mut());
@@ -2007,7 +1936,7 @@ fn handle_command(cmd: DisplayCommand) {
             }
 
             WINDOWS.with(|w| {
-                w.borrow_mut().insert(id, WindowInfo { window, surface, display_surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF, visible: false });
+                w.borrow_mut().insert(id, WindowInfo { window, surface, display_surface, width, height, x11_id, x11_x, x11_y, cursor_type: 0, background_pixel: 0xFFFFFFFF, visible: false, pending_show: false });
             });
 
             info!("Created window {} for X11 0x{:08X} ({}x{}) [IOSurface]", id, x11_id, width, height);
@@ -2019,15 +1948,20 @@ fn handle_command(cmd: DisplayCommand) {
                 if let Some(info) = w.borrow_mut().get_mut(&handle.id) {
                     info.visible = visible;
                     if visible {
-                        info!("ShowWindow: id={} x11=0x{:08X} - makeKeyAndOrderFront", handle.id, info.x11_id);
-                        let mtm = MainThreadMarker::new().unwrap();
-                        let app = NSApplication::sharedApplication(mtm);
-                        unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
-                        info.window.makeKeyAndOrderFront(None);
-                        // Update X11 focus to match macOS key window
+                        info!("ShowWindow: id={} x11=0x{:08X} - deferred (pending_show)", handle.id, info.x11_id);
+                        // Defer actual show until first render frame so the client's
+                        // initial drawing is already in the IOSurface before the window
+                        // becomes visible. This eliminates the black/white flash on startup.
+                        info.pending_show = true;
+                        // Send Expose so the client starts drawing.
                         let x11_id = info.x11_id;
+                        let w = info.width;
+                        let h = info.height;
                         send_display_event(DisplayEvent::FocusIn { window: x11_id });
-                        flush_window(info);
+                        send_display_event(DisplayEvent::Expose {
+                            window: x11_id, x: 0, y: 0,
+                            width: w as u16, height: h as u16, count: 0,
+                        });
                     } else {
                         info!("ShowWindow: id={} x11=0x{:08X} - hidden (render-only)", handle.id, info.x11_id);
                     }
@@ -2204,16 +2138,19 @@ fn handle_command(cmd: DisplayCommand) {
         }
 
         DisplayCommand::ReadPixels { handle, x, y, width, height, reply } => {
+            // Flush any pending render commands before reading
+            drain_render_mailbox();
             let result = WINDOWS.with(|w| {
                 let ws = w.borrow();
                 if let Some(info) = ws.get(&handle.id) {
                     unsafe {
-                        let lock_result = IOSurfaceLock(info.surface, 1, std::ptr::null_mut()); // 1=read-only
+                        // Single-buffer: read from display_surface (where we render)
+                        let lock_result = IOSurfaceLock(info.display_surface, 1, std::ptr::null_mut()); // 1=read-only
                         if lock_result != 0 {
                             return None;
                         }
-                        let base = IOSurfaceGetBaseAddress(info.surface) as *const u8;
-                        let stride = IOSurfaceGetBytesPerRow(info.surface);
+                        let base = IOSurfaceGetBaseAddress(info.display_surface) as *const u8;
+                        let stride = IOSurfaceGetBytesPerRow(info.display_surface);
                         let surf_h = info.height as usize;
                         let w = width as usize;
                         let h = height as usize;
@@ -2231,7 +2168,7 @@ fn handle_command(cmd: DisplayCommand) {
                                 copy_bytes,
                             );
                         }
-                        IOSurfaceUnlock(info.surface, 1, std::ptr::null_mut());
+                        IOSurfaceUnlock(info.display_surface, 1, std::ptr::null_mut());
                         Some(pixels)
                     }
                 } else {
@@ -2293,6 +2230,69 @@ fn get_ns_cursor(cursor_type: u8) -> *mut AnyObject {
 /// Inner flush: set display_surface as CALayer contents.
 /// Double-buffering ensures the pointer alternates each frame, forcing CALayer
 /// to re-read pixel data. No CGImage creation needed — zero color-space conversion overhead.
+/// Drain pending render commands from the mailbox and render to IOSurface.
+/// Called before each DisplayCommand to ensure rendering happens in the
+/// correct order relative to CreateWindow/ShowWindow.
+fn drain_render_mailbox() {
+    RENDER_MAILBOX.with(|mb| {
+        let mb = mb.borrow();
+        if let Some(ref mailbox) = *mb {
+            WINDOWS.with(|w| {
+                let mut ws = w.borrow_mut();
+                let win_ids: Vec<u64> = ws.keys().copied().collect();
+                for win_id in win_ids {
+                    let commands = if let Some(mut entry) = mailbox.get_mut(&win_id) {
+                        if entry.is_empty() { continue; }
+                        std::mem::take(entry.value_mut())
+                    } else {
+                        continue;
+                    };
+
+                    if let Some(info) = ws.get_mut(&win_id) {
+                        let width = info.width as u32;
+                        let height = info.height as u32;
+                        let commands = coalesce_putimage(commands, width, height);
+
+                        unsafe {
+                            IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
+                        }
+
+                        let base = unsafe { IOSurfaceGetBaseAddress(info.display_surface) };
+                        let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.display_surface) };
+                        let buf_len = bytes_per_row * info.height as usize;
+                        let buffer = unsafe {
+                            std::slice::from_raw_parts_mut(base as *mut u8, buf_len)
+                        };
+                        let stride = bytes_per_row as u32;
+
+                        for c in &commands {
+                            render_to_buffer(buffer, width, height, stride, c);
+                        }
+
+                        unsafe { IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut()); }
+
+                        flush_window(info);
+
+                        // Deferred show: make window visible after the first render
+                        // so the initial content is already drawn.
+                        if info.pending_show {
+                            info.pending_show = false;
+                            info!("pending_show: showing window {} x11=0x{:08X} after first render", win_id, info.x11_id);
+                            let mtm = MainThreadMarker::new().unwrap();
+                            let app = NSApplication::sharedApplication(mtm);
+                            unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
+                            info.window.makeKeyAndOrderFront(None);
+                            flush_window(info);
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Notify CA that display_surface contents changed. Single-buffer: same
+/// IOSurface pointer, no swap. setContentsChanged tells CA to re-read.
 fn flush_window(info: &WindowInfo) {
     unsafe {
         if info.width == 0 || info.height == 0 || info.display_surface.is_null() { return; }
@@ -2302,10 +2302,37 @@ fn flush_window(info: &WindowInfo) {
                 let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
                 let _: () = msg_send![ca_cls, begin];
                 let _: () = msg_send![ca_cls, setDisableActions: true];
+                let _: () = msg_send![layer, setContentsChanged];
                 let _: () = msg_send![layer, setContents: info.display_surface as *mut AnyObject];
                 let _: () = msg_send![ca_cls, commit];
             }
         }
+    }
+}
+
+/// Copy render surface content to display surface so the next flush shows it.
+/// Call this after rendering to ensure the display surface has the latest content
+/// without requiring a second render+swap cycle.
+fn sync_surfaces(info: &mut WindowInfo) {
+    unsafe {
+        if info.surface.is_null() || info.display_surface.is_null() { return; }
+        IOSurfaceLock(info.surface, 1, std::ptr::null_mut()); // read-only
+        IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
+        let src = IOSurfaceGetBaseAddress(info.surface) as *const u8;
+        let dst = IOSurfaceGetBaseAddress(info.display_surface) as *mut u8;
+        let src_stride = IOSurfaceGetBytesPerRow(info.surface);
+        let dst_stride = IOSurfaceGetBytesPerRow(info.display_surface);
+        let h = info.height as usize;
+        if src_stride == dst_stride {
+            std::ptr::copy_nonoverlapping(src, dst, src_stride * h);
+        } else {
+            let row_bytes = (info.width as usize) * 4;
+            for row in 0..h {
+                std::ptr::copy_nonoverlapping(src.add(row * src_stride), dst.add(row * dst_stride), row_bytes);
+            }
+        }
+        IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut());
+        IOSurfaceUnlock(info.surface, 1, std::ptr::null_mut());
     }
 }
 

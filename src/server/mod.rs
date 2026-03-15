@@ -758,19 +758,28 @@ async fn dispatch_events(server: Arc<XServer>, evt_rx: Receiver<DisplayEvent>) {
             }
             DisplayEvent::Expose { window, x, y, width, height, count } => {
                 send_expose_event(&server, window, x, y, width, height, count);
-                // Also propagate Expose to all descendant windows with ExposureMask
-                fn expose_descendants(server: &XServer, parent: Xid, x: u16, y: u16, width: u16, height: u16) {
+                // Also propagate Expose to all descendant windows — use each child's
+                // own dimensions, not the parent's, so widgets get correctly sized events.
+                fn expose_descendants(server: &XServer, parent: Xid) {
                     let children = if let Some(res) = server.resources.get(&parent) {
                         if let Resource::Window(win) = res.value() {
                             win.read().children.clone()
                         } else { Vec::new() }
                     } else { Vec::new() };
                     for child_id in &children {
-                        send_expose_event(server, *child_id, x, y, width, height, 0);
-                        expose_descendants(server, *child_id, x, y, width, height);
+                        let (cw, ch) = if let Some(res) = server.resources.get(child_id) {
+                            if let Resource::Window(win) = res.value() {
+                                let w = win.read();
+                                if w.mapped { (w.width, w.height) } else { (0, 0) }
+                            } else { (0, 0) }
+                        } else { (0, 0) };
+                        if cw > 0 && ch > 0 {
+                            send_expose_event(server, *child_id, 0, 0, cw, ch, 0);
+                        }
+                        expose_descendants(server, *child_id);
                     }
                 }
-                expose_descendants(&server, window, x, y, width, height);
+                expose_descendants(&server, window);
             }
             DisplayEvent::ConfigureNotify { window, x, y, width, height } => {
                 // Update the X11 window state with the new dimensions AND position
