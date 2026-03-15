@@ -472,11 +472,19 @@ unsafe extern "C" fn can_become_first_responder(_this: *mut AnyObject, _sel: Sel
     Bool::YES
 }
 
-unsafe extern "C" fn become_first_responder(this: *mut AnyObject, sel: Sel) -> Bool {
+unsafe extern "C" fn become_first_responder(this: *mut AnyObject, _sel: Sel) -> Bool {
     // Update FOCUSED_VIEW so get_focused_x11_window() returns this view's x11_id
     FOCUSED_VIEW.store(this as usize, std::sync::atomic::Ordering::Relaxed);
     let x11_id = view_x11_id(this);
     ios_log(&format!("becomeFirstResponder: view={:p} x11=0x{:08x}", this, x11_id));
+    // UIKit crashes if the view is not fully attached to a window hierarchy.
+    // Check superview/window before calling super becomeFirstResponder.
+    let superview: *mut AnyObject = msg_send![this, superview];
+    let window: *mut AnyObject = msg_send![this, window];
+    if superview.is_null() || window.is_null() {
+        ios_log("becomeFirstResponder: skipping super call (detached view)");
+        return Bool::YES;
+    }
     // Call super implementation
     let superclass = objc2::class!(UIView);
     objc2::msg_send![super(this, superclass), becomeFirstResponder]
@@ -2771,13 +2779,14 @@ extern "C" fn timer_callback(_timer: *mut c_void, _info: *mut c_void) {
         ios_log("timer_callback: first tick");
     }
 
-    // Every ~2s (120 ticks at 60fps): check first responder status and window
-    if cnt % 120 == 60 {
+    // First-responder promotion is handled by pending_show in drain_render_mailbox.
+    // The periodic timer check was removed because MAIN_VIEW can become a dangling
+    // pointer after window destruction, causing SIGSEGV in UIKit's superview chain.
+    if false {
         MAIN_VIEW.with(|mv| {
             if let Some(view) = *mv.borrow() {
                 unsafe {
                     let is_fr: Bool = objc2::msg_send![&*view, isFirstResponder];
-                    // Check key window
                     let app: *mut AnyObject = objc2::msg_send![objc2::class!(UIApplication), sharedApplication];
                     let key_win: *mut AnyObject = if !app.is_null() {
                         objc2::msg_send![app, keyWindow]
@@ -2787,8 +2796,11 @@ extern "C" fn timer_callback(_timer: *mut c_void, _info: *mut c_void) {
                     ios_log(&format!("timer check: isFirstResponder={} isKeyWindow={} view={:p} win={:p} keyWin={:p}",
                         is_fr.as_bool(), is_key, view, win, key_win));
                     if !is_fr.as_bool() {
-                        ios_log("timer: re-acquiring first responder");
-                        let _: Bool = objc2::msg_send![&*view, becomeFirstResponder];
+                        let sv: *mut AnyObject = objc2::msg_send![&*view, superview];
+                        if !sv.is_null() && !win.is_null() {
+                            ios_log("timer: re-acquiring first responder");
+                            become_first_responder_deferred(view);
+                        }
                     }
                 }
             }
@@ -2853,45 +2865,47 @@ fn drain_render_mailbox() {
                 let mut ws = w.borrow_mut();
                 let win_ids: Vec<u64> = ws.keys().copied().collect();
                 for win_id in win_ids {
-                    let commands = if let Some(mut entry) = mailbox.get_mut(&win_id) {
-                        if entry.is_empty() { continue; }
-                        std::mem::take(entry.value_mut())
-                    } else {
-                        continue;
-                    };
+                    // 1. Render any pending commands
+                    let had_commands = if let Some(mut entry) = mailbox.get_mut(&win_id) {
+                        if entry.is_empty() { false } else {
+                            let commands = std::mem::take(entry.value_mut());
+                            drop(entry); // release mailbox shard lock
+                            if let Some(info) = ws.get_mut(&win_id) {
+                                let width = info.width as u32;
+                                let height = info.height as u32;
+                                let commands = coalesce_putimage(commands, width, height);
 
+                                unsafe { IOSurfaceLock(info.surface, 0, std::ptr::null_mut()); }
+
+                                let base = unsafe { IOSurfaceGetBaseAddress(info.surface) };
+                                let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.surface) };
+                                let buf_len = bytes_per_row * info.height as usize;
+                                let buffer = unsafe {
+                                    std::slice::from_raw_parts_mut(base as *mut u8, buf_len)
+                                };
+                                let stride = bytes_per_row as u32;
+
+                                for c in &commands {
+                                    render_to_buffer(buffer, width, height, stride, c);
+                                }
+
+                                unsafe { IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut()); }
+
+                                sync_surfaces(info);
+
+                                if info.visible {
+                                    flush_window_to_layer(info.ca_layer, info.display_surface);
+                                }
+                            }
+                            true
+                        }
+                    } else { false };
+
+                    // 2. Check pending_show for ALL windows (not just those with render commands).
+                    // ShowWindow sets pending_show, but render commands may have already been
+                    // processed in a previous drain_render_mailbox call before ShowWindow arrived.
                     if let Some(info) = ws.get_mut(&win_id) {
-                        let width = info.width as u32;
-                        let height = info.height as u32;
-                        let commands = coalesce_putimage(commands, width, height);
-
-                        unsafe {
-                            IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
-                        }
-
-                        let base = unsafe { IOSurfaceGetBaseAddress(info.surface) };
-                        let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.surface) };
-                        let buf_len = bytes_per_row * info.height as usize;
-                        let buffer = unsafe {
-                            std::slice::from_raw_parts_mut(base as *mut u8, buf_len)
-                        };
-                        let stride = bytes_per_row as u32;
-
-                        for c in &commands {
-                            render_to_buffer(buffer, width, height, stride, c);
-                        }
-
-                        unsafe { IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut()); }
-
-                        sync_surfaces(info);
-
-                        if info.visible {
-                            flush_window_to_layer(info.ca_layer, info.display_surface);
-                        }
-
-                        // Deferred show: make window visible after first render
-                        // (same as macOS pending_show in drain_render_mailbox)
-                        if info.pending_show {
+                        if info.pending_show && (had_commands || !info.ui_window.is_null()) {
                             info.pending_show = false;
                             if !info.ui_window.is_null() {
                                 ios_log(&format!("pending_show: showing window {} x11=0x{:08X}", win_id, info.x11_id));
