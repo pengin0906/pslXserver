@@ -915,8 +915,10 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
     let x11_id = *ivar.load::<u32>(&*this);
     if x11_id == 0 { return; }
 
-    let new_w = new_size.width as u16;
-    let new_h = new_size.height as u16;
+    // HiDPI: macOS reports points; convert to X11 pixels
+    let scale = get_scale_factor();
+    let new_w = (new_size.width * scale) as u16;
+    let new_h = (new_size.height * scale) as u16;
     if new_w == 0 || new_h == 0 { return; }
 
     extern "C" {
@@ -1112,8 +1114,10 @@ fn macos_frame_to_x11_pos(window: &NSWindow) -> (i16, i16) {
         };
         // Use cached screen height — avoids [NSScreen mainScreen] ObjC call per frame
         let screen_h = SCREEN_HEIGHT.with(|sh| sh.get());
-        let x11_x = frame.origin.x as i16;
-        let x11_y = (screen_h - frame.origin.y - content_h) as i16;
+        // HiDPI: convert point position to pixel position
+        let scale = get_scale_factor();
+        let x11_x = (frame.origin.x * scale) as i16;
+        let x11_y = ((screen_h - frame.origin.y - content_h) * scale) as i16;
         (x11_x, x11_y)
     }
 }
@@ -1899,10 +1903,11 @@ fn handle_command(cmd: DisplayCommand) {
                     | NSWindowStyleMask::Resizable
             };
 
-            // X11 dimensions treated as points (not physical pixels) so text remains legible.
-            // On Retina displays, the IOSurface is pixel-doubled by CALayer automatically.
-            let mut pt_w = width as f64;
-            let mut pt_h = height as f64;
+            // HiDPI: X11 dimensions are physical pixels. NSWindow is sized in points.
+            // With contentsScale=2.0, IOSurface pixels map 2:1 to points.
+            let scale = get_scale_factor();
+            let mut pt_w = width as f64 / scale;
+            let mut pt_h = height as f64 / scale;
             unsafe {
                 let screen: *mut AnyObject = msg_send![objc2::class!(NSScreen), mainScreen];
                 if !screen.is_null() {
@@ -2005,8 +2010,8 @@ fn handle_command(cmd: DisplayCommand) {
                         // Pin content to top-left during resize
                         let gravity = NSString::from_str("topLeft");
                         let _: () = msg_send![layer, setContentsGravity: &*gravity];
-                        // 1:1 pixel mapping (no HiDPI scaling)
-                        let _: () = msg_send![layer, setContentsScale: 1.0_f64];
+                        // HiDPI: 2 IOSurface pixels per point on Retina displays
+                        let _: () = msg_send![layer, setContentsScale: scale];
                         // Clip layer contents to view bounds
                         let _: () = msg_send![layer, setMasksToBounds: true];
                         // Set IOSurface directly as initial layer contents (zero-copy)
@@ -2165,8 +2170,10 @@ fn handle_command(cmd: DisplayCommand) {
                     let screen_h = info.window.screen()
                         .map(|s| s.frame().size.height)
                         .unwrap_or(956.0);
-                    let pt_w = width as f64;
-                    let pt_h = height as f64;
+                    // HiDPI: X11 coords are pixels, NSWindow uses points
+                    let scale = get_scale_factor();
+                    let pt_w = width as f64 / scale;
+                    let pt_h = height as f64 / scale;
                     // X11 size = content area size (not including title bar)
                     // Use frameRectForContentRect to compute the full frame
                     let content_rect = NSRect::new(
@@ -2180,9 +2187,9 @@ fn handle_command(cmd: DisplayCommand) {
                     // Convert X11 content top-left to macOS frame bottom-left.
                     // Content bottom in macOS Y = screen_h - y - pt_h.
                     // Frame bottom = content bottom (no bottom border).
-                    let mac_y = screen_h - y as f64 - pt_h;
+                    let mac_y = screen_h - y as f64 / scale - pt_h;
                     let frame = NSRect::new(
-                        NSPoint::new(x as f64, mac_y),
+                        NSPoint::new(x as f64 / scale, mac_y),
                         NSSize::new(pt_w, pt_h + title_bar_h),
                     );
                     info!("MoveResizeWindow: content {}x{} frame {}x{} title_h={}", pt_w, pt_h, frame.size.width, frame.size.height, title_bar_h);
@@ -2915,19 +2922,20 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
 }
 
 /// Get the current mouse position in X11 root window (screen) coordinates.
-/// Returns logical points (not physical pixels) to match our point-based IOSurface rendering.
+/// HiDPI: multiply macOS points by scale factor to get X11 pixel coordinates.
 fn get_screen_mouse_location() -> (i16, i16) {
     unsafe {
         let mouse_loc: NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
-        // Use cached screen height — avoids [NSScreen mainScreen] ObjC call per event.
         let sh = SCREEN_HEIGHT.with(|sh| sh.get());
-        let x = mouse_loc.x as i16;
-        let y = (sh - mouse_loc.y) as i16;
+        let scale = get_scale_factor();
+        let x = (mouse_loc.x * scale) as i16;
+        let y = ((sh - mouse_loc.y) * scale) as i16;
         (x, y)
     }
 }
 
 fn get_event_location(event: &AnyObject, x11_id: crate::display::Xid, win_width: u16, win_height: u16) -> (i16, i16) {
+    let scale = get_scale_factor();
     let ns_window: *mut AnyObject = unsafe { msg_send![event, window] };
     if !ns_window.is_null() {
         // locationInWindow returns coords in points (origin at bottom-left of content view)
@@ -2936,16 +2944,13 @@ fn get_event_location(event: &AnyObject, x11_id: crate::display::Xid, win_width:
         if !view.is_null() {
             let bounds: NSRect = unsafe { msg_send![view, bounds] };
             let vh = bounds.size.height;
-            // With topLeft gravity: IOSurface pixels map 1:1 to points, pinned at top-left
-            // macOS Y is bottom-up, X11 Y is top-down
-            // Don't clamp: allow negative/out-of-bounds coords for drag scroll-back
-            let x = point.x as i16;
-            let y = (vh - point.y) as i16;
+            // HiDPI: multiply point coords by scale factor for X11 pixel coords
+            let x = (point.x * scale) as i16;
+            let y = ((vh - point.y) * scale) as i16;
             return (x, y);
         }
-        // Fallback — don't clamp for drag scroll-back
-        let x = point.x as i16;
-        let y = (win_height as f64 - point.y) as i16;
+        let x = (point.x * scale) as i16;
+        let y = (win_height as f64 - point.y * scale) as i16;
         (x, y)
     } else {
         // No window — use screen coords and find the matching window frame

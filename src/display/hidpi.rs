@@ -13,11 +13,23 @@ extern "C" {
 }
 
 /// Detect the scale factor of the main screen.
+/// Uses CGDisplayMode pixel dimensions / logical dimensions.
 pub fn detect_scale_factor() -> f64 {
     #[cfg(target_os = "macos")]
     {
-        // TODO: Query NSScreen.mainScreen.backingScaleFactor via objc2
-        2.0 // Default to 2x for modern Macs
+        unsafe {
+            let display = CGMainDisplayID();
+            let mode = CGDisplayCopyDisplayMode(display);
+            if !mode.is_null() {
+                let phys_w = CGDisplayModeGetPixelWidth(mode) as f64;
+                let logic_w = CGDisplayPixelsWide(display) as f64;
+                CGDisplayModeRelease(mode);
+                if logic_w > 0.0 {
+                    return (phys_w / logic_w * 100.0).round() / 100.0; // round to 2 decimals
+                }
+            }
+            2.0 // fallback
+        }
     }
 
     #[cfg(target_os = "ios")]
@@ -32,18 +44,21 @@ pub fn detect_scale_factor() -> f64 {
     }
 }
 
-/// Get the main screen dimensions in logical points.
-/// Since our IOSurface uses contentsScale=1.0 (point-based rendering),
-/// all X11 coordinates should be in points, not physical pixels.
+/// Get the main screen dimensions in physical pixels (HiDPI-aware).
+/// Uses logical dimensions × scale factor (not CGDisplayModeGetPixelWidth,
+/// which returns the panel's native resolution, not the scaled mode).
 pub fn get_screen_dimensions_pixels() -> (u16, u16) {
     #[cfg(target_os = "macos")]
     {
         unsafe {
             let display = CGMainDisplayID();
-            // Use logical (point) dimensions, not physical pixels.
-            // This matches our point-based IOSurface rendering.
-            let w = CGDisplayPixelsWide(display) as u16;
-            let h = CGDisplayPixelsHigh(display) as u16;
+            // Get logical (point) dimensions
+            let lw = CGDisplayPixelsWide(display) as f64;
+            let lh = CGDisplayPixelsHigh(display) as f64;
+            // Multiply by scale factor for HiDPI pixel dimensions
+            let scale = detect_scale_factor();
+            let w = (lw * scale) as u16;
+            let h = (lh * scale) as u16;
             (w, h)
         }
     }
