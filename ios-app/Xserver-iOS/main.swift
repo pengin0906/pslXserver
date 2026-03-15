@@ -13,4 +13,4 @@ func pslx_start(_ display_num: UInt32, _ tcp_port: UInt16)
 // - X11 protocol server runs on background threads via tokio
 
 // We call pslx_start which calls UIApplicationMain and never returns.
-pslx_start(0, 0) // display :0, TCP port 6000
+pslx_start(1, 0) // display :1, TCP port 6001

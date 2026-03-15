@@ -937,6 +937,12 @@ unsafe extern "C" fn send_arrow_right(_this: *mut AnyObject, _sel: Sel) { send_k
 /// inputAccessoryView — creates the Ctrl/Esc/Tab/arrow toolbar shown above the keyboard.
 /// Returns a UIScrollView containing shortcut buttons.
 unsafe extern "C" fn input_accessory_view(_this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+    // On the iOS simulator, custom keyboard accessory views can trigger
+    // a UIKit crash during becomeFirstResponder/input view reloading.
+    // Returning nil keeps software keyboard activation on the safe path.
+    let nil: *mut AnyObject = std::ptr::null_mut();
+    return nil;
+
     // Return cached accessory view (created once).
     static CACHED_VIEW: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
     let cached = *CACHED_VIEW.lock().unwrap();
