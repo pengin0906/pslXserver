@@ -2684,22 +2684,25 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
                 NS_RIGHT_MOUSE_DOWN => 3,
                 _ => 2,
             };
-            // Suppress spurious button events from app activation (SUPPRESS_BUTTON_FRAMES set
-            // by mouseEntered: before calling activateIgnoringOtherApps:).
-            if SUPPRESS_BUTTON_FRAMES.with(|s| s.get()) > 0 {
-                let cur: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
-                LAST_BUTTONS.with(|lb| lb.set(cur));
-                // fall through to sync LAST_BUTTONS at end of arm
-            } else {
+            // Click-to-focus: activate app and send FocusIn on click
+            unsafe {
+                let mtm = MainThreadMarker::new().unwrap();
+                let app = NSApplication::sharedApplication(mtm);
+                let is_active: bool = msg_send![&*app, isActive];
+                if !is_active {
+                    let ns_window: *mut AnyObject = msg_send![event, window];
+                    if !ns_window.is_null() {
+                        activate_app(ns_window);
+                    }
+                }
+            }
+            send_display_event(DisplayEvent::FocusIn { window: x11_id });
             // Check if polling already detected this press (avoid duplicate ButtonPress)
             let btn_bit: u64 = match button { 1 => 1, 3 => 2, 2 => 4, _ => 0 };
             let prev = LAST_BUTTONS.with(|lb| lb.get());
             if (prev & btn_bit) == 0 {
                 let (x, y) = get_event_location(event, x11_id, win_width, win_height);
                 let (root_x, root_y) = get_screen_mouse_location();
-                // For ButtonPress, state should reflect state BEFORE this press.
-                // macOS pressedMouseButtons already includes the button being pressed,
-                // so we subtract it.
                 let button_mask: u16 = match button {
                     1 => 0x100, 2 => 0x200, 3 => 0x400, _ => 0,
                 };
@@ -2714,7 +2717,6 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
             // Always sync LAST_BUTTONS so the polling path doesn't re-fire
             let cur: u64 = unsafe { msg_send![objc2::class!(NSEvent), pressedMouseButtons] };
             LAST_BUTTONS.with(|lb| lb.set(cur));
-            } // end else (not suppressed)
         }
         NS_LEFT_MOUSE_UP | NS_RIGHT_MOUSE_UP | NS_OTHER_MOUSE_UP => {
             let button: u8 = match event_type {

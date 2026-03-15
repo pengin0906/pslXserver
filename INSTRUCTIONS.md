@@ -147,6 +147,8 @@
 - [ ][ ] Chrome/VS Codeで日本語IMEインライン編集が動かない
 - [x][x] xtermでIME日本語インライン表示+BSバグ修正 — (1) Homebrew libX11のXSupportsLocale()=0問題: locale module(.2.so)にLinux命名(.so.2)のsymlink作成で解決 (2) プリエディットフリッカー: 毎回全消去→全再描画をインクリメンタル更新に変更(starts_withで接頭辞一致なら差分のみ送信)
 - [x][ ] ブラウザ音声出力: PulseAudio TCP (port 4713, auth-anonymous) + start-with-audio.shスクリプト
+- [ ][ ] 音声TCP直結化: 現在SSH経由parec→ffplay。9955wxでTCPサーバー(4714)→Mac直接接続に変更すべき（socat EXEC/Pythonサーバーでparec がPulseAudioセッション接続できない問題を要解決）
+- [ ][ ] Chromeボタンクリック問題: ButtonPress反転するがクリック完了しない（ButtonRelease配信問題の可能性）
 - [x][ ] SHAPE拡張実装 (xeyes/xlogo非矩形ウィンドウ対応) — shape.rs作成、全サブオペコード対応
 - [x][ ] RENDER拡張実装 (スタブ) — QueryVersion 0.11, QueryPictFormats(ARGB32/RGB24/A8), 描画op全no-op
 - [x][x] BIG-REQUESTS拡張実装 — 既存実装、opcode 133で16MB対応
