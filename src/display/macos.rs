@@ -512,10 +512,10 @@ unsafe extern "C" fn mouse_entered(this: *mut AnyObject, _sel: Sel, _event: *mut
     let is_active: bool = msg_send![&*app, isActive];
 
     if is_active {
-        // Normal case: Xserver already has focus, user moved to a different X11 window.
+        // Click-to-focus: only track entered window, don't send FocusIn on hover.
+        // FocusIn is sent on mouseDown instead (ButtonPress handler).
         LAST_ENTER_WINDOW_X11.with(|le| le.set(x11_id));
-        info!("mouseEntered (active) → FocusIn x11=0x{:08x}", x11_id);
-        send_display_event(DisplayEvent::FocusIn { window: x11_id });
+        debug!("mouseEntered (active) x11=0x{:08x} — click-to-focus, no FocusIn", x11_id);
     } else {
         // Backgrounded: DON'T set LAST_ENTER_WINDOW_X11 here.
         // The global monitor will see the next mouse-moved event, find LAST=0 ≠ entered_xid,
@@ -1396,19 +1396,13 @@ unsafe extern "C" fn cg_mouse_tap_callback(
         return event;
     }
 
-    // Mouse moved/dragged: focus-follows-mouse activation.
+    // Click-to-focus: don't activate on mouse move, only on click (handled above).
     LAST_ENTER_WINDOW_X11.with(|le| {
         if entered_nswin.is_null() {
-            // Mouse left all our windows — reset so next entry fires again.
             if le.get() != 0 { le.set(0); }
             return;
         }
-        if le.get() == entered_xid { return; }
         le.set(entered_xid);
-        info!("CGEventTap: cursor entered x11=0x{:08x} while backgrounded — activating", entered_xid);
-        SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
-        activate_app(entered_nswin);
-        send_display_event(DisplayEvent::FocusIn { window: entered_xid });
     });
 
     event // passive listener: return event unchanged
@@ -1466,16 +1460,9 @@ fn check_enter_notify() {
         0
     });
 
+    // Click-to-focus: track which window cursor is over, but don't send FocusIn.
     LAST_ENTER_WINDOW_X11.with(|le| {
-        if le.get() == entered_xid { return; }
         le.set(entered_xid);
-        if entered_xid == 0 { return; }
-
-        // Only send X11 FocusIn from timer — macOS activation must come from
-        // a real user-event handler (mouseEntered:), not a 60fps timer loop.
-        // macOS Sequoia ignores activateIgnoringOtherApps from timer contexts.
-        info!("EnterNotify → FocusIn x11=0x{:08x}", entered_xid);
-        send_display_event(DisplayEvent::FocusIn { window: entered_xid });
     });
 }
 
@@ -2425,15 +2412,8 @@ pub fn run_cocoa_app(
             });
             if entered_nswin.is_null() { return; }
 
-            // Cursor is over one of our windows while backgrounded — activate.
-            // No dedup on xid: user may cmd-tab while mouse is over our window,
-            // leaving LAST_ENTER_WINDOW_X11 already set to entered_xid.
-            // The is_active guard above prevents redundant calls once we're active.
-            info!("GlobalMonitor: cursor over x11=0x{:08x} while backgrounded — activating", entered_xid);
-            SUPPRESS_BUTTON_FRAMES.with(|s| s.set(8));
+            // Click-to-focus: only track window under cursor, don't activate on hover.
             LAST_ENTER_WINDOW_X11.with(|le| le.set(entered_xid));
-            activate_app(entered_nswin);
-            send_display_event(DisplayEvent::FocusIn { window: entered_xid });
         });
         let ns_event_cls = objc2::class!(NSEvent);
         // NSEventMaskMouseMoved(32) | NSEventMaskLeftMouseDragged(64) | NSEventMaskRightMouseDragged(128)
