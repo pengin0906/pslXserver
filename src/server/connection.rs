@@ -1464,36 +1464,16 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
                     },
                 );
             }
-            // Determine visibility: show the first window per connection,
-            // transient (dialog) windows, and override_redirect windows.
-            // Other windows stay hidden (render-only IOSurface buffers).
-            let visible = {
-                let has_transient = if let Some(res) = server.resources.get(&wid) {
-                    if let super::resources::Resource::Window(win) = res.value() {
-                        win.read().get_property(crate::server::atoms::predefined::WM_TRANSIENT_FOR).is_some()
-                    } else { false }
-                } else { false };
-                if override_redirect || has_transient {
-                    true
-                } else {
-                    // Check if this connection already has a visible native window
-                    let resource_base = wid & 0xFFE00000;
-                    !server.resources.iter().any(|r| {
-                        let rid = *r.key();
-                        if (rid & 0xFFE00000) == resource_base && rid != wid {
-                            if let super::resources::Resource::Window(w2) = r.value() {
-                                w2.read().native_window.is_some()
-                            } else { false }
-                        } else { false }
-                    })
-                }
-            };
+            // Correct X11 semantics: every mapped top-level window should become visible.
+            // Hiding additional top-levels as "render-only" breaks normal apps like
+            // xclock/xcalc/xeyes that legitimately map their own windows.
+            let visible = true;
             let _ = server.display_cmd_tx.send(
                 crate::display::DisplayCommand::ShowWindow { handle, visible },
             );
 
-            // Auto-focus visible windows (transient dialogs, popups) so keyboard
-            // input routes to them when macOS makes them the key window.
+            // Auto-focus visible windows so keyboard input routes to them when
+            // macOS makes them the key window.
             if visible {
                 let old_focus = server.focus_window.load(std::sync::atomic::Ordering::Relaxed);
                 if old_focus != wid {
@@ -1507,6 +1487,11 @@ async fn handle_map_window<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
+
+    // Initialize the mapped window contents according to its background attributes
+    // before the first Expose-driven redraw. This matches X11 behavior for apps
+    // like xclock/xcalc that expect the server to clear the background on map.
+    clear_window_tree(server, wid);
 
     // Send MapNotify event to the client (inline for correct sequence ordering)
     let seq = conn.current_request_sequence();
@@ -5325,4 +5310,3 @@ fn parse_xlfd_metrics(name: &str) -> (i16, i16, i16) {
     let descent = pixel_size - ascent;
     (ascent, descent, char_width)
 }
-

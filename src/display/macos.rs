@@ -964,17 +964,17 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
         info.height = new_h;
 
         if need_new_surface {
-            // Flush any pending render commands to display_surface BEFORE replacing it.
+            // Flush any pending render commands to the backing surface before replacing it.
             let win_id_u64 = *win_id;
             RENDER_MAILBOX.with(|mb| {
                 let mb = mb.borrow();
                 if let Some(ref mailbox) = *mb {
                     if let Some((_k, commands)) = mailbox.remove(&win_id_u64) {
                         if !commands.is_empty() {
-                            let lock_result = IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
+                            let lock_result = IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
                             if lock_result == 0 {
-                                let base = IOSurfaceGetBaseAddress(info.display_surface);
-                                let stride = IOSurfaceGetBytesPerRow(info.display_surface);
+                                let base = IOSurfaceGetBaseAddress(info.surface);
+                                let stride = IOSurfaceGetBytesPerRow(info.surface);
                                 let buf_len = stride * old_h as usize;
                                 let buffer = std::slice::from_raw_parts_mut(
                                     base as *mut u8, buf_len);
@@ -984,7 +984,7 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
                                 for c in &commands {
                                     render_to_buffer(buffer, w, h, s, c);
                                 }
-                                IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut());
+                                IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
                             }
                         }
                     }
@@ -1041,9 +1041,9 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
                 ((bg >> 16) & 0xFF) as u8,
                 0xFF,
             ];
-            IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
-            let base = IOSurfaceGetBaseAddress(info.display_surface) as *mut u8;
-            let stride = IOSurfaceGetBytesPerRow(info.display_surface);
+            IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
+            let base = IOSurfaceGetBaseAddress(info.surface) as *mut u8;
+            let stride = IOSurfaceGetBytesPerRow(info.surface);
             for row in 0..(new_h as usize) {
                 let row_base = base.add(row * stride);
                 for col in 0..(new_w as usize) {
@@ -1051,10 +1051,10 @@ unsafe extern "C" fn set_frame_size(this: *mut AnyObject, _sel: Sel, new_size: N
                     std::ptr::copy_nonoverlapping(bg_bytes.as_ptr(), row_base.add(off), 4);
                 }
             }
-            IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut());
+            IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut());
         }
 
-        // Single-buffer: just flush display_surface (no swap needed).
+        sync_surfaces(info);
         flush_window(info);
         ca_transaction_flush();
 
@@ -1916,8 +1916,8 @@ fn handle_command(cmd: DisplayCommand) {
                         let _: () = msg_send![layer, setContentsScale: 1.0_f64];
                         // Clip layer contents to view bounds
                         let _: () = msg_send![layer, setMasksToBounds: true];
-                        // Set IOSurface directly as initial layer contents (zero-copy)
-                        let _: () = msg_send![layer, setContents: surface as *mut AnyObject];
+                        // Set the display IOSurface as the layer contents.
+                        let _: () = msg_send![layer, setContents: display_surface as *mut AnyObject];
                     }
                     // Prevent AppKit from overwriting layer contents during redraw.
                     // NSViewLayerContentsRedrawNever = 0
@@ -1953,15 +1953,6 @@ fn handle_command(cmd: DisplayCommand) {
                         // initial drawing is already in the IOSurface before the window
                         // becomes visible. This eliminates the black/white flash on startup.
                         info.pending_show = true;
-                        // Send Expose so the client starts drawing.
-                        let x11_id = info.x11_id;
-                        let w = info.width;
-                        let h = info.height;
-                        send_display_event(DisplayEvent::FocusIn { window: x11_id });
-                        send_display_event(DisplayEvent::Expose {
-                            window: x11_id, x: 0, y: 0,
-                            width: w as u16, height: h as u16, count: 0,
-                        });
                     } else {
                         info!("ShowWindow: id={} x11=0x{:08X} - hidden (render-only)", handle.id, info.x11_id);
                     }
@@ -2144,13 +2135,13 @@ fn handle_command(cmd: DisplayCommand) {
                 let ws = w.borrow();
                 if let Some(info) = ws.get(&handle.id) {
                     unsafe {
-                        // Single-buffer: read from display_surface (where we render)
-                        let lock_result = IOSurfaceLock(info.display_surface, 1, std::ptr::null_mut()); // 1=read-only
+                        // Read from the backing surface so GetImage sees the canonical pixels.
+                        let lock_result = IOSurfaceLock(info.surface, 1, std::ptr::null_mut()); // 1=read-only
                         if lock_result != 0 {
                             return None;
                         }
-                        let base = IOSurfaceGetBaseAddress(info.display_surface) as *const u8;
-                        let stride = IOSurfaceGetBytesPerRow(info.display_surface);
+                        let base = IOSurfaceGetBaseAddress(info.surface) as *const u8;
+                        let stride = IOSurfaceGetBytesPerRow(info.surface);
                         let surf_h = info.height as usize;
                         let w = width as usize;
                         let h = height as usize;
@@ -2168,7 +2159,7 @@ fn handle_command(cmd: DisplayCommand) {
                                 copy_bytes,
                             );
                         }
-                        IOSurfaceUnlock(info.display_surface, 1, std::ptr::null_mut());
+                        IOSurfaceUnlock(info.surface, 1, std::ptr::null_mut());
                         Some(pixels)
                     }
                 } else {
@@ -2254,11 +2245,11 @@ fn drain_render_mailbox() {
                         let commands = coalesce_putimage(commands, width, height);
 
                         unsafe {
-                            IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
+                            IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
                         }
 
-                        let base = unsafe { IOSurfaceGetBaseAddress(info.display_surface) };
-                        let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.display_surface) };
+                        let base = unsafe { IOSurfaceGetBaseAddress(info.surface) };
+                        let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(info.surface) };
                         let buf_len = bytes_per_row * info.height as usize;
                         let buffer = unsafe {
                             std::slice::from_raw_parts_mut(base as *mut u8, buf_len)
@@ -2269,41 +2260,20 @@ fn drain_render_mailbox() {
                             render_to_buffer(buffer, width, height, stride, c);
                         }
 
-                        unsafe { IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut()); }
+                        unsafe { IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut()); }
+
+                        sync_surfaces(info);
 
                         flush_window(info);
 
-                        // Deferred show: make window visible once real content arrives.
-                        // Check if any command has non-white content (Chrome sends
-                        // all-white PutImage as its first frame).
                         if info.pending_show {
-                            let has_real_content = commands.iter().any(|c| match c {
-                                crate::display::RenderCommand::DrawText { .. } => true,
-                                crate::display::RenderCommand::DrawLine { .. } => true,
-                                crate::display::RenderCommand::DrawRectangle { .. } => true,
-                                crate::display::RenderCommand::FillArc { .. } => true,
-                                crate::display::RenderCommand::DrawArc { .. } => true,
-                                crate::display::RenderCommand::FillPolygon { .. } => true,
-                                crate::display::RenderCommand::PutImage { data, .. } => {
-                                    // Sample pixels — if any is non-white, it's real content
-                                    data.chunks(4).step_by(64).any(|px| {
-                                        px.len() == 4 && (px[0] != 0xFF || px[1] != 0xFF || px[2] != 0xFF)
-                                    })
-                                }
-                                crate::display::RenderCommand::FillRectangle { color, .. } => {
-                                    *color != 0xFFFFFFFF && *color != 0x00FFFFFF
-                                }
-                                _ => false,
-                            });
-                            if has_real_content {
-                                info.pending_show = false;
-                                info!("pending_show: showing window {} x11=0x{:08X}", win_id, info.x11_id);
-                                let mtm = MainThreadMarker::new().unwrap();
-                                let app = NSApplication::sharedApplication(mtm);
-                                unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
-                                info.window.makeKeyAndOrderFront(None);
-                                flush_window(info);
-                            }
+                            info.pending_show = false;
+                            info!("pending_show: showing window {} x11=0x{:08X}", win_id, info.x11_id);
+                            let mtm = MainThreadMarker::new().unwrap();
+                            let app = NSApplication::sharedApplication(mtm);
+                            unsafe { let _: () = msg_send![&*app, activateIgnoringOtherApps: true]; }
+                            info.window.makeKeyAndOrderFront(None);
+                            flush_window(info);
                         }
                     }
                 }

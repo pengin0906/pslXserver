@@ -1,0 +1,28 @@
+diff --git a/hw/xquartz/bundle/X11.sh b/hw/xquartz/bundle/X11.sh
+index 3b8b6799c..686d8c449 100755
+--- a/hw/xquartz/bundle/X11.sh
++++ b/hw/xquartz/bundle/X11.sh
+@@ -2,6 +2,23 @@
+ 
+ set "$(dirname "$0")"/X11.bin "${@}"
+ 
++if [ ! -f "${HOME}/Library/Preferences/org.xquartz.X11.plist" ] ; then
++    # Try migrating preferences
++    if [ -f "${HOME}/Library/Preferences/org.macosforge.xquartz.X11.plist" ] ; then
++        cp "${HOME}/Library/Preferences/org.macosforge.xquartz.X11.plist" "${HOME}/Library/Preferences/org.xquartz.X11.plist"
++    elif [ -f "${HOME}/Library/Preferences/org.x.X11.plist" ] ; then
++        cp "${HOME}/Library/Preferences/org.x.X11.plist" "${HOME}/Library/Preferences/org.xquartz.X11.plist"
++    elif [ -f "${HOME}/Library/Preferences/com.apple.X11.plist" ] ; then
++        cp "${HOME}/Library/Preferences/com.apple.X11.plist" "${HOME}/Library/Preferences/org.xquartz.X11.plist"
++    fi
++fi
++
++SPARKLE_URL=$(defaults read org.xquartz.X11 SUFeedURL 2> /dev/null || true)
++NEW_SPARKLE_URL="${SPARKLE_URL/\/sparkle\//\/sparkle-r1\/}"
++if [[ "${SPARKLE_URL}" != "${NEW_SPARKLE_URL}" ]] ; then
++    defaults write org.xquartz.X11 SUFeedURL "${NEW_SPARKLE_URL}"
++fi
++
+ if [ -x ~/.x11run ]; then
+ 	exec ~/.x11run "${@}"
+ fi

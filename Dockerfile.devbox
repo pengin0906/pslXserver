@@ -1,0 +1,32 @@
+FROM debian:bookworm-slim
+
+# X11 libs + basic tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # C compiler
+    gcc libc6-dev make \
+    # Editor
+    vim \
+    # Chromium + deps
+    chromium \
+    # VS Code deps (Electron/GTK)
+    libx11-xcb1 libxcb-dri3-0 libdrm2 libgbm1 libasound2 \
+    libatk1.0-0 libatk-bridge2.0-0 libcups2 libgtk-3-0 \
+    libnss3 libxcomposite1 libxdamage1 libxrandr2 libxkbfile1 \
+    libsecret-1-0 libpango-1.0-0 libcairo2 \
+    # X11 apps & utils (xeyes, ico, xclock, xterm, xdpyinfo, xev, xlsfonts, etc.)
+    x11-apps x11-utils x11-xserver-utils xterm \
+    # Networking & utils
+    curl wget gnupg2 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install VS Code (ARM64)
+RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+      | gpg --dearmor -o /usr/share/keyrings/ms.gpg \
+    && echo "deb [arch=arm64 signed-by=/usr/share/keyrings/ms.gpg] https://packages.microsoft.com/repos/code stable main" \
+      > /etc/apt/sources.list.d/vscode.list \
+    && apt-get update && apt-get install -y --no-install-recommends code \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV DISPLAY=192.168.5.2:0
+WORKDIR /root
+CMD ["bash"]

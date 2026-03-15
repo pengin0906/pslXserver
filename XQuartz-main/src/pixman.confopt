@@ -1,0 +1,3 @@
+-Dmmx=disabled \
+-Da64-neon=disabled \
+-Dtests=disabled
