@@ -25,6 +25,11 @@ pub extern "C" fn pslx_start(display_num: u32, tcp_port: u16) {
         .target(env_logger::Target::Stderr)
         .init();
 
+    // Set locale for correct font selection (Japanese, etc.)
+    // iOS simulator doesn't propagate locale env vars automatically.
+    std::env::set_var("LANG", "ja_JP.UTF-8");
+    std::env::set_var("LC_ALL", "ja_JP.UTF-8");
+
     info!("Xserver (iOS) starting on display :{}", display_num);
 
     let (screen_width, screen_height) = display::hidpi::get_screen_dimensions_pixels();
