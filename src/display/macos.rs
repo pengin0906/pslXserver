@@ -1564,14 +1564,7 @@ fn process_commands() {
         let prev_buttons = LAST_BUTTONS.with(|lb| lb.get());
 
         // Detect button edges and send ButtonPress/ButtonRelease.
-        // Skip for a few frames after activateIgnoringOtherApps: to avoid spurious clicks.
-        if SUPPRESS_BUTTON_FRAMES.with(|s| {
-            let v = s.get();
-            if v > 0 { s.set(v - 1); }
-            v > 0
-        }) {
-            LAST_BUTTONS.with(|lb| lb.set(cur_buttons)); // sync state silently
-        } else if cur_buttons != prev_buttons {
+        if cur_buttons != prev_buttons {
             LAST_BUTTONS.with(|lb| lb.set(cur_buttons));
             let time = unsafe {
                 let pi: *mut AnyObject = msg_send![objc2::class!(NSProcessInfo), processInfo];
@@ -2672,11 +2665,6 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
         (ts * 1000.0) as u32
     };
 
-    // When user clicks on a window, update X11 focus to that window
-    if event_type == NS_LEFT_MOUSE_DOWN || event_type == NS_RIGHT_MOUSE_DOWN || event_type == NS_OTHER_MOUSE_DOWN {
-        send_display_event(DisplayEvent::FocusIn { window: x11_id });
-    }
-
     match event_type {
         NS_LEFT_MOUSE_DOWN | NS_RIGHT_MOUSE_DOWN | NS_OTHER_MOUSE_DOWN => {
             let button: u8 = match event_type {
@@ -2684,7 +2672,8 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
                 NS_RIGHT_MOUSE_DOWN => 3,
                 _ => 2,
             };
-            // Click-to-focus: activate app and send FocusIn on click
+            // Click-to-focus: activate app and send FocusIn only when clicking
+            // a different window (avoid re-sending FocusIn to already-focused window).
             unsafe {
                 let mtm = MainThreadMarker::new().unwrap();
                 let app = NSApplication::sharedApplication(mtm);
@@ -2694,9 +2683,9 @@ fn handle_ns_event(event: &AnyObject, event_type: usize) {
                     if !ns_window.is_null() {
                         activate_app(ns_window);
                     }
+                    send_display_event(DisplayEvent::FocusIn { window: x11_id });
                 }
             }
-            send_display_event(DisplayEvent::FocusIn { window: x11_id });
             // Check if polling already detected this press (avoid duplicate ButtonPress)
             let btn_bit: u64 = match button { 1 => 1, 3 => 2, 2 => 4, _ => 0 };
             let prev = LAST_BUTTONS.with(|lb| lb.get());
