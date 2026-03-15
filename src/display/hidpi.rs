@@ -13,23 +13,12 @@ extern "C" {
 }
 
 /// Detect the scale factor of the main screen.
-/// Uses CGDisplayMode pixel dimensions / logical dimensions.
+/// On macOS Retina displays, backingScaleFactor is always 2.0 regardless
+/// of the "Looks like" display scaling setting. This is what CALayer uses.
 pub fn detect_scale_factor() -> f64 {
     #[cfg(target_os = "macos")]
     {
-        unsafe {
-            let display = CGMainDisplayID();
-            let mode = CGDisplayCopyDisplayMode(display);
-            if !mode.is_null() {
-                let phys_w = CGDisplayModeGetPixelWidth(mode) as f64;
-                let logic_w = CGDisplayPixelsWide(display) as f64;
-                CGDisplayModeRelease(mode);
-                if logic_w > 0.0 {
-                    return (phys_w / logic_w * 100.0).round() / 100.0; // round to 2 decimals
-                }
-            }
-            2.0 // fallback
-        }
+        2.0 // Retina Macs always use 2.0 backingScaleFactor
     }
 
     #[cfg(target_os = "ios")]
@@ -55,21 +44,15 @@ pub fn detect_scale_factor() -> f64 {
     }
 }
 
-/// Get the main screen dimensions in physical pixels (HiDPI-aware).
-/// Uses logical dimensions × scale factor (not CGDisplayModeGetPixelWidth,
-/// which returns the panel's native resolution, not the scaled mode).
+/// Get the main screen dimensions in logical points.
+/// Font scaling (2x bitmap) handles readability. contentsScale=1.0 for correct clicks.
 pub fn get_screen_dimensions_pixels() -> (u16, u16) {
     #[cfg(target_os = "macos")]
     {
         unsafe {
             let display = CGMainDisplayID();
-            // Get logical (point) dimensions
-            let lw = CGDisplayPixelsWide(display) as f64;
-            let lh = CGDisplayPixelsHigh(display) as f64;
-            // Multiply by scale factor for HiDPI pixel dimensions
-            let scale = detect_scale_factor();
-            let w = (lw * scale) as u16;
-            let h = (lh * scale) as u16;
+            let w = CGDisplayPixelsWide(display) as u16;
+            let h = CGDisplayPixelsHigh(display) as u16;
             (w, h)
         }
     }

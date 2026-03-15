@@ -5307,7 +5307,10 @@ fn lookup_x11_color(name: &str) -> Option<(u16, u16, u16)> {
 }
 
 fn parse_xlfd_metrics(name: &str) -> (i16, i16, i16) {
-    let default = (10i16, 3i16, 6i16);
+    // HiDPI: scale default font metrics by 2x so text matches macOS system font size (13pt).
+    // At contentsScale=2.0, 1 X11 pixel = 0.5 points, so 26px = 13pt.
+    let scale = crate::display::hidpi::detect_scale_factor() as i16;
+    let default = (10i16 * scale, 3i16 * scale, 6i16 * scale);
     if !name.starts_with('-') {
         return default;
     }
@@ -5315,9 +5318,9 @@ fn parse_xlfd_metrics(name: &str) -> (i16, i16, i16) {
     if parts.len() < 14 {
         return default;
     }
-    let pixel_size: i16 = parts[7].parse().unwrap_or(13);
+    let pixel_size: i16 = parts[7].parse().unwrap_or(13) * scale;
     let avg_width: i16 = parts[12].parse().unwrap_or(60);
-    let char_width = (avg_width + 5) / 10;
+    let char_width = (avg_width + 5) / 10 * scale;
     let ascent = (pixel_size * 3 + 2) / 4;
     let descent = pixel_size - ascent;
     (ascent, descent, char_width)

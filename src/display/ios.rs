@@ -206,6 +206,7 @@ thread_local! {
     static EVT_TX: RefCell<Option<Sender<DisplayEvent>>> = RefCell::new(None);
     static RENDER_MAILBOX: RefCell<Option<crate::display::RenderMailbox>> = RefCell::new(None);
     static NEXT_ID: RefCell<u64> = RefCell::new(1);
+    static SCALE_FACTOR: std::cell::Cell<f64> = const { std::cell::Cell::new(2.0) };
     static LAST_POINTER: std::cell::Cell<(i16, i16)> = const { std::cell::Cell::new((0, 0)) };
     /// Cascade offset for new windows (incremented each CreateWindow).
     static CASCADE_OFFSET: std::cell::Cell<i16> = const { std::cell::Cell::new(0) };
@@ -245,6 +246,10 @@ fn send_display_event(evt: DisplayEvent) {
             let _ = tx.send(evt);
         }
     });
+}
+
+fn get_scale_factor() -> f64 {
+    SCALE_FACTOR.with(|sf| sf.get())
 }
 
 /// Register the PSLXView class (custom UIView for touch and keyboard input).
@@ -1263,7 +1268,7 @@ fn toggle_fullscreen(x11_id: u32) {
                     let win_bounds: CGRect = if !info.ui_window.is_null() {
                         msg_send![info.ui_window, bounds]
                     } else {
-                        CGRect { origin: [0.0, 0.0], size: [info.width as f64, info.height as f64 + IOS_TITLE_BAR_HEIGHT] }
+                        { let s = get_scale_factor(); CGRect { origin: [0.0, 0.0], size: [info.width as f64 / s, info.height as f64 / s + IOS_TITLE_BAR_HEIGHT] } }
                     };
                     let content_h = win_bounds.size[1] - y_offset;
                     let content_w = win_bounds.size[0];
@@ -1283,7 +1288,7 @@ fn toggle_fullscreen(x11_id: u32) {
 
 // --- Touch handling → X11 mouse events ---
 
-/// Height of the drag handle area at the top of each window (points = X11 pixels at contentsScale=1.0).
+/// Height of the drag handle area at the top of each window (in UIKit points).
 const TITLE_BAR_HEIGHT: i16 = 30;
 
 /// Touch mode state machine:
@@ -1733,9 +1738,10 @@ unsafe extern "C" fn handle_hover(this: *mut AnyObject, _sel: Sel, gesture: *mut
     }
 
     let loc: CGPoint = msg_send![gesture, locationInView: &*this];
-    // X11 pixels = UIKit points (contentsScale=1.0), so no conversion needed.
-    let x = loc.x as i16;
-    let y = loc.y as i16;
+    // HiDPI: multiply UIKit point coords by scale factor for X11 pixel coords
+    let scale = get_scale_factor();
+    let x = (loc.x * scale) as i16;
+    let y = (loc.y * scale) as i16;
     let time = get_timestamp();
 
     LAST_POINTER.with(|lp| lp.set((x, y)));
@@ -1770,9 +1776,10 @@ unsafe extern "C" fn handle_scroll(this: *mut AnyObject, _sel: Sel, gesture: *mu
     let _: () = msg_send![gesture, setTranslation: zero inView: &*this];
 
     let loc: CGPoint = msg_send![gesture, locationInView: &*this];
-    // X11 pixels = UIKit points (contentsScale=1.0), so no conversion needed.
-    let x = loc.x as i16;
-    let y = loc.y as i16;
+    // HiDPI: multiply UIKit point coords by scale factor for X11 pixel coords
+    let scale = get_scale_factor();
+    let x = (loc.x * scale) as i16;
+    let y = (loc.y * scale) as i16;
     let time = get_timestamp();
 
     // Per-window design: this PSLXView = one X11 window; coords are view-local = X11-local
@@ -1832,8 +1839,10 @@ unsafe extern "C" fn handle_touch_scroll(this: *mut AnyObject, _sel: Sel, gestur
     let _: () = msg_send![gesture, setTranslation: zero inView: &*this];
 
     let loc: CGPoint = msg_send![gesture, locationInView: &*this];
-    let x = loc.x as i16;
-    let y = loc.y as i16;
+    // HiDPI: multiply UIKit point coords by scale factor for X11 pixel coords
+    let scale = get_scale_factor();
+    let x = (loc.x * scale) as i16;
+    let y = (loc.y * scale) as i16;
     let time = get_timestamp();
 
     let x11_id = view_x11_id(this);
@@ -1905,8 +1914,9 @@ fn touch_location_in_view(touch: *mut AnyObject, view: *mut AnyObject) -> (i16, 
 
     unsafe {
         let point: CGPoint = msg_send![&*touch, locationInView: &*view];
-        // X11 pixels = UIKit points (contentsScale=1.0), so no conversion needed.
-        (point.x as i16, point.y as i16)
+        // HiDPI: multiply UIKit point coords by scale factor for X11 pixel coords
+        let scale = get_scale_factor();
+        ((point.x * scale) as i16, (point.y * scale) as i16)
     }
 }
 
@@ -1941,6 +1951,7 @@ fn get_focused_x11_window() -> crate::display::Xid {
 /// Check if (x,y) is in the title bar area of any visible window.
 /// Returns (native_id, layer_x, layer_y) for drag initiation.
 fn find_window_titlebar_at(x: i16, y: i16) -> Option<(u64, f64, f64)> {
+    let tb_pixels = (TITLE_BAR_HEIGHT as f64 * get_scale_factor()) as i16;
     WINDOWS.with(|w| {
         let ws = w.borrow();
         let mut best: Option<(u64, f64, f64, u64)> = None;
@@ -1948,7 +1959,7 @@ fn find_window_titlebar_at(x: i16, y: i16) -> Option<(u64, f64, f64)> {
             if !info.visible { continue; }
             let wx = x - info.x11_x;
             let wy = y - info.x11_y;
-            if wx >= 0 && (wx as u16) < info.width && wy >= 0 && wy < TITLE_BAR_HEIGHT {
+            if wx >= 0 && (wx as u16) < info.width && wy >= 0 && wy < tb_pixels {
                 if best.is_none() || *id > best.unwrap().3 {
                     best = Some((*id, info.x11_x as f64, info.x11_y as f64, *id));
                 }
@@ -1959,7 +1970,7 @@ fn find_window_titlebar_at(x: i16, y: i16) -> Option<(u64, f64, f64)> {
 }
 
 /// Move a window's panel to a new position using setFrame on the container_layer.
-/// x, y are in X11 physical pixels which map 1:1 to UIKit points (contentsScale=1.0).
+/// x, y are in X11 physical pixels; divided by scale factor for UIKit points.
 fn move_window_layer(native_id: u64, x: f64, y: f64) {
     WINDOWS.with(|w| {
         let ws = w.borrow();
@@ -1994,10 +2005,12 @@ fn move_window_layer(native_id: u64, x: f64, y: f64) {
                 let _: () = msg_send![ca_cls, begin];
                 let _: () = msg_send![ca_cls, setDisableActions: true];
 
-                let panel_h = info.height as f64 + TITLE_BAR_HEIGHT as f64;
+                // HiDPI: X11 coords are pixels, CALayer uses points
+                let scale = get_scale_factor();
+                let panel_h = info.height as f64 / scale + TITLE_BAR_HEIGHT as f64;
                 let frame = CGRect {
-                    origin: CGPoint { x, y },
-                    size: CGSize { w: info.width as f64, h: panel_h },
+                    origin: CGPoint { x: x / scale, y: y / scale },
+                    size: CGSize { w: info.width as f64 / scale, h: panel_h },
                 };
                 let _: () = msg_send![layer, setFrame: frame];
 
@@ -2186,12 +2199,14 @@ fn add_window_panel(native_id: u64) {
 
             let ca_cls = objc_getClass(b"CALayer\0".as_ptr());
             let tb_h = TITLE_BAR_HEIGHT as f64;
+            // HiDPI: X11 coords are pixels, CALayer uses points
+            let scale = get_scale_factor();
 
             // --- 1. Container layer (title bar + content, positioned at x11_x/y) ---
             let container: *mut AnyObject = msg_send![ca_cls, layer];
             let container_frame = CGRect {
-                origin: [info.x11_x as f64, info.x11_y as f64],
-                size: [info.width as f64, info.height as f64 + tb_h],
+                origin: [info.x11_x as f64 / scale, info.x11_y as f64 / scale],
+                size: [info.width as f64 / scale, info.height as f64 / scale + tb_h],
             };
             let _: () = msg_send![container, setFrame: container_frame];
             let _: () = msg_send![container, setMasksToBounds: true];
@@ -2202,7 +2217,7 @@ fn add_window_panel(native_id: u64) {
             let title_layer: *mut AnyObject = msg_send![ca_cls, layer];
             let title_frame = CGRect {
                 origin: [0.0, 0.0],
-                size: [info.width as f64, tb_h],
+                size: [info.width as f64 / scale, tb_h],
             };
             let _: () = msg_send![title_layer, setFrame: title_frame];
             // Dark title bar background (#333333)
@@ -2219,12 +2234,12 @@ fn add_window_panel(native_id: u64) {
             let content_layer: *mut AnyObject = msg_send![ca_cls, layer];
             let content_frame = CGRect {
                 origin: [0.0, tb_h],
-                size: [info.width as f64, info.height as f64],
+                size: [info.width as f64 / scale, info.height as f64 / scale],
             };
             let _: () = msg_send![content_layer, setFrame: content_frame];
             let gravity = NSString::from_str("topLeft");
             let _: () = msg_send![content_layer, setContentsGravity: &*gravity];
-            let _: () = msg_send![content_layer, setContentsScale: 1.0_f64];
+            let _: () = msg_send![content_layer, setContentsScale: get_scale_factor()];
             let _: () = msg_send![content_layer, setMasksToBounds: true];
             if !info.display_surface.is_null() {
                 let _: () = msg_send![content_layer, setContents: info.display_surface as *mut AnyObject];
@@ -2284,12 +2299,12 @@ fn claim_main_scene(native_id: u64, info: &mut WindowInfo) -> bool {
         let mut mw = mw.borrow_mut();
         if let Some(main_win) = mw.take() {
             unsafe {
-                // Same screen clamp as macOS (macos.rs:1767-1781).
-                // X11 pixels map 1:1 to UIKit points (contentsScale=1.0).
+                // HiDPI: X11 dimensions are pixels; convert to points for UIKit
+                let scale = get_scale_factor();
                 let screen: *mut AnyObject = msg_send![objc2::class!(UIScreen), mainScreen];
                 let screen_bounds: CGRect = msg_send![screen, bounds];
-                let mut pt_w = info.width as f64;
-                let mut pt_h = info.height as f64;
+                let mut pt_w = info.width as f64 / scale;
+                let mut pt_h = info.height as f64 / scale;
                 // Screen bounds are in points; at 2x scale a 1366pt screen = 2732px.
                 // Since we report physical pixels to X11, xterm creates a 484px window
                 // which maps to 484pt here. Clamp to screen bounds in points.
@@ -2312,7 +2327,7 @@ fn claim_main_scene(native_id: u64, info: &mut WindowInfo) -> bool {
                         // Same layer config as macOS (macos.rs:1866-1884)
                         let gravity = NSString::from_str("topLeft");
                         let _: () = msg_send![layer, setContentsGravity: &*gravity];
-                        let _: () = msg_send![layer, setContentsScale: 1.0_f64];
+                        let _: () = msg_send![layer, setContentsScale: get_scale_factor()];
                         let _: () = msg_send![layer, setMasksToBounds: true];
                         // IOSurface as contents — zero-copy (like macOS)
                         let _: () = msg_send![layer, setContents: info.display_surface as *mut AnyObject];
@@ -2400,11 +2415,12 @@ fn setup_window_in_scene(native_id: u64) {
             ]);
         }
 
-        // Clamp window size to screen bounds (same as macOS clamp to visibleFrame)
+        // HiDPI: X11 dimensions are pixels; convert to points for UIKit
+        let scale = get_scale_factor();
         let screen_w = SCREEN_WIDTH.with(|sw| sw.get());
         let screen_h = SCREEN_HEIGHT.with(|sh| sh.get());
-        let mut pt_w = width as f64;
-        let mut pt_h = height as f64;
+        let mut pt_w = width as f64 / scale;
+        let mut pt_h = height as f64 / scale;
         if screen_w > 0.0 && screen_h > 0.0 {
             let max_w = screen_w;
             let max_h = screen_h - IOS_TITLE_BAR_HEIGHT; // reserve title bar space
@@ -2448,7 +2464,7 @@ fn setup_window_in_scene(native_id: u64) {
         if !layer.is_null() {
             let gravity = NSString::from_str("topLeft");
             let _: () = msg_send![layer, setContentsGravity: &*gravity];
-            let _: () = msg_send![layer, setContentsScale: 1.0_f64];
+            let _: () = msg_send![layer, setContentsScale: get_scale_factor()];
             let _: () = msg_send![layer, setMasksToBounds: true];
             if !display_surface.is_null() {
                 let _: () = msg_send![layer, setContents: display_surface as *mut AnyObject];
@@ -2590,7 +2606,7 @@ fn request_new_scene(native_window_id: u64) {
 /// Resize a UIScene's Stage Manager window to match the X11 window dimensions.
 /// Uses UIWindowScene.sizeRestrictions (iPadOS 16+) to constrain the window size,
 /// then requestGeometryUpdate to apply it.
-/// width/height are X11 dimensions in pixels = UIKit points (contentsScale=1.0 mapping).
+/// width/height are in UIKit points (already converted from X11 pixels).
 unsafe fn resize_scene_to_x11(ui_window: *mut AnyObject, width: u16, height: u16) {
     let scene: *mut AnyObject = msg_send![ui_window, windowScene];
     if scene.is_null() { return; }
@@ -2658,9 +2674,10 @@ fn resize_scene_to_content() {
 
     if max_right <= 0 || max_bottom <= 0 { return; }
 
-    // X11 pixels map 1:1 to UIKit points (contentsScale=1.0).
-    let w = max_right as f64;
-    let h = max_bottom as f64;
+    // HiDPI: X11 pixels / scale = UIKit points
+    let scale = get_scale_factor();
+    let w = max_right as f64 / scale;
+    let h = max_bottom as f64 / scale;
 
     MAIN_UI_WINDOW.with(|mw| {
         if let Some(win) = *mw.borrow() {
@@ -3069,10 +3086,12 @@ fn handle_command(cmd: DisplayCommand) {
                                     Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
                                 ]);
                             }
-                            let panel_h = info.height as f64 + TITLE_BAR_HEIGHT as f64;
+                            // HiDPI: X11 coords are pixels, CALayer uses points
+                            let scale = get_scale_factor();
+                            let panel_h = info.height as f64 / scale + TITLE_BAR_HEIGHT as f64;
                             let frame = CGRect {
-                                origin: [info.x11_x as f64, info.x11_y as f64],
-                                size: [info.width as f64, panel_h],
+                                origin: [info.x11_x as f64 / scale, info.x11_y as f64 / scale],
+                                size: [info.width as f64 / scale, panel_h],
                             };
                             let _: () = msg_send![info.container_layer, setFrame: frame];
                         }
@@ -3398,10 +3417,12 @@ unsafe extern "C" fn vc_view_did_layout_subviews(this: *mut AnyObject, _sel: Sel
     }
 
     let bounds: CGRect = msg_send![view, bounds];
-    let new_w = bounds.size[0] as u16;
-    // Subtract title bar height — the view is the container (title bar + content)
+    // HiDPI: UIKit reports points; convert to X11 pixels
+    let scale = get_scale_factor();
+    let new_w = (bounds.size[0] * scale) as u16;
+    // Subtract title bar height (in points) before scaling
     let raw_h = bounds.size[1] - IOS_TITLE_BAR_HEIGHT;
-    let new_h = if raw_h > 0.0 { raw_h as u16 } else { return; };
+    let new_h = if raw_h > 0.0 { (raw_h * scale) as u16 } else { return; };
     if new_w == 0 || new_h == 0 { return; }
 
     // Find the window by matching the UIWindow from the VC
@@ -3469,11 +3490,12 @@ unsafe extern "C" fn vc_view_did_layout_subviews(this: *mut AnyObject, _sel: Sel
                 info.width = new_w;
                 info.height = new_h;
 
-                // Resize the PSLXView frame to match new content size
+                // Resize the PSLXView frame to match new content size (in points)
                 if !info.ui_view.is_null() {
+                    let scale = get_scale_factor();
                     let content_frame = CGRect {
                         origin: [0.0, IOS_TITLE_BAR_HEIGHT],
-                        size: [new_w as f64, new_h as f64],
+                        size: [new_w as f64 / scale, new_h as f64 / scale],
                     };
                     let _: () = msg_send![info.ui_view, setFrame: content_frame];
                 }
@@ -3704,9 +3726,11 @@ fn resize_primary_window(new_width: u16, new_height: u16) {
                             Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]),
                         ]);
                     }
+                    // HiDPI: X11 pixels / scale = UIKit points
+                    let scale = get_scale_factor();
                     let frame = CGRect {
                         origin: [0.0, 0.0],
-                        size: [new_width as f64, new_height as f64],
+                        size: [new_width as f64 / scale, new_height as f64 / scale],
                     };
                     let _: () = msg_send![info.ui_view, setFrame: frame];
                 }
@@ -3817,6 +3841,11 @@ pub fn run_ios_app(
     let kmap = build_keyboard_map();
     let _ = crate::display::KEYBOARD_MAP.set(kmap);
     info!("iOS: Keyboard map initialized");
+
+    // Detect and cache scale factor (like macOS SCALE_FACTOR)
+    let scale = crate::display::hidpi::detect_scale_factor();
+    SCALE_FACTOR.with(|sf| sf.set(scale));
+    info!("iOS: scale factor = {}", scale);
 
     // Store channels in thread-local storage
     CMD_RX.with(|rx| *rx.borrow_mut() = Some(cmd_rx));

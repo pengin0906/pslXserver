@@ -558,7 +558,7 @@ fn fill_polygon(
 
 // --- Bitmap font text rendering ---
 
-/// Draw text using a built-in 6x13 bitmap font.
+/// Draw text using a built-in 6x13 bitmap font, scaled by HiDPI factor.
 /// x, y: X11 coordinates where y is the text baseline.
 fn draw_text_bitmap(
     buffer: &mut [u8],
@@ -571,9 +571,11 @@ fn draw_text_bitmap(
     color: u32,
     bg_color: Option<u32>,
 ) {
-    const GLYPH_W: u32 = 6;
-    const GLYPH_H: u32 = 13;
-    const ASCENT: u32 = 10;
+    // HiDPI: scale bitmap font so it matches macOS system font size (13pt)
+    let scale = crate::display::hidpi::detect_scale_factor() as u32;
+    let glyph_w: u32 = 6 * scale;
+    let glyph_h: u32 = 13 * scale;
+    let ascent: u32 = 10 * scale;
 
     let pixel: [u8; 4] = [
         (color & 0xFF) as u8,
@@ -582,7 +584,7 @@ fn draw_text_bitmap(
         0xFF,
     ];
 
-    let top_y = y as i32 - ASCENT as i32;
+    let top_y = y as i32 - ascent as i32;
 
     // Try to decode as UTF-8; if valid, render char-by-char with width awareness
     let text_str = std::str::from_utf8(text);
@@ -592,33 +594,38 @@ fn draw_text_bitmap(
         for ch in s.chars() {
             // Determine character width: CJK/fullwidth = 2 cells, ASCII = 1 cell
             let char_cells = if ch.is_ascii() { 1u32 } else { 2u32 };
-            let cell_w = char_cells * GLYPH_W;
+            let cell_w = char_cells * glyph_w;
 
             // Fill background per character cell if ImageText
             if let Some(bg) = bg_color {
                 let fill = RenderCommand::FillRectangle {
                     x: cursor_x as i16, y: top_y as i16,
-                    width: cell_w as u16, height: GLYPH_H as u16,
+                    width: cell_w as u16, height: glyph_h as u16,
                     color: bg, gc_function: 3,
                 };
                 render_to_buffer(buffer, buf_w, buf_h, stride, &fill);
             }
 
             if ch.is_ascii() {
-                // ASCII: use bitmap font
+                // ASCII: use bitmap font, scaled by HiDPI factor
                 let glyph = get_glyph_bitmap(ch as u8);
-                for row in 0..GLYPH_H {
+                for row in 0..13u32 {
                     let bits = glyph[row as usize];
                     if bits == 0 { continue; }
-                    let py = top_y + row as i32;
-                    if py < 0 || py >= buf_h as i32 { continue; }
-                    for col in 0..GLYPH_W {
+                    for col in 0..6u32 {
                         if bits & (0x80 >> col) != 0 {
-                            let px = cursor_x + col as i32;
-                            if px >= 0 && (px as u32) < buf_w {
-                                let off = (py as usize) * (stride as usize) + (px as usize) * 4;
-                                if off + 4 <= buffer.len() {
-                                    buffer[off..off + 4].copy_from_slice(&pixel);
+                            // Draw scale×scale block for each bitmap pixel
+                            for sy in 0..scale {
+                                let py = top_y + (row * scale + sy) as i32;
+                                if py < 0 || py >= buf_h as i32 { continue; }
+                                for sx in 0..scale {
+                                    let px = cursor_x + (col * scale + sx) as i32;
+                                    if px >= 0 && (px as u32) < buf_w {
+                                        let off = (py as usize) * (stride as usize) + (px as usize) * 4;
+                                        if off + 4 <= buffer.len() {
+                                            buffer[off..off + 4].copy_from_slice(&pixel);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -626,7 +633,7 @@ fn draw_text_bitmap(
                 }
             } else {
                 // Non-ASCII (CJK etc.): render using CoreText
-                render_coretext_char(buffer, buf_w, buf_h, stride, cursor_x, top_y, ch, &pixel, cell_w, GLYPH_H);
+                render_coretext_char(buffer, buf_w, buf_h, stride, cursor_x, top_y, ch, &pixel, cell_w, glyph_h);
             }
 
             cursor_x += cell_w as i32;
@@ -634,30 +641,34 @@ fn draw_text_bitmap(
     } else {
         // Not valid UTF-8: fall back to byte-by-byte rendering
         for (i, &ch) in text.iter().enumerate() {
-            let cx = x as i32 + (i as i32 * GLYPH_W as i32);
+            let cx = x as i32 + (i as i32 * glyph_w as i32);
 
             if let Some(bg) = bg_color {
                 let fill = RenderCommand::FillRectangle {
                     x: cx as i16, y: top_y as i16,
-                    width: GLYPH_W as u16, height: GLYPH_H as u16,
+                    width: glyph_w as u16, height: glyph_h as u16,
                     color: bg, gc_function: 3,
                 };
                 render_to_buffer(buffer, buf_w, buf_h, stride, &fill);
             }
 
             let glyph = get_glyph_bitmap(ch);
-            for row in 0..GLYPH_H {
+            for row in 0..13u32 {
                 let bits = glyph[row as usize];
                 if bits == 0 { continue; }
-                let py = top_y + row as i32;
-                if py < 0 || py >= buf_h as i32 { continue; }
-                for col in 0..GLYPH_W {
+                for col in 0..6u32 {
                     if bits & (0x80 >> col) != 0 {
-                        let px = cx + col as i32;
-                        if px >= 0 && (px as u32) < buf_w {
-                            let off = (py as usize) * (stride as usize) + (px as usize) * 4;
-                            if off + 4 <= buffer.len() {
-                                buffer[off..off + 4].copy_from_slice(&pixel);
+                        for sy in 0..scale {
+                            let py = top_y + (row * scale + sy) as i32;
+                            if py < 0 || py >= buf_h as i32 { continue; }
+                            for sx in 0..scale {
+                                let px = cx + (col * scale + sx) as i32;
+                                if px >= 0 && (px as u32) < buf_w {
+                                    let off = (py as usize) * (stride as usize) + (px as usize) * 4;
+                                    if off + 4 <= buffer.len() {
+                                        buffer[off..off + 4].copy_from_slice(&pixel);
+                                    }
+                                }
                             }
                         }
                     }
