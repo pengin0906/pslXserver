@@ -39,12 +39,19 @@ use crate::display::renderer::render_to_buffer;
 /// Deferring avoids silent failure when the view hierarchy isn't fully set up yet.
 unsafe fn become_first_responder_deferred(view: *mut AnyObject) {
     if view.is_null() { return; }
-    // Defer to next run loop iteration so UIKit finishes current layout pass first.
-    // Direct call inside timer callback confuses UIKit's software keyboard management.
-    // NOTE: reloadInputViews removed — it caused UIKit to suppress the software keyboard.
+    // Check that view is fully attached to the hierarchy before asking UIKit
+    // to promote it. Without this, UIKit's keyboard reload crashes (SIGSEGV)
+    // when calling superview on a detached view.
+    let superview: *mut AnyObject = msg_send![view, superview];
+    let window: *mut AnyObject = msg_send![view, window];
+    if superview.is_null() || window.is_null() {
+        ios_log("become_first_responder_deferred: skipping (view not attached)");
+        return;
+    }
+    // Delay 0.1s so UIKit finishes layout pass after makeKeyAndVisible.
     let sel_become = objc2::sel!(becomeFirstResponder);
     let nil: *mut AnyObject = std::ptr::null_mut();
-    let _: () = msg_send![view, performSelector: sel_become withObject: nil afterDelay: 0.0_f64];
+    let _: () = msg_send![view, performSelector: sel_become withObject: nil afterDelay: 0.1_f64];
 }
 
 /// Write debug message to stderr (visible via devicectl --console on real device).
@@ -108,7 +115,8 @@ fn create_iosurface(width: u16, height: u16) -> *mut c_void {
     let w = width as i32;
     let h = height as i32;
     let bpe: i32 = 4;
-    let bpr: i32 = w * 4;
+    // iOS requires 16-byte row alignment for IOSurface (macOS is more lenient)
+    let bpr: i32 = (w * 4 + 15) & !15;
     let pixel_format: i32 = 0x42475241; // 'BGRA'
 
     unsafe {
@@ -1058,12 +1066,13 @@ unsafe extern "C" fn delete_backward(this: *mut AnyObject, _sel: Sel) {
     ios_log(&format!("deleteBackward: x11=0x{:08x}", x11_id));
     if x11_id == 0 { return; }
     let time = get_timestamp();
-    // macOS keycode 51 = Backspace → X11 keycode = 51 + 8 = 59
+    // macOS keycode 51 = Backspace → evdev via macos_keycode_to_x11
+    let bs_keycode = macos_keycode_to_x11(51);
     send_display_event(DisplayEvent::KeyPress {
-        window: x11_id, keycode: 59, state: 0, time,
+        window: x11_id, keycode: bs_keycode, state: 0, time,
     });
     send_display_event(DisplayEvent::KeyRelease {
-        window: x11_id, keycode: 59, state: 0, time,
+        window: x11_id, keycode: bs_keycode, state: 0, time,
     });
 }
 
@@ -1549,8 +1558,32 @@ fn uikit_keycode_to_mac_nontext(uikit_kc: i64) -> Option<u8> {
     Some(mac)
 }
 
+/// Convert macOS keycode to X11 keycode (evdev keycode + 8).
+/// Same as macos_keycode_to_x11 in macos.rs — Chrome/xterm expect evdev layout.
+fn macos_keycode_to_x11(mac: u16) -> u8 {
+    let evdev: u16 = match mac {
+        0  => 30,  1  => 31,  2  => 32,  3  => 33,  4  => 35,  5  => 34,  // a s d f h g
+        6  => 44,  7  => 45,  8  => 46,  9  => 47,  11 => 48,              // z x c v b
+        12 => 16,  13 => 17,  14 => 18,  15 => 19,  16 => 21,  17 => 20,  // q w e r y t
+        18 => 2,   19 => 3,   20 => 4,   21 => 5,   22 => 7,   23 => 6,   // 1 2 3 4 6 5
+        24 => 13,  25 => 10,  26 => 8,   27 => 12,  28 => 9,   29 => 11,  // = 9 7 - 8 0
+        30 => 27,  31 => 24,  32 => 22,  33 => 26,  34 => 23,  35 => 25,  // ] o u [ i p
+        36 => 28,  37 => 38,  38 => 36,  39 => 40,  40 => 37,  41 => 39,  // Return l j ' k ;
+        42 => 43,  43 => 51,  44 => 53,  45 => 49,  46 => 50,  47 => 52,  // \ , / n m .
+        48 => 15,  49 => 57,  50 => 41,  51 => 14,  53 => 1,              // Tab Space ` BS Esc
+        54 => 126, 55 => 125, 56 => 42,  57 => 58,  58 => 56,  59 => 29,  // modifiers
+        60 => 54,  61 => 100, 62 => 97,
+        122 => 59, 120 => 60, 99  => 61, 118 => 62, 96  => 63, 97  => 64, // F1-F6
+        98  => 65, 100 => 66, 101 => 67, 109 => 68, 103 => 87, 111 => 88, // F7-F12
+        123 => 105, 124 => 106, 125 => 108, 126 => 103,                    // arrows
+        115 => 102, 119 => 107, 116 => 104, 121 => 109, 117 => 111,       // nav
+        102 => 100, 104 => 92,                                              // JIS
+        _ => return (mac as u8).wrapping_add(8),
+    };
+    (evdev + 8) as u8
+}
+
 /// Full UIKit keyCode → macOS virtual keycode mapping (all keys including text).
-/// Used for KeyRelease only (to match KeyPress sent by insertText:).
 fn uikit_keycode_to_mac(uikit_kc: i64) -> Option<u8> {
     // UIKeyboardHIDUsage values → macOS kVK codes
     let mac = match uikit_kc {
@@ -1649,22 +1682,23 @@ unsafe extern "C" fn presses_began(this: *mut AnyObject, _sel: Sel, presses: *mu
         if has_modifier {
             // With Control/Command modifier: use full keycode map (text keys too)
             if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
-                let keycode = mac_kc + 8;
+                let keycode = macos_keycode_to_x11(mac_kc as u16);
                 send_display_event(DisplayEvent::KeyPress {
                     window: x11_id, keycode, state, time,
                 });
             }
         } else if uikit_kc == 42 {
-            // Backspace — mac keycode 51 + 8 = 59
+            // Backspace — evdev keycode via macos_keycode_to_x11
+            let keycode = macos_keycode_to_x11(51); // mac 51 = Backspace
             send_display_event(DisplayEvent::KeyPress {
-                window: x11_id, keycode: 59, state, time,
+                window: x11_id, keycode, state, time,
             });
         } else {
             // Use full keycode map: in the iOS simulator (and iPad with hardware keyboard),
             // text keys come through pressesBegan, NOT insertText:.
             // Set HARDWARE_KB_DETECTED so insertText: knows to skip ASCII to avoid double-send.
             if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
-                let keycode = mac_kc + 8;
+                let keycode = macos_keycode_to_x11(mac_kc as u16);
                 // Store keycode so insertText: can detect duplicate and skip.
                 LAST_HW_KEYCODE.store(keycode, Ordering::Relaxed);
                 send_display_event(DisplayEvent::KeyPress {
@@ -1710,19 +1744,20 @@ unsafe extern "C" fn presses_ended(this: *mut AnyObject, _sel: Sel, presses: *mu
 
         if has_modifier {
             if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
-                let keycode = mac_kc + 8;
+                let keycode = macos_keycode_to_x11(mac_kc as u16);
                 send_display_event(DisplayEvent::KeyRelease {
                     window: x11_id, keycode, state, time,
                 });
             }
         } else if uikit_kc == 42 {
-            // Backspace KeyRelease — mac keycode 51 + 8 = 59
+            // Backspace KeyRelease
+            let keycode = macos_keycode_to_x11(51);
             send_display_event(DisplayEvent::KeyRelease {
-                window: x11_id, keycode: 59, state, time,
+                window: x11_id, keycode, state, time,
             });
         } else {
             if let Some(mac_kc) = uikit_keycode_to_mac(uikit_kc) {
-                let keycode = mac_kc + 8;
+                let keycode = macos_keycode_to_x11(mac_kc as u16);
                 send_display_event(DisplayEvent::KeyRelease {
                     window: x11_id, keycode, state, time,
                 });
@@ -2135,7 +2170,7 @@ fn ascii_to_x11_keycode_state(ch: u8) -> (u8, u16) {
         _ => return (0, 0),
     };
     let state = if shift { 1u16 } else { 0u16 };
-    (mac_kc + 8, state)
+    (macos_keycode_to_x11(mac_kc as u16), state)
 }
 
 /// Drop redundant full-window PutImage commands (same as macos.rs).
@@ -2539,22 +2574,11 @@ fn setup_window_in_scene(native_id: u64) {
             MAIN_VIEW.with(|mv| *mv.borrow_mut() = Some(view));
         }
 
-        // If ShowWindow was already called (pending_show), show immediately.
-        // Otherwise, wait for ShowWindow command (like macOS: CreateWindow doesn't show).
+        // If ShowWindow was already called (pending_show), leave it for
+        // drain_render_mailbox to show after the first render frame completes.
+        // This matches macOS: window becomes visible only after initial content is drawn.
         if pending_show {
-            ios_log(&format!("setup_window_in_scene: pending_show=true, showing now"));
-            let _: () = msg_send![win, setHidden: false];
-            let _: () = msg_send![win, makeKeyAndVisible];
-            WINDOWS.with(|w| {
-                if let Some(info) = w.borrow_mut().get_mut(&native_id) {
-                    info.visible = true;
-                    info.pending_show = false;
-                }
-            });
-            become_first_responder_deferred(view);
-            if x11_id != 0 {
-                send_display_event(DisplayEvent::FocusIn { window: x11_id });
-            }
+            ios_log(&format!("setup_window_in_scene: pending_show=true, will show after first render"));
         }
 
         ios_log(&format!("setup_window_in_scene: created UIWindow {:.0}x{:.0} x11=0x{:08x} scene={:p}",
@@ -2576,8 +2600,37 @@ fn flush_window_to_layer(layer: *mut AnyObject, surface: *mut c_void) {
         let ca_cls = objc_getClass(b"CATransaction\0".as_ptr());
         let _: () = msg_send![ca_cls, begin];
         let _: () = msg_send![ca_cls, setDisableActions: true];
+        let _: () = msg_send![layer, setContentsChanged];
         let _: () = msg_send![layer, setContents: surface as *mut AnyObject];
         let _: () = msg_send![ca_cls, commit];
+    }
+}
+
+/// Copy render surface content to display surface (same as macOS sync_surfaces).
+fn sync_surfaces(info: &mut WindowInfo) {
+    unsafe {
+        if info.surface.is_null() || info.display_surface.is_null() { return; }
+        IOSurfaceLock(info.surface, 1, std::ptr::null_mut()); // read-only
+        IOSurfaceLock(info.display_surface, 0, std::ptr::null_mut());
+        let src = IOSurfaceGetBaseAddress(info.surface) as *const u8;
+        let dst = IOSurfaceGetBaseAddress(info.display_surface) as *mut u8;
+        let src_stride = IOSurfaceGetBytesPerRow(info.surface);
+        let dst_stride = IOSurfaceGetBytesPerRow(info.display_surface);
+        let h = info.height as usize;
+        if src_stride == dst_stride {
+            std::ptr::copy_nonoverlapping(src, dst, src_stride * h);
+        } else {
+            let row_bytes = (info.width as usize) * 4;
+            for row in 0..h {
+                std::ptr::copy_nonoverlapping(
+                    src.add(row * src_stride),
+                    dst.add(row * dst_stride),
+                    row_bytes,
+                );
+            }
+        }
+        IOSurfaceUnlock(info.display_surface, 0, std::ptr::null_mut());
+        IOSurfaceUnlock(info.surface, 1, std::ptr::null_mut());
     }
 }
 
@@ -2775,19 +2828,30 @@ fn process_commands() {
         ios_log(&format!("process_commands: {} cmds received", cmds.len()));
     }
     for cmd in cmds {
+        // Drain render mailbox BEFORE each command so that rendering
+        // happens in the correct order relative to ShowWindow etc.
+        // (Same as macOS drain_render_mailbox() before handle_command)
+        drain_render_mailbox();
         handle_command(cmd);
     }
 
-    // 2. Drain render mailbox and render all windows to their IOSurfaces
+    // 2. Drain render mailbox + render
+    drain_render_mailbox();
+
+    // Force immediate compositing after rendering
+    ca_transaction_flush();
+}
+
+/// Drain pending render commands from the mailbox and render to IOSurface.
+/// Same as macOS drain_render_mailbox: render to info.surface, sync_surfaces
+/// to display_surface, then flush display_surface to CALayer.
+fn drain_render_mailbox() {
     RENDER_MAILBOX.with(|mb| {
         let mb = mb.borrow();
         if let Some(ref mailbox) = *mb {
-            // Note: do NOT call mailbox.is_empty() — it locks all 16 DashMap shards,
-            // causing heavy contention with the protocol thread's write lock.
             WINDOWS.with(|w| {
                 let mut ws = w.borrow_mut();
                 let win_ids: Vec<u64> = ws.keys().copied().collect();
-                let mut any_rendered = false;
                 for win_id in win_ids {
                     let commands = if let Some(mut entry) = mailbox.get_mut(&win_id) {
                         if entry.is_empty() { continue; }
@@ -2801,35 +2865,8 @@ fn process_commands() {
                         let height = info.height as u32;
                         let commands = coalesce_putimage(commands, width, height);
 
-                        let first_covers_all = matches!(commands.first(),
-                            Some(crate::display::RenderCommand::PutImage { x, y, width: w, height: h, .. })
-                            if *x == 0 && *y == 0 && *w as u32 >= width && *h as u32 >= height
-                        );
-
                         unsafe {
                             IOSurfaceLock(info.surface, 0, std::ptr::null_mut());
-                            if !first_covers_all {
-                                // Copy display → render surface (preserve previous frame)
-                                IOSurfaceLock(info.display_surface, 1, std::ptr::null_mut());
-                                let src = IOSurfaceGetBaseAddress(info.display_surface) as *const u8;
-                                let dst = IOSurfaceGetBaseAddress(info.surface) as *mut u8;
-                                let src_stride = IOSurfaceGetBytesPerRow(info.display_surface);
-                                let dst_stride = IOSurfaceGetBytesPerRow(info.surface);
-                                let h = info.height as usize;
-                                if src_stride == dst_stride {
-                                    std::ptr::copy_nonoverlapping(src, dst, src_stride * h);
-                                } else {
-                                    let row_bytes = (info.width as usize) * 4;
-                                    for row in 0..h {
-                                        std::ptr::copy_nonoverlapping(
-                                            src.add(row * src_stride),
-                                            dst.add(row * dst_stride),
-                                            row_bytes,
-                                        );
-                                    }
-                                }
-                                IOSurfaceUnlock(info.display_surface, 1, std::ptr::null_mut());
-                            }
                         }
 
                         let base = unsafe { IOSurfaceGetBaseAddress(info.surface) };
@@ -2846,57 +2883,32 @@ fn process_commands() {
 
                         unsafe { IOSurfaceUnlock(info.surface, 0, std::ptr::null_mut()); }
 
-                        std::mem::swap(&mut info.surface, &mut info.display_surface);
-                        any_rendered = true;
+                        sync_surfaces(info);
 
-                        // For visible windows, push to screen
                         if info.visible {
                             flush_window_to_layer(info.ca_layer, info.display_surface);
                         }
-                    }
-                }
-                if any_rendered {
-                    // Log only occasionally to avoid spam
-                    static RENDER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let cnt = RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if cnt < 5 || cnt % 60 == 0 {
-                        let n_windows = ws.len();
-                        let n_visible = ws.values().filter(|i| i.visible).count();
-                        ios_log(&format!("render #{}: {} windows, {} visible", cnt, n_windows, n_visible));
-                        // Debug: dump window info to file
-                        if cnt < 5 || (n_windows > 1 && cnt < 300) {
-                            let mut debug = String::new();
-                            for (id, info) in ws.iter() {
-                                debug.push_str(&format!("  id={} x11=0x{:08X} {}x{} at ({},{}) vis={} layer={:?} uiwin={:?}\n",
-                                    id, info.x11_id, info.width, info.height,
-                                    info.x11_x, info.x11_y, info.visible,
-                                    info.ca_layer.is_null(), info.ui_window.is_null()));
-                            }
-                            // Also check sublayer count on container
-                            let main_view_ptr = MAIN_VIEW.with(|mv| *mv.borrow());
-                            if let Some(mv) = main_view_ptr {
+
+                        // Deferred show: make window visible after first render
+                        // (same as macOS pending_show in drain_render_mailbox)
+                        if info.pending_show {
+                            info.pending_show = false;
+                            if !info.ui_window.is_null() {
+                                ios_log(&format!("pending_show: showing window {} x11=0x{:08X}", win_id, info.x11_id));
                                 unsafe {
-                                    let container: *mut AnyObject = msg_send![mv, superview];
-                                    if !container.is_null() {
-                                        let clayer: *mut AnyObject = msg_send![container, layer];
-                                        let sublayers: *mut AnyObject = msg_send![clayer, sublayers];
-                                        let sublayer_count: usize = if !sublayers.is_null() {
-                                            msg_send![sublayers, count]
-                                        } else { 0 };
-                                        debug.push_str(&format!("  container.layer sublayers: {}\n", sublayer_count));
-                                    }
-                                    let vlayer: *mut AnyObject = msg_send![mv, layer];
-                                    let vsublayers: *mut AnyObject = msg_send![vlayer, sublayers];
-                                    let vsub_count: usize = if !vsublayers.is_null() {
-                                        msg_send![vsublayers, count]
-                                    } else { 0 };
-                                    debug.push_str(&format!("  main_view.layer sublayers: {}\n", vsub_count));
+                                    let _: () = msg_send![info.ui_window, setHidden: false];
+                                    let _: () = msg_send![info.ui_window, makeKeyAndVisible];
                                 }
+                                flush_window_to_layer(info.ca_layer, info.display_surface);
+                                let view = info.ui_view;
+                                let x11_id = info.x11_id;
+                                if !view.is_null() {
+                                    unsafe { become_first_responder_deferred(view); }
+                                }
+                                send_display_event(DisplayEvent::FocusIn { window: x11_id });
                             }
-                            let _ = std::fs::write("/tmp/pslx_render_debug.txt", debug);
                         }
                     }
-                    ca_transaction_flush();
                 }
             });
         }
@@ -2922,7 +2934,8 @@ fn handle_command(cmd: DisplayCommand) {
                 return;
             }
 
-            // Fill both IOSurfaces with opaque black (same as macOS)
+            // Fill both IOSurfaces with opaque white (same as macOS).
+            // X11 windows default to white background.
             unsafe {
                 for s in [surface, display_surface] {
                     IOSurfaceLock(s, 0, std::ptr::null_mut());
@@ -2931,7 +2944,7 @@ fn handle_command(cmd: DisplayCommand) {
                     for row in 0..height as usize {
                         let row_ptr = base.add(row * stride) as *mut u32;
                         for col in 0..width as usize {
-                            *row_ptr.add(col) = 0xFF000000;
+                            *row_ptr.add(col) = 0xFFFFFFFF;
                         }
                     }
                     IOSurfaceUnlock(s, 0, std::ptr::null_mut());
@@ -2967,46 +2980,23 @@ fn handle_command(cmd: DisplayCommand) {
         }
 
         DisplayCommand::ShowWindow { handle, visible } => {
-            // Per-window design: ShowWindow → makeKeyAndVisible on per-window UIWindow (like macOS makeKeyAndOrderFront)
-            let show_info = WINDOWS.with(|w| {
+            // Like macOS: defer actual show until first render frame (pending_show).
+            // This eliminates black/white flash on startup.
+            WINDOWS.with(|w| {
                 if let Some(info) = w.borrow_mut().get_mut(&handle.id) {
                     info.visible = visible;
                     if visible {
-                        if !info.ui_window.is_null() {
-                            // UIWindow exists — show it (like macOS makeKeyAndOrderFront)
-                            unsafe {
-                                let _: () = msg_send![info.ui_window, setHidden: false];
-                                let _: () = msg_send![info.ui_window, makeKeyAndVisible];
-                            }
-                            flush_window_to_layer(info.ca_layer, info.display_surface);
-                            Some((info.x11_id, info.width, info.height, info.ui_view))
-                        } else {
-                            // UIWindow not yet created — defer
-                            info.pending_show = true;
-                            ios_log(&format!("ShowWindow: id={} deferred (no UIWindow yet)", handle.id));
-                            None
-                        }
+                        info.pending_show = true;
+                        ios_log(&format!("ShowWindow: id={} x11=0x{:08X} - deferred (pending_show)",
+                            handle.id, info.x11_id));
                     } else {
                         // Hide (like macOS orderOut)
                         if !info.ui_window.is_null() {
                             unsafe { let _: () = msg_send![info.ui_window, setHidden: true]; }
                         }
-                        None
                     }
-                } else {
-                    None
                 }
             });
-            if let Some((x11_id, w, h, view)) = show_info {
-                // Make view first responder — deferred so UIKit has settled after makeKeyAndVisible
-                if !view.is_null() {
-                    unsafe { become_first_responder_deferred(view); }
-                    ios_log(&format!("ShowWindow: id={} become_first_responder_deferred", handle.id));
-                }
-                send_display_event(DisplayEvent::FocusIn { window: x11_id });
-                ios_log(&format!("ShowWindow: id={} x11=0x{:08X} {}x{}",
-                    handle.id, x11_id, w, h));
-            }
         }
 
         DisplayCommand::HideWindow { handle } => {
@@ -3128,6 +3118,8 @@ fn handle_command(cmd: DisplayCommand) {
         }
 
         DisplayCommand::ReadPixels { handle, x, y, width, height, reply } => {
+            // Flush any pending render commands before reading (same as macOS)
+            drain_render_mailbox();
             let result = WINDOWS.with(|w| {
                 let ws = w.borrow();
                 if let Some(info) = ws.get(&handle.id) {

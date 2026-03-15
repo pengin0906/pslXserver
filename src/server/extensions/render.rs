@@ -1,13 +1,16 @@
 // RENDER extension — alpha compositing, gradients, glyph rendering
-// Minimal stub: responds to QueryVersion and QueryPictFormats so that
-// clients using libXrender don't crash. Actual rendering ops are no-ops.
+// Minimal implementation: enough for software-rendered clients such as Chrome
+// to composite pixmaps into windows. More advanced operators still fall back
+// to no-op.
 
+use std::sync::OnceLock;
 use std::sync::Arc;
 use log::debug;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::server::{XServer, ServerError};
 use crate::server::connection::{ClientConnection, read_u32, write_u16_to, write_u32_to};
+use crate::display::RenderCommand;
 
 // RENDER sub-opcodes
 const RENDER_QUERY_VERSION: u8 = 0;
@@ -38,6 +41,87 @@ const RENDER_CREATE_SOLID_FILL: u8 = 33;
 const RENDER_CREATE_LINEAR_GRADIENT: u8 = 34;
 const RENDER_CREATE_RADIAL_GRADIENT: u8 = 35;
 const RENDER_CREATE_CONICAL_GRADIENT: u8 = 36;
+
+#[derive(Clone, Copy, Debug)]
+struct PictureState {
+    drawable: u32,
+    format: u32,
+}
+
+fn picture_map() -> &'static dashmap::DashMap<u32, PictureState> {
+    static PICTURES: OnceLock<dashmap::DashMap<u32, PictureState>> = OnceLock::new();
+    PICTURES.get_or_init(dashmap::DashMap::new)
+}
+
+fn premultiplied_argb_to_bgra(mut data: Vec<u8>) -> Vec<u8> {
+    for px in data.chunks_exact_mut(4) {
+        let b = px[0] as u32;
+        let g = px[1] as u32;
+        let r = px[2] as u32;
+        let a = px[3] as u32;
+        if a == 0 {
+            px.copy_from_slice(&[0, 0, 0, 0xFF]);
+            continue;
+        }
+        let r = ((r * 255) / a).min(255) as u8;
+        let g = ((g * 255) / a).min(255) as u8;
+        let b = ((b * 255) / a).min(255) as u8;
+        px.copy_from_slice(&[b, g, r, 0xFF]);
+    }
+    data
+}
+
+fn composite_src_pixmap_to_drawable(
+    server: &Arc<XServer>,
+    src_drawable: u32,
+    dst_drawable: u32,
+    src_x: i16,
+    src_y: i16,
+    dst_x: i16,
+    dst_y: i16,
+    width: u16,
+    height: u16,
+) {
+    let src_pixels = if let Some(res) = server.resources.get(&src_drawable) {
+        if let crate::server::resources::Resource::Pixmap(pix) = res.value() {
+            let p = pix.read();
+            let pw = p.width as usize;
+            let ph = p.height as usize;
+            let sx = src_x.max(0) as usize;
+            let sy = src_y.max(0) as usize;
+            let copy_w = (width as usize).min(pw.saturating_sub(sx));
+            let copy_h = (height as usize).min(ph.saturating_sub(sy));
+            if copy_w == 0 || copy_h == 0 {
+                return;
+            }
+            let mut out = vec![0u8; copy_w * copy_h * 4];
+            for row in 0..copy_h {
+                let src_off = ((sy + row) * pw + sx) * 4;
+                let dst_off = row * copy_w * 4;
+                out[dst_off..dst_off + copy_w * 4]
+                    .copy_from_slice(&p.data[src_off..src_off + copy_w * 4]);
+            }
+            (premultiplied_argb_to_bgra(out), copy_w as u16, copy_h as u16)
+        } else {
+            return;
+        }
+    } else {
+        return;
+    };
+
+    let (data, copy_w, copy_h) = src_pixels;
+    let cmd = RenderCommand::PutImage {
+        x: dst_x,
+        y: dst_y,
+        width: copy_w,
+        height: copy_h,
+        depth: 32,
+        format: 2,
+        data,
+        gc_function: 3,
+    };
+    crate::server::connection::dispatch_render_commands(server, dst_drawable, vec![cmd]);
+}
 
 pub async fn handle_render_request<S: AsyncRead + AsyncWrite + Unpin>(
     server: &Arc<XServer>,
@@ -170,14 +254,89 @@ pub async fn handle_render_request<S: AsyncRead + AsyncWrite + Unpin>(
             stream.write_all(&reply).await?;
             Ok(())
         }
-        // All rendering operations: accept silently (no-op)
-        RENDER_CREATE_PICTURE | RENDER_CHANGE_PICTURE |
-        RENDER_SET_PICTURE_CLIP_RECTANGLES | RENDER_FREE_PICTURE |
-        RENDER_COMPOSITE | RENDER_TRAPEZOIDS | RENDER_TRIANGLES |
+        RENDER_CREATE_PICTURE => {
+            if data.len() >= 16 {
+                let pid = read_u32(conn, &data[4..8]);
+                let drawable = read_u32(conn, &data[8..12]);
+                let format = read_u32(conn, &data[12..16]);
+                picture_map().insert(pid, PictureState { drawable, format });
+                debug!("RENDER CreatePicture: pict=0x{:08X} drawable=0x{:08X} format={}", pid, drawable, format);
+            }
+            Ok(())
+        }
+        RENDER_FREE_PICTURE => {
+            if data.len() >= 8 {
+                let pid = read_u32(conn, &data[4..8]);
+                picture_map().remove(&pid);
+            }
+            Ok(())
+        }
+        RENDER_FILL_RECTANGLES => {
+            if data.len() >= 20 {
+                let op = data[4];
+                let dst_picture = read_u32(conn, &data[8..12]);
+                let color_r = u16::from_le_bytes([data[12], data[13]]);
+                let color_g = u16::from_le_bytes([data[14], data[15]]);
+                let color_b = u16::from_le_bytes([data[16], data[17]]);
+                let dst = picture_map().get(&dst_picture).map(|p| *p);
+                if let Some(dst) = dst {
+                    let color = (((color_r >> 8) as u32) << 16)
+                        | (((color_g >> 8) as u32) << 8)
+                        | ((color_b >> 8) as u32);
+                    let mut commands = Vec::new();
+                    let mut offset = 20;
+                    while offset + 8 <= data.len() {
+                        let x = i16::from_le_bytes([data[offset], data[offset + 1]]);
+                        let y = i16::from_le_bytes([data[offset + 2], data[offset + 3]]);
+                        let width = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
+                        let height = u16::from_le_bytes([data[offset + 6], data[offset + 7]]);
+                        offset += 8;
+                        commands.push(RenderCommand::FillRectangle {
+                            x, y, width, height, color,
+                            gc_function: if op == 0 { 3 } else { 7 },
+                        });
+                    }
+                    crate::server::connection::dispatch_render_commands(server, dst.drawable, commands);
+                }
+            }
+            Ok(())
+        }
+        RENDER_COMPOSITE => {
+            if data.len() >= 36 {
+                let op = data[4];
+                let src_picture = read_u32(conn, &data[8..12]);
+                let _mask_picture = read_u32(conn, &data[12..16]);
+                let dst_picture = read_u32(conn, &data[16..20]);
+                let src_x = i16::from_le_bytes([data[20], data[21]]);
+                let src_y = i16::from_le_bytes([data[22], data[23]]);
+                let _mask_x = i16::from_le_bytes([data[24], data[25]]);
+                let _mask_y = i16::from_le_bytes([data[26], data[27]]);
+                let dst_x = i16::from_le_bytes([data[28], data[29]]);
+                let dst_y = i16::from_le_bytes([data[30], data[31]]);
+                let width = u16::from_le_bytes([data[32], data[33]]);
+                let height = u16::from_le_bytes([data[34], data[35]]);
+                let src = picture_map().get(&src_picture).map(|p| *p);
+                let dst = picture_map().get(&dst_picture).map(|p| *p);
+                if let (Some(src), Some(dst)) = (src, dst) {
+                    if op <= 3 {
+                        composite_src_pixmap_to_drawable(
+                            server, src.drawable, dst.drawable,
+                            src_x, src_y, dst_x, dst_y, width, height,
+                        );
+                    } else {
+                        debug!("RENDER Composite: unsupported op={}", op);
+                    }
+                }
+            }
+            Ok(())
+        }
+        // Remaining rendering operations: accept silently (no-op)
+        RENDER_CHANGE_PICTURE |
+        RENDER_SET_PICTURE_CLIP_RECTANGLES | RENDER_TRAPEZOIDS | RENDER_TRIANGLES |
         RENDER_CREATE_GLYPH_SET | RENDER_FREE_GLYPH_SET |
         RENDER_ADD_GLYPHS | RENDER_FREE_GLYPHS |
         RENDER_COMPOSITE_GLYPHS_8 | RENDER_COMPOSITE_GLYPHS_16 | RENDER_COMPOSITE_GLYPHS_32 |
-        RENDER_FILL_RECTANGLES | RENDER_CREATE_CURSOR |
+        RENDER_CREATE_CURSOR |
         RENDER_SET_PICTURE_TRANSFORM | RENDER_SET_PICTURE_FILTER |
         RENDER_CREATE_ANIM_CURSOR | RENDER_ADD_TRAPS |
         RENDER_CREATE_SOLID_FILL | RENDER_CREATE_LINEAR_GRADIENT |

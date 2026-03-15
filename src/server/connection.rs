@@ -2367,7 +2367,7 @@ fn find_native_position(server: &Arc<XServer>, drawable: u32, x: i16, y: i16) ->
     (0, 0, 0)
 }
 
-fn dispatch_render_commands(
+pub(crate) fn dispatch_render_commands(
     server: &Arc<XServer>,
     drawable: u32,
     commands: Vec<crate::display::RenderCommand>,
